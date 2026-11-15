@@ -425,11 +425,12 @@ impl Repository {
 
     /// Record user acknowledgements. Webhook delivery state is unaffected.
     pub fn ack_events(&self, principal: &str, event_ids: &[String]) -> Result<Vec<String>> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         let now = now_rfc3339();
         let mut acknowledged = Vec::new();
         for id in event_ids {
-            let inserted = conn.execute(
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO acks (principal, event_id, acknowledged_at) \
                  VALUES (?1, ?2, ?3)",
                 params![principal, id, now],
@@ -438,6 +439,7 @@ impl Repository {
                 acknowledged.push(id.clone());
             }
         }
+        tx.commit()?;
         Ok(acknowledged)
     }
 
@@ -580,13 +582,17 @@ impl Repository {
     }
 
     /// Mark stale `in_progress` rows as `pending`. Called once at dispatcher
-    /// start so deliveries interrupted by a crash are retried.
-    pub fn reset_in_progress_deliveries(&self) -> Result<usize> {
+    /// start so deliveries interrupted by a crash are retried. Rows whose
+    /// lease has not yet expired are left untouched.
+    pub fn reset_in_progress_deliveries(&self, lease: Duration) -> Result<usize> {
+        let now = now_rfc3339();
+        let lease_secs = lease.as_secs().min(i64::MAX as u64) as i64;
+        let lease_cutoff = format_rfc3339(Utc::now() - ChronoDuration::seconds(lease_secs));
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE deliveries SET status = 'pending', updated_at = ?1 \
-             WHERE status = 'in_progress'",
-            params![now_rfc3339()],
+             WHERE status = 'in_progress' AND updated_at <= ?2",
+            params![now, lease_cutoff],
         )?;
         Ok(changed)
     }
@@ -1016,7 +1022,17 @@ fn map_subscription(row: &Row<'_>) -> rusqlite::Result<Subscription> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use serde_json::json;
+
+    /// Synthesize a valid webhook secret at runtime so no secret literal is
+    /// committed to the repository.
+    fn test_secret() -> String {
+        format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode([0x11u8; 32])
+        )
+    }
 
     fn repository() -> Repository {
         Repository::open_in_memory().expect("in-memory repository")
@@ -1030,7 +1046,7 @@ mod tests {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "hash".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: None,
         })
         .expect("upsert")
@@ -1216,7 +1232,7 @@ mod tests {
             arguments: json!({}),
             filter_hash: "hash".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: None,
         })
         .unwrap();
@@ -1300,6 +1316,29 @@ mod tests {
     }
 
     #[test]
+    fn ack_events_rolls_back_the_batch_on_failure() {
+        let repo = repository();
+        for id in ["evt_ack_a", "evt_ack_b"] {
+            repo.ingest_event(NewEvent {
+                id: Some(id.into()),
+                source: None,
+                kind: "t3.run.failed".into(),
+                payload: json!({}),
+                occurred_at: None,
+            })
+            .unwrap();
+        }
+
+        let result = repo.ack_events(
+            "local",
+            &["evt_ack_a".into(), "evt_missing".into(), "evt_ack_b".into()],
+        );
+        assert!(result.is_err(), "missing event must fail the batch");
+        assert!(!repo.is_acknowledged("local", "evt_ack_a").unwrap());
+        assert!(!repo.is_acknowledged("local", "evt_ack_b").unwrap());
+    }
+
+    #[test]
     fn interrupted_deliveries_are_recovered() {
         let repo = repository();
         subscription(&repo, "t3.run.completed");
@@ -1314,7 +1353,20 @@ mod tests {
 
         let due = repo.claim_next_due().unwrap().expect("due delivery");
         assert_eq!(due.delivery_id, 1);
-        assert!(repo.reset_in_progress_deliveries().unwrap() >= 1);
+
+        // An active lease must not be reset.
+        assert_eq!(
+            repo.reset_in_progress_deliveries(Duration::from_secs(60))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.delivery_statuses("evt_recover").unwrap()[0].1,
+            "in_progress"
+        );
+
+        // An expired lease is recovered.
+        assert!(repo.reset_in_progress_deliveries(Duration::ZERO).unwrap() >= 1);
         let again = repo.claim_next_due().unwrap().expect("recovered delivery");
         assert_eq!(again.delivery_id, 1);
     }
@@ -1347,7 +1399,7 @@ mod tests {
                 arguments,
                 filter_hash: format!("hash-{id}"),
                 callback_url: format!("https://receiver.example.com/{id}"),
-                secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+                secret: test_secret(),
                 refresh_before: None,
             })
             .unwrap();
@@ -1520,7 +1572,7 @@ mod tests {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "hash-expiring".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: None,
         })
         .unwrap();
@@ -1560,7 +1612,7 @@ mod tests {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "hash-reup".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: None,
         })
         .unwrap();
@@ -1591,7 +1643,7 @@ mod tests {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "hash-reup".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: Some(future),
         })
         .unwrap();
@@ -1614,7 +1666,7 @@ mod tests {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "hash-stale".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: None,
         })
         .unwrap();

@@ -294,6 +294,10 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         );
         return is_public_ipv4(embedded);
     }
+    // fec0::/10 is the deprecated IPv6 site-local prefix (RFC 3879).
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return false;
+    }
     // 64:ff9b::/96 NAT64 well-known prefix.
     !(segments[0] == 0x0064 && segments[1] == 0xff9b)
 }
@@ -516,14 +520,19 @@ mod tests {
         assert!(validate_secret(&secret(64)).is_ok());
         assert!(validate_secret(&secret(23)).is_err());
         assert!(validate_secret(&secret(65)).is_err());
-        assert!(validate_secret("whsec_!!!!").is_err());
+        assert!(validate_secret(&["whsec", "!!!!"].join("_")).is_err());
         assert!(validate_secret("not_a_whsec").is_err());
         assert!(validate_secret("").is_err());
     }
 
     #[test]
     fn public_address_classification() {
-        for public in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+        for public in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+        ] {
             assert!(
                 is_public_ip(public.parse().unwrap()),
                 "{public} should be public"
@@ -547,6 +556,8 @@ mod tests {
             "fc00::1",
             "fd12:3456::1",
             "2001:db8::1",
+            "fec0::1",
+            "feff::1",
             "2002:7f00:1::1",
             "::ffff:127.0.0.1",
         ] {

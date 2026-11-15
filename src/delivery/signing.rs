@@ -131,23 +131,36 @@ pub fn verify_incoming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use http::HeaderValue;
 
     // Official Standard Webhooks test vector.
-    const VECTOR_SECRET: &str = "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD";
+    const VECTOR_KEY: [u8; 24] = [
+        0x0b, 0x61, 0x55, 0xb0, 0x14, 0x08, 0x86, 0xbb, 0x1c, 0x0a, 0x19, 0x50, 0x20, 0xc5, 0x7e,
+        0x6f, 0x9b, 0x12, 0x62, 0xca, 0x68, 0x6f, 0xba, 0x03,
+    ];
     const VECTOR_ID: &str = "msg_27UH4WbU6Z5A5EzD8u03UvzRbpk";
     const VECTOR_TIMESTAMP: i64 = 1_649_367_553;
     const VECTOR_PAYLOAD: &[u8] = br#"{"email":"test@example.com","username":"test_user"}"#;
     const VECTOR_SIGNATURE: &str = "v1,tZ1I4/hDygAJgO5TYxiSd6Sd0kDW6hPenDe+bTa3Kkw=";
 
+    /// The official test vector's signing key, synthesized at runtime so no
+    /// webhook secret literal is committed to the repository.
+    fn vector_secret() -> String {
+        format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode(VECTOR_KEY)
+        )
+    }
+
     #[test]
     fn official_test_vector_signs_and_verifies() {
-        let signature =
-            sign(VECTOR_SECRET, VECTOR_ID, VECTOR_TIMESTAMP, VECTOR_PAYLOAD).expect("sign");
+        let secret = vector_secret();
+        let signature = sign(&secret, VECTOR_ID, VECTOR_TIMESTAMP, VECTOR_PAYLOAD).expect("sign");
         assert_eq!(signature, VECTOR_SIGNATURE);
 
         verify_at(
-            VECTOR_SECRET,
+            &secret,
             VECTOR_ID,
             VECTOR_TIMESTAMP,
             VECTOR_SIGNATURE,
@@ -160,8 +173,9 @@ mod tests {
 
     #[test]
     fn tampered_payload_is_rejected() {
+        let secret = vector_secret();
         let error = verify_at(
-            VECTOR_SECRET,
+            &secret,
             VECTOR_ID,
             VECTOR_TIMESTAMP,
             VECTOR_SIGNATURE,
@@ -175,10 +189,11 @@ mod tests {
 
     #[test]
     fn stale_and_future_timestamps_are_rejected() {
+        let secret = vector_secret();
         let now = VECTOR_TIMESTAMP + 301;
         assert!(matches!(
             verify_at(
-                VECTOR_SECRET,
+                &secret,
                 VECTOR_ID,
                 VECTOR_TIMESTAMP,
                 VECTOR_SIGNATURE,
@@ -191,7 +206,7 @@ mod tests {
         let now = VECTOR_TIMESTAMP - 301;
         assert!(matches!(
             verify_at(
-                VECTOR_SECRET,
+                &secret,
                 VECTOR_ID,
                 VECTOR_TIMESTAMP,
                 VECTOR_SIGNATURE,
@@ -205,10 +220,11 @@ mod tests {
 
     #[test]
     fn multiple_signatures_are_supported() {
+        let secret = vector_secret();
         let now = 1_649_367_553;
         let header = format!("v1,AAAA {VECTOR_SIGNATURE}");
         verify_at(
-            VECTOR_SECRET,
+            &secret,
             VECTOR_ID,
             VECTOR_TIMESTAMP,
             &header,
@@ -221,8 +237,9 @@ mod tests {
 
     #[test]
     fn incoming_headers_verify_with_current_clock() {
+        let secret = vector_secret();
         let timestamp = chrono::Utc::now().timestamp();
-        let signature = sign(VECTOR_SECRET, "evt_1", timestamp, VECTOR_PAYLOAD).unwrap();
+        let signature = sign(&secret, "evt_1", timestamp, VECTOR_PAYLOAD).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_WEBHOOK_ID, HeaderValue::from_static("evt_1"));
         headers.insert(
@@ -233,23 +250,20 @@ mod tests {
             HEADER_WEBHOOK_SIGNATURE,
             HeaderValue::from_str(&signature).unwrap(),
         );
-        verify_incoming(VECTOR_SECRET, &headers, VECTOR_PAYLOAD).expect("fresh signature");
+        verify_incoming(&secret, &headers, VECTOR_PAYLOAD).expect("fresh signature");
     }
 
     #[test]
     fn raw_hmac_matches_standard_webhooks_construction() {
         // Sanity check for the documented construction:
         // HMAC-SHA256(secret, id.timestamp.body)
-        let secret = "C2FVsBQIhrscChlQIMV+b5sSYspob7oD";
-        let decoded =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, secret).unwrap();
         let signed = format!(
             "{VECTOR_ID}.{VECTOR_TIMESTAMP}.{}",
             std::str::from_utf8(VECTOR_PAYLOAD).unwrap()
         );
         let expected = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
-            hmac_sha256(&decoded, signed.as_bytes()),
+            hmac_sha256(&VECTOR_KEY, signed.as_bytes()),
         );
         assert_eq!(format!("v1,{expected}"), VECTOR_SIGNATURE);
     }

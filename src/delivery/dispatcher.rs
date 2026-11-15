@@ -51,7 +51,7 @@ impl Dispatcher {
 
     /// Run until cancellation.
     pub async fn run(&self, cancellation: CancellationToken) {
-        match self.repo.reset_in_progress_deliveries() {
+        match self.repo.reset_in_progress_deliveries(self.lease()) {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "recovered interrupted deliveries"),
             Err(error) => tracing::error!(%error, "could not reset interrupted deliveries"),

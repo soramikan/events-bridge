@@ -41,7 +41,9 @@ impl Hub {
     #[doc(hidden)]
     pub fn with_policy(config: Config, policy: CallbackPolicy) -> Result<Self> {
         let state = AppState::new(config, policy.clone())?;
-        match state.repo.reset_in_progress_deliveries() {
+        match state.repo.reset_in_progress_deliveries(Duration::from_secs(
+            state.config.delivery.lease_secs.max(1),
+        )) {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "recovered interrupted deliveries"),
             Err(error) => tracing::warn!(%error, "could not recover interrupted deliveries"),

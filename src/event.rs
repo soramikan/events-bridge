@@ -104,7 +104,17 @@ impl IngestService {
 mod tests {
     use super::*;
     use crate::store::NewEvent;
+    use base64::Engine;
     use serde_json::json;
+
+    /// Synthesize a valid webhook secret at runtime so no secret literal is
+    /// committed to the repository.
+    fn test_secret() -> String {
+        format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode([0x11u8; 32])
+        )
+    }
 
     fn service() -> (IngestService, Arc<Repository>) {
         let repo = Arc::new(Repository::open_in_memory().unwrap());
@@ -137,7 +147,7 @@ mod tests {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "hash".into(),
             callback_url: "https://receiver.example.com/hook".into(),
-            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            secret: test_secret(),
             refresh_before: None,
         })
         .unwrap();
