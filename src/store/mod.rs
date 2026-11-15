@@ -1,9 +1,16 @@
 //! SQLite-backed state store.
 
+pub mod github;
 pub mod migrations;
 pub mod repository;
 pub mod t3;
 
+pub use github::{
+    GITHUB_COLLECTOR, GitHubApplyOutcome, GitHubCheckpoint, GitHubCiRun, GitHubDelivery,
+    GitHubPendingCheck, GitHubPendingCheckResolution, GitHubPendingCheckUpdate, GitHubPollChanges,
+    GitHubPollCommit, GitHubPollContinuation, GitHubPullRequest, GitHubStatus, GitHubStatusQuery,
+    GitHubWebhookChanges, pulls_scope, runs_scope,
+};
 pub use repository::{
     AttemptOutcome, DueDelivery, Event, EventQuery, IngestOutcome, NewEvent, NewSubscription,
     Repository, Subscription,

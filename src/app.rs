@@ -33,6 +33,10 @@ pub struct AppState {
     pub auth: Auth,
     /// Optional token for `POST /internal/events`.
     pub internal_token: Option<SecretString>,
+    /// GitHub webhook HMAC secret, read when the webhook endpoint is enabled.
+    pub github_webhook_secret: Option<SecretString>,
+    /// Optional GitHub REST API token.
+    pub github_token: Option<SecretString>,
 }
 
 impl AppState {
@@ -55,21 +59,26 @@ impl AppState {
 
         let internal_token = if config.server.enable_internal_ingest {
             match &config.server.internal_token_env {
-                Some(variable) => {
-                    let value = std::env::var(variable).with_context(|| {
-                        format!(
-                            "internal ingest is configured but environment variable `{variable}` is unset"
-                        )
-                    })?;
-                    if value.is_empty() {
-                        anyhow::bail!("environment variable `{variable}` is empty");
-                    }
-                    Some(SecretString::from(value))
-                }
+                Some(variable) => Some(read_secret_env(variable, "internal ingest")?),
                 None => None,
             }
         } else {
             None
+        };
+
+        let github = &config.collectors.github;
+        let github_webhook_secret = if github.webhook_enabled {
+            let variable = github.webhook_secret_env.as_deref().context(
+                "collectors.github.webhook_enabled requires \
+                 collectors.github.webhook_secret_env",
+            )?;
+            Some(read_secret_env(variable, "GitHub webhook")?)
+        } else {
+            None
+        };
+        let github_token = match github.token_env.as_deref() {
+            Some(variable) => Some(read_secret_env(variable, "GitHub API")?),
+            None => None,
         };
 
         Ok(Arc::new(Self {
@@ -81,6 +90,18 @@ impl AppState {
             tools,
             auth,
             internal_token,
+            github_webhook_secret,
+            github_token,
         }))
     }
+}
+
+fn read_secret_env(variable: &str, purpose: &str) -> Result<SecretString> {
+    let value = std::env::var(variable).with_context(|| {
+        format!("{purpose} is configured but environment variable `{variable}` is unset")
+    })?;
+    if value.trim().is_empty() {
+        anyhow::bail!("environment variable `{variable}` is empty");
+    }
+    Ok(SecretString::from(value))
 }

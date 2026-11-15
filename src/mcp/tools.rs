@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::mcp::event_catalog;
-use crate::store::{Event, EventQuery, Repository, T3ApprovalQuery};
+use crate::store::{Event, EventQuery, GitHubStatusQuery, Repository, T3ApprovalQuery};
 use crate::util::{format_rfc3339, parse_rfc3339};
 
 /// Maximum page size for `list_events`.
@@ -109,6 +109,21 @@ pub fn definitions() -> Vec<Tool> {
                 true,
             ),
             tool(
+                "get_github_status",
+                "Fetch materialized GitHub pull requests and CI runs, optionally filtered by repository, pull request, or head branch.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": {"type": "string", "description": "Repository in owner/repo form."},
+                        "pull_number": {"type": "integer", "minimum": 1},
+                        "branch": {"type": "string", "description": "Head branch (pull requests may also match the base branch)."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+                    },
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
                 "ack_events",
                 "Record that the user has seen events. This is separate from webhook delivery confirmation.",
                 json!({
@@ -164,6 +179,7 @@ impl ToolService {
             "get_event" => self.get_event(arguments),
             "get_t3_run" => self.get_t3_run(arguments),
             "get_t3_approvals" => self.get_t3_approvals(arguments),
+            "get_github_status" => self.get_github_status(arguments),
             "ack_events" => self.ack_events(principal, arguments),
             other => Err(format!("unknown tool `{other}`")),
         };
@@ -288,6 +304,79 @@ impl ToolService {
         Ok(json!({"approvals": approvals}))
     }
 
+    fn get_github_status(&self, arguments: Value) -> Result<Value, String> {
+        let args: GetGitHubStatusArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        if let Some(repository) = &args.repository {
+            let mut parts = repository.split('/');
+            let owner = parts.next().unwrap_or_default();
+            let name = parts.next().unwrap_or_default();
+            if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+                return Err("`repository` must have the form `owner/repo`".into());
+            }
+        }
+        if let Some(pull_number) = args.pull_number
+            && pull_number <= 0
+        {
+            return Err("`pull_number` must be a positive integer".into());
+        }
+        let limit = match args.limit {
+            None => DEFAULT_LIMIT,
+            Some(0) => {
+                return Err(format!("`limit` must be between 1 and {MAX_LIMIT}, got 0"));
+            }
+            Some(limit) if limit > MAX_LIMIT => {
+                return Err(format!(
+                    "`limit` must be between 1 and {MAX_LIMIT}, got {limit}"
+                ));
+            }
+            Some(limit) => limit,
+        };
+        let status = self
+            .repo
+            .github_status(&GitHubStatusQuery {
+                repository: args.repository,
+                pull_number: args.pull_number,
+                branch: args.branch,
+                limit: limit as i64,
+            })
+            .map_err(|error| error.to_string())?;
+
+        let open_pull_requests = status
+            .pull_requests
+            .iter()
+            .filter(|pull| pull.state == "open")
+            .count();
+        let merged_pull_requests = status
+            .pull_requests
+            .iter()
+            .filter(|pull| pull.merged)
+            .count();
+        let failed_ci_runs = status
+            .ci_runs
+            .iter()
+            .filter(|run| {
+                run.status == "failed"
+                    || matches!(
+                        run.conclusion.as_deref(),
+                        Some("failure" | "timed_out" | "action_required" | "startup_failure")
+                    )
+            })
+            .count();
+
+        Ok(json!({
+            "pullRequests": status.pull_requests,
+            "ciRuns": status.ci_runs,
+            "summary": {
+                "pullRequestCount": status.pull_requests.len(),
+                "ciRunCount": status.ci_runs.len(),
+                "openPullRequestCount": open_pull_requests,
+                "mergedPullRequestCount": merged_pull_requests,
+                "failedCiRunCount": failed_ci_runs,
+            },
+        }))
+    }
+
     fn ack_events(&self, principal: &str, arguments: Value) -> Result<Value, String> {
         let args: AckEventsArgs = serde_json::from_value(arguments)
             .map_err(|error| format!("invalid arguments: {error}"))?;
@@ -365,6 +454,19 @@ struct GetT3ApprovalsArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GetGitHubStatusArgs {
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default, alias = "pullNumber")]
+    pull_number: Option<i64>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AckEventsArgs {
     #[serde(alias = "eventIds")]
     event_ids: Vec<String>,
@@ -391,6 +493,7 @@ mod tests {
                 "get_event",
                 "get_t3_run",
                 "get_t3_approvals",
+                "get_github_status",
                 "ack_events",
             ]
         );

@@ -601,6 +601,7 @@ async fn initialize_advertises_events_and_lists_the_catalog() {
             "get_event",
             "get_t3_run",
             "get_t3_approvals",
+            "get_github_status",
             "ack_events",
         ]
     );
