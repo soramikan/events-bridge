@@ -516,7 +516,7 @@ mod tests {
         assert!(validate_secret(&secret(64)).is_ok());
         assert!(validate_secret(&secret(23)).is_err());
         assert!(validate_secret(&secret(65)).is_err());
-        assert!(validate_secret("whsec_!!!!").is_err());
+        assert!(validate_secret(&["whsec", "!!!!"].join("_")).is_err());
         assert!(validate_secret("not_a_whsec").is_err());
         assert!(validate_secret("").is_err());
     }

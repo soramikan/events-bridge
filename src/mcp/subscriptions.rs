@@ -349,6 +349,16 @@ impl SubscriptionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    /// Synthesize a valid webhook secret at runtime so no secret literal is
+    /// committed to the repository.
+    fn test_secret() -> String {
+        format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode([0x11u8; 32])
+        )
+    }
 
     #[test]
     fn canonicalization_sorts_nested_keys() {
@@ -401,7 +411,7 @@ mod tests {
         let absent: SubscribeParams = serde_json::from_value(json!({
             "name": "t3.run.completed",
             "arguments": {"environment_id": "linux-main"},
-            "delivery": {"url": "https://r.example/hook", "secret": "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD"}
+            "delivery": {"url": "https://r.example/hook", "secret": test_secret()}
         }))
         .unwrap();
         assert!(absent.ttl_ms.is_none());
@@ -409,7 +419,7 @@ mod tests {
         let null: SubscribeParams = serde_json::from_value(json!({
             "name": "t3.run.completed",
             "arguments": {"environment_id": "linux-main"},
-            "delivery": {"url": "https://r.example/hook", "secret": "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD"},
+            "delivery": {"url": "https://r.example/hook", "secret": test_secret()},
             "ttlMs": null
         }))
         .unwrap();
@@ -418,7 +428,7 @@ mod tests {
         let finite: SubscribeParams = serde_json::from_value(json!({
             "name": "t3.run.completed",
             "arguments": {"environment_id": "linux-main"},
-            "delivery": {"url": "https://r.example/hook", "secret": "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD"},
+            "delivery": {"url": "https://r.example/hook", "secret": test_secret()},
             "ttlMs": 120000
         }))
         .unwrap();
@@ -430,7 +440,7 @@ mod tests {
         let base = json!({
             "name": "t3.run.completed",
             "arguments": {"environment_id": "linux-main"},
-            "delivery": {"url": "https://r.example/hook", "secret": "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD"}
+            "delivery": {"url": "https://r.example/hook", "secret": test_secret()}
         });
         let mut with_meta = base.clone();
         with_meta["_meta"] = json!({

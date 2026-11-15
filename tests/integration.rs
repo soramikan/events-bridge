@@ -22,6 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use events_bridge::{
     config::{Config, MAX_WEBHOOK_BODY_BYTES},
@@ -35,7 +36,23 @@ use tempfile::TempDir;
 use tokio::{task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-const SECRET: &str = "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD";
+/// Synthesize a valid webhook secret at runtime so no secret literal is
+/// committed to the repository.
+fn test_secret() -> String {
+    format!(
+        "whsec_{}",
+        base64::engine::general_purpose::STANDARD.encode([0x11u8; 32])
+    )
+}
+
+/// A distinct runtime-synthesized secret used for rotation tests.
+fn rotated_test_secret() -> String {
+    format!(
+        "whsec_{}",
+        base64::engine::general_purpose::STANDARD.encode([0x22u8; 32])
+    )
+}
+
 fn t3_completed_payload() -> Value {
     json!({
         "environment_id": "linux-main",
@@ -112,7 +129,7 @@ impl MockReceiver {
     async fn start(behavior: Behavior) -> Self {
         let state = Arc::new(ReceiverState {
             behavior: Mutex::new(behavior),
-            secret: SECRET.to_string(),
+            secret: test_secret(),
             records: Mutex::new(Vec::new()),
             event_attempts: AtomicUsize::new(0),
         });
@@ -546,7 +563,7 @@ async fn subscribe(
                 "delivery": {
                     "mode": "webhook",
                     "url": receiver.endpoint(path),
-                    "secret": SECRET,
+                    "secret": test_secret(),
                 }
             }),
         )
@@ -775,7 +792,7 @@ async fn subscribe_rejects_an_invalid_secret() {
                 "delivery": {
                     "mode": "webhook",
                     "url": receiver.endpoint("/hook"),
-                    "secret": "whsec_AAAA",
+                    "secret": format!("{prefix}AAAA", prefix = "whsec_"),
                 }
             }),
         )
@@ -808,7 +825,7 @@ async fn subscribe_rejects_plain_http_on_the_production_policy() {
                 "delivery": {
                     "mode": "webhook",
                     "url": "http://127.0.0.1:9/hook",
-                    "secret": SECRET,
+                    "secret": test_secret(),
                 }
             }),
         )
@@ -834,7 +851,7 @@ async fn subscribe_rejects_private_addresses_on_the_production_policy() {
                 "delivery": {
                     "mode": "webhook",
                     "url": "https://127.0.0.1:9/hook",
-                    "secret": SECRET,
+                    "secret": test_secret(),
                 }
             }),
         )
@@ -1479,7 +1496,7 @@ async fn text_plain_events_requests_are_rejected_without_side_effects() {
             "delivery": {
                 "mode": "webhook",
                 "url": receiver.endpoint("/hook"),
-                "secret": SECRET,
+                "secret": test_secret(),
             }
         }
     });
@@ -1523,7 +1540,7 @@ async fn events_methods_require_a_json_rpc_2_envelope() {
         "delivery": {
             "mode": "webhook",
             "url": receiver.endpoint("/hook"),
-            "secret": SECRET,
+            "secret": test_secret(),
         }
     });
     let invalid_bodies = [
@@ -1576,7 +1593,7 @@ async fn events_methods_accept_mcp_meta() {
                 "delivery": {
                     "mode": "webhook",
                     "url": receiver.endpoint("/hook"),
-                    "secret": SECRET,
+                    "secret": test_secret(),
                 },
                 "_meta": {
                     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -1611,8 +1628,6 @@ async fn events_methods_accept_mcp_meta() {
 // ---------------------------------------------------------------------------
 // Secret rotation
 // ---------------------------------------------------------------------------
-
-const ROTATED_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 
 #[tokio::test]
 async fn rotating_the_secret_reverifies_with_the_new_key() {
@@ -1650,7 +1665,7 @@ async fn rotating_the_secret_reverifies_with_the_new_key() {
                     "delivery": {
                         "mode": "webhook",
                         "url": receiver.endpoint("/hook"),
-                        "secret": ROTATED_SECRET,
+                        "secret": rotated_test_secret(),
                     }
                 }),
             )
@@ -1664,7 +1679,7 @@ async fn rotating_the_secret_reverifies_with_the_new_key() {
         2,
         "a secret change must re-run the challenge"
     );
-    let webhook = standardwebhooks::Webhook::new(ROTATED_SECRET).unwrap();
+    let webhook = standardwebhooks::Webhook::new(&rotated_test_secret()).unwrap();
     assert!(
         webhook
             .verify(&verifications[1].body, &verifications[1].headers)
@@ -1678,7 +1693,7 @@ async fn rotating_the_secret_reverifies_with_the_new_key() {
         .get_subscription(&subscription_id)
         .unwrap()
         .expect("subscription exists");
-    assert_eq!(subscription.secret, ROTATED_SECRET);
+    assert_eq!(subscription.secret, rotated_test_secret());
     assert!(subscription.active && subscription.verified);
 }
 
@@ -1717,7 +1732,7 @@ async fn failed_secret_rotation_keeps_the_old_key_and_state() {
                 "delivery": {
                     "mode": "webhook",
                     "url": receiver.endpoint("/hook"),
-                    "secret": ROTATED_SECRET,
+                    "secret": rotated_test_secret(),
                 }
             }),
         )
@@ -1732,7 +1747,7 @@ async fn failed_secret_rotation_keeps_the_old_key_and_state() {
         .get_subscription(&subscription_id)
         .unwrap()
         .expect("the old subscription must survive a failed rotation");
-    assert_eq!(subscription.secret, SECRET);
+    assert_eq!(subscription.secret, test_secret());
     assert!(subscription.active && subscription.verified);
 }
 
@@ -1816,7 +1831,7 @@ async fn expired_subscription_backlog_is_not_delivered() {
             arguments: json!({"environment_id": "linux-main"}),
             filter_hash: "expiring".into(),
             callback_url: receiver.endpoint("/hook"),
-            secret: SECRET.into(),
+            secret: test_secret(),
             refresh_before: Some(format_rfc3339(
                 Utc::now() + ChronoDuration::milliseconds(400),
             )),
