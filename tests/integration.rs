@@ -1938,10 +1938,13 @@ async fn body_size_limit_is_enforced_at_the_256_kib_boundary() {
     );
 
     let occurred_at = "2026-01-01T00:00:00.000Z";
+    let ok_id = "evt_boundary_ok_000001";
+    let too_large_id = "evt_boundary_too_large";
+    assert_eq!(ok_id.len(), too_large_id.len());
     let mut payload = t3_completed_payload();
     payload["summary"] = json!("");
     let envelope_len = serde_json::to_vec(&json!({
-        "eventId": "evt_boundary_ok",
+        "eventId": ok_id,
         "name": "t3.run.completed",
         "timestamp": occurred_at,
         "data": payload,
@@ -1954,7 +1957,7 @@ async fn body_size_limit_is_enforced_at_the_256_kib_boundary() {
 
     hub.hub
         .ingest_event(NewEvent {
-            id: Some("evt_boundary_ok".into()),
+            id: Some(ok_id.into()),
             source: None,
             kind: "t3.run.completed".into(),
             payload: payload.clone(),
@@ -1963,9 +1966,19 @@ async fn body_size_limit_is_enforced_at_the_256_kib_boundary() {
         .unwrap();
 
     payload["summary"] = json!("x".repeat(filler + 1));
+    let rejected_len = serde_json::to_vec(&json!({
+        "eventId": too_large_id,
+        "name": "t3.run.completed",
+        "timestamp": occurred_at,
+        "data": payload,
+        "cursor": Value::Null,
+    }))
+    .unwrap()
+    .len();
+    assert_eq!(rejected_len, MAX_WEBHOOK_BODY_BYTES + 1);
     hub.hub
         .ingest_event(NewEvent {
-            id: Some("evt_boundary_too_large".into()),
+            id: Some(too_large_id.into()),
             source: None,
             kind: "t3.run.completed".into(),
             payload,
@@ -1977,19 +1990,16 @@ async fn body_size_limit_is_enforced_at_the_256_kib_boundary() {
 
     let events = receiver.event_records();
     assert_eq!(events.len(), 1, "only the boundary-sized body is sent");
-    assert_eq!(events[0].header("webhook-id"), Some("evt_boundary_ok"));
+    assert_eq!(events[0].header("webhook-id"), Some(ok_id));
     assert_eq!(events[0].body.len(), MAX_WEBHOOK_BODY_BYTES);
 
     let repository = hub.hub.repository().clone();
     assert_eq!(
-        repository.delivery_statuses("evt_boundary_ok").unwrap()[0].1,
+        repository.delivery_statuses(ok_id).unwrap()[0].1,
         "delivered"
     );
     assert_eq!(
-        repository
-            .delivery_statuses("evt_boundary_too_large")
-            .unwrap()[0]
-            .1,
+        repository.delivery_statuses(too_large_id).unwrap()[0].1,
         "failed"
     );
 }

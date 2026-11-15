@@ -213,6 +213,12 @@ impl Config {
                 self.subscriptions.max_ttl_secs
             );
         }
+        if self.delivery.max_attempts < 1 {
+            bail!(
+                "delivery.max_attempts must be at least 1, got {}",
+                self.delivery.max_attempts
+            );
+        }
         Ok(())
     }
 
@@ -268,6 +274,19 @@ mod tests {
         let error =
             Config::parse("[delivery]\nlease_secs = 0\n").expect_err("zero lease must fail");
         assert!(error.to_string().contains("lease_secs"), "{error}");
+    }
+
+    #[test]
+    fn non_positive_max_attempts_is_rejected() {
+        for value in ["0", "-1"] {
+            let error = Config::parse(&format!("[delivery]\nmax_attempts = {value}\n"))
+                .expect_err("non-positive max_attempts must fail");
+            assert!(error.to_string().contains("max_attempts"), "{error}");
+        }
+
+        let accepted = Config::parse("[delivery]\nmax_attempts = 1\n")
+            .expect("max_attempts of one is accepted");
+        assert_eq!(accepted.delivery.max_attempts, 1);
     }
 
     #[test]

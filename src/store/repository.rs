@@ -386,11 +386,12 @@ impl Repository {
 
     /// Record user acknowledgements. Webhook delivery state is unaffected.
     pub fn ack_events(&self, principal: &str, event_ids: &[String]) -> Result<Vec<String>> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         let now = now_rfc3339();
         let mut acknowledged = Vec::new();
         for id in event_ids {
-            let inserted = conn.execute(
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO acks (principal, event_id, acknowledged_at) \
                  VALUES (?1, ?2, ?3)",
                 params![principal, id, now],
@@ -399,6 +400,7 @@ impl Repository {
                 acknowledged.push(id.clone());
             }
         }
+        tx.commit()?;
         Ok(acknowledged)
     }
 
@@ -541,13 +543,17 @@ impl Repository {
     }
 
     /// Mark stale `in_progress` rows as `pending`. Called once at dispatcher
-    /// start so deliveries interrupted by a crash are retried.
-    pub fn reset_in_progress_deliveries(&self) -> Result<usize> {
+    /// start so deliveries interrupted by a crash are retried. Rows whose
+    /// lease has not yet expired are left untouched.
+    pub fn reset_in_progress_deliveries(&self, lease: Duration) -> Result<usize> {
+        let now = now_rfc3339();
+        let lease_secs = lease.as_secs().min(i64::MAX as u64) as i64;
+        let lease_cutoff = format_rfc3339(Utc::now() - ChronoDuration::seconds(lease_secs));
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE deliveries SET status = 'pending', updated_at = ?1 \
-             WHERE status = 'in_progress'",
-            params![now_rfc3339()],
+             WHERE status = 'in_progress' AND updated_at <= ?2",
+            params![now, lease_cutoff],
         )?;
         Ok(changed)
     }
@@ -1065,6 +1071,29 @@ mod tests {
     }
 
     #[test]
+    fn ack_events_rolls_back_the_batch_on_failure() {
+        let repo = repository();
+        for id in ["evt_ack_a", "evt_ack_b"] {
+            repo.ingest_event(NewEvent {
+                id: Some(id.into()),
+                source: None,
+                kind: "t3.run.failed".into(),
+                payload: json!({}),
+                occurred_at: None,
+            })
+            .unwrap();
+        }
+
+        let result = repo.ack_events(
+            "local",
+            &["evt_ack_a".into(), "evt_missing".into(), "evt_ack_b".into()],
+        );
+        assert!(result.is_err(), "missing event must fail the batch");
+        assert!(!repo.is_acknowledged("local", "evt_ack_a").unwrap());
+        assert!(!repo.is_acknowledged("local", "evt_ack_b").unwrap());
+    }
+
+    #[test]
     fn interrupted_deliveries_are_recovered() {
         let repo = repository();
         subscription(&repo, "t3.run.completed");
@@ -1079,7 +1108,20 @@ mod tests {
 
         let due = repo.claim_next_due().unwrap().expect("due delivery");
         assert_eq!(due.delivery_id, 1);
-        assert!(repo.reset_in_progress_deliveries().unwrap() >= 1);
+
+        // An active lease must not be reset.
+        assert_eq!(
+            repo.reset_in_progress_deliveries(Duration::from_secs(60))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.delivery_statuses("evt_recover").unwrap()[0].1,
+            "in_progress"
+        );
+
+        // An expired lease is recovered.
+        assert!(repo.reset_in_progress_deliveries(Duration::ZERO).unwrap() >= 1);
         let again = repo.claim_next_due().unwrap().expect("recovered delivery");
         assert_eq!(again.delivery_id, 1);
     }
