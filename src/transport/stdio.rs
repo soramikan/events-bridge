@@ -39,11 +39,15 @@ pub async fn run(config_path: Option<PathBuf>) -> Result<()> {
         dispatcher.run(worker_token).await;
     });
 
-    let service =
-        rmcp::serve_server(EventsHandler::new(state), rmcp::transport::io::stdio()).await?;
-    service.waiting().await?;
+    let result = async {
+        let service =
+            rmcp::serve_server(EventsHandler::new(state), rmcp::transport::io::stdio()).await?;
+        service.waiting().await?;
+        anyhow::Ok(())
+    }
+    .await;
 
     cancellation.cancel();
     let _ = worker.await;
-    Ok(())
+    result
 }

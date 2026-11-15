@@ -29,6 +29,7 @@ use rmcp::transport::streamable_http_server::{
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use url::Url;
 
@@ -54,12 +55,18 @@ struct McpHttpState {
 
 /// Build the hub router.
 pub fn router(app: Arc<AppState>) -> Router {
+    router_with_cancellation(app, CancellationToken::new())
+}
+
+/// Build the hub router with a cancellation token wired into the MCP HTTP service.
+pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationToken) -> Router {
     let server_config = StreamableHttpServerConfig::default()
         // Prefer JSON for simple request/response traffic. This keeps the
         // initialize response patchable without parsing SSE framing.
         .with_json_response(true)
         .with_sse_keep_alive(None)
         .with_allowed_hosts(app.config.server.allowed_hosts.clone())
+        .with_cancellation_token(cancellation)
         .with_max_request_body_bytes(MAX_MCP_REQUEST_BYTES);
 
     let service = {
@@ -458,11 +465,18 @@ struct IngestRequest {
 
 async fn internal_ingest(
     State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     if !state.app.config.server.enable_internal_ingest {
         return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return response.into_response();
     }
 
     if let Err(error) = state.app.auth.authenticate(&headers) {

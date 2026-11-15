@@ -25,6 +25,7 @@ T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI �
 
 ```sh
 cp config.example.toml /etc/events-bridge/config.toml
+# /etc/events-bridge/config.toml で auth.token_env = "EVENTS_BRIDGE_TOKEN" を設定
 $EDITOR /etc/events-bridge/config.toml
 
 export EVENTS_BRIDGE_TOKEN="$(openssl rand -base64 32)"
@@ -35,12 +36,15 @@ events-bridge hub --config /etc/events-bridge/config.toml
 Secure MCP Tunnel の内側など、信頼できる経路でのみ使用してください。
 
 イベント注入は `server.enable_internal_ingest = true` のときだけ
-`POST /internal/events` で有効になります。`internal_token_env` を設定した場合は
-`X-Internal-Token` ヘッダーも必要です。
+`POST /internal/events` で有効になります。MCP 認証（`auth.token_env`）が有効な場合は
+`Authorization: Bearer ...` が必要であり、さらに `internal_token_env` を設定した場合は
+`X-Internal-Token` ヘッダーも必要です（無認証テスト構成では両方省略できます）。
 
 ```sh
 curl -sS http://127.0.0.1:8787/internal/events \
   -H 'content-type: application/json' \
+  -H "Authorization: Bearer ${EVENTS_BRIDGE_TOKEN}" \
+  -H "X-Internal-Token: ${EVENTS_BRIDGE_INTERNAL_TOKEN}" \
   -d '{
     "kind": "t3.run.completed",
     "payload": {

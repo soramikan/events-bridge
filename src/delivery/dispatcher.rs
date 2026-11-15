@@ -59,7 +59,10 @@ impl Dispatcher {
 
         let mut wakeups = self.bus.subscribe();
         loop {
-            if self.drain().await > 0 {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            if self.drain_until(&cancellation).await > 0 {
                 continue;
             }
             if cancellation.is_cancelled() {
@@ -104,8 +107,16 @@ impl Dispatcher {
 
     /// Deliver every currently-due record. Returns the number processed.
     pub async fn drain(&self) -> usize {
+        self.drain_until(&CancellationToken::new()).await
+    }
+
+    /// Deliver currently-due records until the queue is empty or `cancellation` fires.
+    pub async fn drain_until(&self, cancellation: &CancellationToken) -> usize {
         let mut processed = 0usize;
         loop {
+            if cancellation.is_cancelled() {
+                break;
+            }
             let due = match self.repo.claim_next_due_with_lease(self.lease()) {
                 Ok(Some(due)) => due,
                 Ok(None) => break,

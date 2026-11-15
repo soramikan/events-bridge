@@ -739,9 +739,9 @@ impl Repository {
         )?;
 
         let next_attempt_at = outcome.next_attempt_at.unwrap_or(&now);
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE deliveries SET status = ?2, attempt_count = ?3, next_attempt_at = ?4, \
-                 updated_at = ?5 WHERE id = ?1",
+                 updated_at = ?5 WHERE id = ?1 AND status = 'in_progress'",
             params![
                 outcome.delivery_id,
                 outcome.delivery_status,
@@ -750,6 +750,14 @@ impl Repository {
                 now
             ],
         )?;
+        if updated == 0 {
+            // The claim was lost (for example, when a subscription refresh
+            // terminalized the row while a delivery attempt was in flight).
+            // Keep the attempt audit row, but do not alter delivery or
+            // subscription state.
+            tx.commit()?;
+            return Ok(());
+        }
 
         if outcome.delivery_status == "delivered" {
             tx.execute(
@@ -1349,5 +1357,66 @@ mod tests {
             "failed"
         );
         assert_eq!(repo.pending_delivery_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn finish_attempt_does_not_revive_terminalized_delivery() {
+        let repo = repository();
+        repo.upsert_subscription(NewSubscription {
+            id: "sub_stale".into(),
+            principal: "local".into(),
+            event_name: "t3.run.completed".into(),
+            arguments: json!({"environment_id": "linux-main"}),
+            filter_hash: "hash-stale".into(),
+            callback_url: "https://receiver.example.com/hook".into(),
+            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            refresh_before: None,
+        })
+        .unwrap();
+        repo.ingest_event(NewEvent {
+            id: Some("evt_stale".into()),
+            source: None,
+            kind: "t3.run.completed".into(),
+            payload: json!({"environment_id": "linux-main"}),
+            occurred_at: None,
+        })
+        .unwrap();
+
+        let due = repo.claim_next_due().unwrap().expect("claimed delivery");
+        // Terminalize the delivery while the attempt is in flight.
+        repo.lock()
+            .execute(
+                "UPDATE deliveries SET status = 'failed' WHERE id = ?1",
+                params![due.delivery_id],
+            )
+            .unwrap();
+
+        let future = format_rfc3339(Utc::now() + ChronoDuration::seconds(30));
+        repo.finish_attempt(AttemptOutcome {
+            delivery_id: due.delivery_id,
+            attempt: 1,
+            status_code: Some(503),
+            outcome: "retryable",
+            error: Some("http_503"),
+            delivery_status: "pending",
+            next_attempt_at: Some(&future),
+            subscription_id: "sub_stale",
+            disable_subscription: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            repo.delivery_statuses("evt_stale").unwrap()[0].1,
+            "failed",
+            "stale retryable completion must not revive a failed delivery"
+        );
+        assert_eq!(repo.attempts(due.delivery_id).unwrap().len(), 1);
+        assert_eq!(
+            repo.get_subscription("sub_stale")
+                .unwrap()
+                .unwrap()
+                .last_error,
+            None
+        );
     }
 }

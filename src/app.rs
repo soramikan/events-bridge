@@ -61,6 +61,9 @@ impl AppState {
                             "internal ingest is configured but environment variable `{variable}` is unset"
                         )
                     })?;
+                    if value.is_empty() {
+                        anyhow::bail!("environment variable `{variable}` is empty");
+                    }
                     Some(SecretString::from(value))
                 }
                 None => None,

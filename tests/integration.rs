@@ -1396,6 +1396,68 @@ async fn disallowed_origins_are_rejected() {
 }
 
 #[tokio::test]
+async fn internal_ingest_rejects_disallowed_host_and_origin() {
+    let temp = TempDir::new().unwrap();
+    let mut config = Config::for_tests(temporary_database(&temp));
+    config.server.allowed_hosts = vec!["localhost".into()];
+    let hub = RunningHub::start_with_config(config, CallbackPolicy::for_tests(), false).await;
+
+    let http = reqwest::Client::new();
+    let url = format!("{}/internal/events", hub.base_url);
+    let body = json!({
+        "kind": "t3.run.completed",
+        "payload": t3_completed_payload(),
+    });
+
+    let bad_host = http
+        .post(&url)
+        .header("Host", "attacker.example")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_host.status(), StatusCode::FORBIDDEN);
+
+    let bad_origin = http
+        .post(&url)
+        .header("Host", "localhost:8787")
+        .header("Origin", "https://evil.example")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+    let ok = http
+        .post(&url)
+        .header("Host", "localhost:8787")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[test]
+fn empty_internal_token_env_is_rejected_at_startup() {
+    let temp = TempDir::new().unwrap();
+    let var = "EVENTS_BRIDGE_TEST_EMPTY_INTERNAL_TOKEN";
+    // SAFETY: unique variable name used only by this test.
+    unsafe {
+        std::env::set_var(var, "");
+    }
+    let mut config = Config::for_tests(temporary_database(&temp));
+    config.server.internal_token_env = Some(var.into());
+    let err = Hub::with_policy(config, CallbackPolicy::for_tests())
+        .err()
+        .expect("empty internal token env must fail startup");
+    assert!(err.to_string().contains("empty"), "{err}");
+    unsafe {
+        std::env::remove_var(var);
+    }
+}
+
+#[tokio::test]
 async fn text_plain_events_requests_are_rejected_without_side_effects() {
     let temp = TempDir::new().unwrap();
     let receiver = MockReceiver::start(Behavior::Success).await;

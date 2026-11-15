@@ -206,6 +206,13 @@ impl Config {
         if self.delivery.lease_secs == 0 {
             bail!("delivery.lease_secs must be greater than zero");
         }
+        if self.subscriptions.min_ttl_secs > self.subscriptions.max_ttl_secs {
+            bail!(
+                "subscriptions.min_ttl_secs must not exceed subscriptions.max_ttl_secs, got {} > {}",
+                self.subscriptions.min_ttl_secs,
+                self.subscriptions.max_ttl_secs
+            );
+        }
         Ok(())
     }
 
@@ -261,6 +268,13 @@ mod tests {
         let error =
             Config::parse("[delivery]\nlease_secs = 0\n").expect_err("zero lease must fail");
         assert!(error.to_string().contains("lease_secs"), "{error}");
+    }
+
+    #[test]
+    fn inverted_subscription_ttl_bounds_are_rejected() {
+        let error = Config::parse("[subscriptions]\nmin_ttl_secs = 120\nmax_ttl_secs = 60\n")
+            .expect_err("inverted subscription TTL bounds must fail");
+        assert!(error.to_string().contains("min_ttl_secs"), "{error}");
     }
 
     #[test]

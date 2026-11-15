@@ -13,8 +13,11 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 
 # public_base_url = "https://bridge.example.com"
 
-# Local event injection endpoint. Requires network-level protection and, when
-# internal_token_env is set, the same bearer token used for MCP.
+# Local event injection endpoint. Requires network-level protection. When
+# `internal_token_env` is set, requests must present that separate token in
+# `X-Internal-Token` (it does not reuse the MCP bearer token). When
+# `[auth].token_env` is also configured, MCP bearer authentication applies
+# independently.
 enable_internal_ingest = false
 # internal_token_env = "EVENTS_BRIDGE_INTERNAL_TOKEN"
 

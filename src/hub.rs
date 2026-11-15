@@ -21,6 +21,7 @@ pub struct Hub {
     state: Arc<AppState>,
     router: Router,
     dispatcher: Dispatcher,
+    mcp_cancellation: CancellationToken,
 }
 
 impl Hub {
@@ -44,7 +45,8 @@ impl Hub {
             Ok(count) => tracing::info!(count, "recovered interrupted deliveries"),
             Err(error) => tracing::warn!(%error, "could not recover interrupted deliveries"),
         }
-        let router = http::router(state.clone());
+        let mcp_cancellation = CancellationToken::new();
+        let router = http::router_with_cancellation(state.clone(), mcp_cancellation.clone());
         let dispatcher = Dispatcher::new(
             state.repo.clone(),
             state.bus.clone(),
@@ -55,6 +57,7 @@ impl Hub {
             state,
             router,
             dispatcher,
+            mcp_cancellation,
         })
     }
 
@@ -104,8 +107,13 @@ impl Hub {
         );
 
         let (cancellation, dispatcher) = self.spawn_dispatcher();
-        let result = axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown_signal())
+        let mcp_cancellation = self.mcp_cancellation.clone();
+        let router = self.router();
+        let result = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                mcp_cancellation.cancel();
+            })
             .await;
         cancellation.cancel();
         let _ = dispatcher.await;
