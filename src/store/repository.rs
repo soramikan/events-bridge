@@ -417,8 +417,26 @@ impl Repository {
     pub fn upsert_subscription(&self, new: NewSubscription) -> Result<Subscription> {
         let arguments = serde_json::to_string(&new.arguments)?;
         let now = now_rfc3339();
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+
+        // If the prior subscription had already been deactivated, unverified, or
+        // expired before this refresh arrived, terminalize its stale backlog
+        // before resetting `active` / `refresh_before`.
+        tx.execute(
+            "UPDATE deliveries SET status = 'failed', updated_at = ?2 \
+             WHERE subscription_id = ?1 \
+               AND status IN ('pending', 'in_progress') \
+               AND EXISTS ( \
+                   SELECT 1 FROM subscriptions s \
+                   WHERE s.id = ?1 \
+                     AND (s.active = 0 OR s.verified = 0 \
+                          OR (s.refresh_before IS NOT NULL AND s.refresh_before <= ?2)) \
+               )",
+            params![new.id, now],
+        )?;
+
+        tx.execute(
             "INSERT INTO subscriptions \
                  (id, principal, event_name, arguments, filter_hash, callback_url, secret, \
                   delivery_mode, verified, active, created_at, updated_at, refresh_before) \
@@ -442,9 +460,10 @@ impl Repository {
                 new.refresh_before,
             ],
         )?;
-        drop(conn);
-        self.get_subscription(&new.id)?
-            .context("subscription disappeared after upsert")
+        let subscription =
+            load_subscription(&tx, &new.id)?.context("subscription disappeared after upsert")?;
+        tx.commit()?;
+        Ok(subscription)
     }
 
     /// Fetch a subscription by id.
@@ -1273,6 +1292,60 @@ mod tests {
         assert!(repo.claim_next_due().unwrap().is_none());
         assert_eq!(
             repo.delivery_statuses("evt_expiring").unwrap()[0].1,
+            "failed"
+        );
+        assert_eq!(repo.pending_delivery_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn refreshing_expired_subscription_does_not_revive_old_backlog() {
+        let repo = repository();
+        repo.upsert_subscription(NewSubscription {
+            id: "sub_reup".into(),
+            principal: "local".into(),
+            event_name: "t3.run.completed".into(),
+            arguments: json!({"environment_id": "linux-main"}),
+            filter_hash: "hash-reup".into(),
+            callback_url: "https://receiver.example.com/hook".into(),
+            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            refresh_before: None,
+        })
+        .unwrap();
+        repo.ingest_event(NewEvent {
+            id: Some("evt_before_expiry".into()),
+            source: None,
+            kind: "t3.run.completed".into(),
+            payload: json!({"environment_id": "linux-main"}),
+            occurred_at: None,
+        })
+        .unwrap();
+
+        // Expire the subscription before `claim_next_due` runs.
+        let past = format_rfc3339(Utc::now() - ChronoDuration::seconds(1));
+        repo.lock()
+            .execute(
+                "UPDATE subscriptions SET refresh_before = ?2 WHERE id = ?1",
+                params!["sub_reup", past],
+            )
+            .unwrap();
+
+        // Refresh the same subscription before any claim runs.
+        let future = format_rfc3339(Utc::now() + ChronoDuration::hours(1));
+        repo.upsert_subscription(NewSubscription {
+            id: "sub_reup".into(),
+            principal: "local".into(),
+            event_name: "t3.run.completed".into(),
+            arguments: json!({"environment_id": "linux-main"}),
+            filter_hash: "hash-reup".into(),
+            callback_url: "https://receiver.example.com/hook".into(),
+            secret: "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD".into(),
+            refresh_before: Some(future),
+        })
+        .unwrap();
+
+        assert!(repo.claim_next_due().unwrap().is_none());
+        assert_eq!(
+            repo.delivery_statuses("evt_before_expiry").unwrap()[0].1,
             "failed"
         );
         assert_eq!(repo.pending_delivery_count().unwrap(), 0);
