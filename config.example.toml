@@ -21,6 +21,19 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 enable_internal_ingest = false
 # internal_token_env = "EVENTS_BRIDGE_INTERNAL_TOKEN"
 
+# Authenticated Edge -> Hub T3 forwarding. Disabled by default. When enabled,
+# `POST /internal/edge/t3` accepts signed requests from `events-bridge edge`.
+# The shared HMAC secret is read from the named environment variable; never
+# write the secret itself to this file.
+enable_edge_ingest = false
+# edge_shared_secret_env = "EVENTS_BRIDGE_EDGE_SECRET"
+# Accepted clock skew for X-Edge-Timestamp (seconds, must be > 0).
+edge_max_skew_secs = 300
+# Maximum edge request body (1 byte .. 16 MiB).
+max_edge_body_bytes = 4194304
+# Retention period for incomplete chunked snapshot stages (seconds, must be > 0).
+edge_stage_ttl_secs = 3600
+
 [database]
 path = "/var/lib/events-bridge/events.db"
 
@@ -49,3 +62,82 @@ poll_interval_ms = 5000
 
 [logging]
 level = "info,events_bridge=debug"
+
+# T3 Code Collector (Phase 2).
+#
+# The collector opens T3 Code's state database read-only. It needs no token:
+# T3 Code performs its own authentication. Enable this only on the host that
+# runs T3 Code. `state_db_path` defaults to ~/.t3/userdata/statev2.sqlite and
+# `environment_id` is read from the sibling `environment-id` file.
+[collectors.t3]
+enabled = false
+# state_db_path = "/home/example/.t3/userdata/statev2.sqlite"
+# environment_id = "59f9e9a5-51a0-41b4-9790-6bc8cbc2245e"
+# environment_id_path = "/home/example/.t3/userdata/environment-id"
+# Optional web base URL; deep links are only emitted when this is set.
+# t3_web_base_url = "https://t3.example.com"
+poll_interval_ms = 1000
+watch_wal = true
+batch_size = 500
+
+# GitHub Collector (Phase 3).
+#
+# GitHub authenticates webhook deliveries with an HMAC-SHA256 signature, not
+# the MCP bearer token. The secret and the optional REST API token are read
+# from environment variables and must never be written to this file.
+#
+# `webhook_enabled` exposes POST /webhooks/github. `poll_enabled` periodically
+# reconciles pull requests and workflow runs through the REST API (and needs at
+# least one repository). Both paths can run together; duplicate CI failures are
+# normalized by workflow run id and attempt.
+[collectors.github]
+webhook_enabled = false
+poll_enabled = false
+
+# Environment variable holding the GitHub webhook HMAC secret.
+# Required when webhook_enabled = true.
+# webhook_secret_env = "EVENTS_BRIDGE_GITHUB_WEBHOOK_SECRET"
+
+# Optional environment variable holding a GitHub personal/app token. When set,
+# the token is sent as `Authorization: Bearer ...` on REST reconciliation.
+# token_env = "EVENTS_BRIDGE_GITHUB_TOKEN"
+
+# Watched "owner/repo" entries. Required when poll_enabled = true. When set,
+# webhook deliveries for other repositories are acknowledged and ignored.
+repositories = []
+# repositories = ["soramikan/events-bridge"]
+
+api_base_url = "https://api.github.com"
+poll_interval_secs = 60
+# Accepted webhook body ceiling (at most 10 MiB).
+max_webhook_body_bytes = 1048576
+
+# Edge Collector (Phase 4).
+#
+# Only the `edge` subcommand requires this section. A hub deployment may omit
+# it entirely. The edge reads T3 Code's state database read-only, derives the
+# same T3 write batches as the hub-local collector, and forwards them to the
+# hub with an HMAC-SHA256 signature. The local cursor advances only after the
+# hub answers 2xx, so a hub outage is retried without losing events.
+[edge]
+# Hub base URL. Must be http or https, hierarchical, and have no query or
+# fragment. The edge appends /internal/edge/t3.
+# hub_url = "https://bridge.example.com"
+
+# Environment variable holding the shared edge HMAC secret. Required by the
+# `edge` subcommand. The hub reads the same variable through
+# server.edge_shared_secret_env.
+# shared_secret_env = "EVENTS_BRIDGE_EDGE_SECRET"
+
+# Stable edge identifier (1..=128 characters, no whitespace/control). When
+# omitted, the resolved collectors.t3.environment_id is used.
+# edge_id = "mac-mini"
+
+request_timeout_secs = 15
+retry_initial_ms = 500
+retry_max_ms = 30000
+
+# Maximum serialized size of one snapshot chunk request. Snapshots larger than
+# this are uploaded as SnapshotChunk requests and finalized with an atomic
+# SnapshotCommit. Must be at least 1024.
+max_snapshot_chunk_bytes = 1048576
