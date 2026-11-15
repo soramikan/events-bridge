@@ -27,7 +27,7 @@ use events_bridge::{
     config::{Config, MAX_WEBHOOK_BODY_BYTES},
     delivery::verification::CallbackPolicy,
     hub::Hub,
-    store::{NewEvent, NewSubscription},
+    store::{NewEvent, NewSubscription, T3Approval, T3Project, T3Run, T3Snapshot, T3Thread},
     util::format_rfc3339,
 };
 use serde_json::{Value, json};
@@ -594,7 +594,16 @@ async fn initialize_advertises_events_and_lists_the_catalog() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["list_events", "get_event", "ack_events"]);
+    assert_eq!(
+        names,
+        vec![
+            "list_events",
+            "get_event",
+            "get_t3_run",
+            "get_t3_approvals",
+            "ack_events",
+        ]
+    );
 
     let listed = rpc_result(client.request("events/list", json!({})).await);
     let events = listed["events"].as_array().unwrap();
@@ -1308,6 +1317,127 @@ async fn pull_tools_return_events_without_affecting_delivery_state() {
 
     // No subscription exists, so the ack path must not have created deliveries.
     assert_eq!(hub.hub.repository().pending_delivery_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn t3_pull_tools_return_materialized_run_and_pending_approvals() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+    hub.hub
+        .repository()
+        .apply_t3_snapshot(
+            "linux-main",
+            &T3Snapshot {
+                projects: vec![T3Project {
+                    environment_id: "linux-main".into(),
+                    project_id: "lnako".into(),
+                    title: "lnako".into(),
+                    workspace_root: "/repo/lnako".into(),
+                    deleted_at: None,
+                    updated_at: "2026-11-16T01:00:00.000Z".into(),
+                }],
+                threads: vec![T3Thread {
+                    environment_id: "linux-main".into(),
+                    thread_id: "thread-42".into(),
+                    project_id: "lnako".into(),
+                    title: "Fix the build".into(),
+                    branch: Some("main".into()),
+                    deleted_at: None,
+                    updated_at: "2026-11-16T01:00:01.000Z".into(),
+                }],
+                runs: vec![T3Run {
+                    environment_id: "linux-main".into(),
+                    run_id: "run-102".into(),
+                    thread_id: "thread-42".into(),
+                    project_id: "lnako".into(),
+                    ordinal: 1,
+                    provider_instance_id: Some("test".into()),
+                    status: "failed".into(),
+                    last_turn_status: Some("failed".into()),
+                    checkpoint_id: None,
+                    error: Some("no API key".into()),
+                    summary: Some("Run #1 failed".into()),
+                    requested_at: Some("2026-11-16T01:00:02.000Z".into()),
+                    started_at: Some("2026-11-16T01:00:03.000Z".into()),
+                    completed_at: Some("2026-11-16T01:00:09.000Z".into()),
+                    updated_at: "2026-11-16T01:00:09.000Z".into(),
+                }],
+                approvals: vec![T3Approval {
+                    environment_id: "linux-main".into(),
+                    approval_id: "approval-1".into(),
+                    thread_id: "thread-42".into(),
+                    run_id: "run-102".into(),
+                    node_id: Some("node-1".into()),
+                    kind: "command".into(),
+                    status: "pending".into(),
+                    summary: Some("Run a command".into()),
+                    decision: None,
+                    created_at: "2026-11-16T01:00:05.000Z".into(),
+                    resolved_at: None,
+                    updated_at: "2026-11-16T01:00:05.000Z".into(),
+                }],
+            },
+            0,
+        )
+        .unwrap();
+
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let listed = client.request("tools/list", json!({})).await;
+    let names: Vec<&str> = listed
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"get_t3_run"), "{listed}");
+    assert!(names.contains(&"get_t3_approvals"), "{listed}");
+
+    let run = client
+        .tool_call("get_t3_run", json!({"run_id": "run-102"}))
+        .await;
+    assert_eq!(run["isError"], false, "{run}");
+    let structured = &run["structuredContent"]["run"];
+    assert_eq!(structured["status"], "failed");
+    assert_eq!(structured["error"], "no API key");
+    assert_eq!(structured["pendingApprovalsCount"], 1);
+
+    let pending = client
+        .tool_call("get_t3_approvals", json!({"environment_id": "linux-main"}))
+        .await;
+    assert_eq!(pending["isError"], false, "{pending}");
+    let approvals = pending["structuredContent"]["approvals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["approvalId"], "approval-1");
+    assert_eq!(approvals[0]["status"], "pending");
+
+    let filtered = client
+        .tool_call(
+            "get_t3_approvals",
+            json!({"environment_id": "linux-main", "project_id": "other"}),
+        )
+        .await;
+    assert_eq!(filtered["isError"], false, "{filtered}");
+    assert!(
+        filtered["structuredContent"]["approvals"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let missing = client
+        .tool_call("get_t3_run", json!({"run_id": "missing"}))
+        .await;
+    assert_eq!(missing["isError"], true);
 }
 
 #[tokio::test]

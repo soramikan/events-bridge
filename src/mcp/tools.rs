@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::mcp::event_catalog;
-use crate::store::{Event, EventQuery, Repository};
+use crate::store::{Event, EventQuery, Repository, T3ApprovalQuery};
 use crate::util::{format_rfc3339, parse_rfc3339};
 
 /// Maximum page size for `list_events`.
@@ -76,6 +76,39 @@ pub fn definitions() -> Vec<Tool> {
                 true,
             ),
             tool(
+                "get_t3_run",
+                "Fetch the latest materialized state of a T3 Code run, including its pending approval count.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                        "environment_id": {"type": "string"}
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
+                "get_t3_approvals",
+                "List T3 Code approvals. Defaults to pending approvals; pass status \"all\" for every state.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "environment_id": {"type": "string"},
+                        "project_id": {"type": "string"},
+                        "thread_id": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "resolved", "expired", "cancelled", "all"]
+                        },
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+                    },
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
                 "ack_events",
                 "Record that the user has seen events. This is separate from webhook delivery confirmation.",
                 json!({
@@ -129,6 +162,8 @@ impl ToolService {
         let result = match request.name.as_ref() {
             "list_events" => self.list_events(arguments),
             "get_event" => self.get_event(arguments),
+            "get_t3_run" => self.get_t3_run(arguments),
+            "get_t3_approvals" => self.get_t3_approvals(arguments),
             "ack_events" => self.ack_events(principal, arguments),
             other => Err(format!("unknown tool `{other}`")),
         };
@@ -219,6 +254,40 @@ impl ToolService {
         Ok(json!({"event": event}))
     }
 
+    fn get_t3_run(&self, arguments: Value) -> Result<Value, String> {
+        let args: GetT3RunArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let detail = self
+            .repo
+            .get_t3_run(&args.run_id, args.environment_id.as_deref())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("T3 run `{}` not found", args.run_id))?;
+        Ok(json!({"run": detail}))
+    }
+
+    fn get_t3_approvals(&self, arguments: Value) -> Result<Value, String> {
+        let args: GetT3ApprovalsArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let status = args.status.unwrap_or_else(|| "pending".into());
+        if !matches!(
+            status.as_str(),
+            "pending" | "resolved" | "expired" | "cancelled" | "all"
+        ) {
+            return Err(format!("unknown approval status `{status}`"));
+        }
+        let approvals = self
+            .repo
+            .list_t3_approvals(&T3ApprovalQuery {
+                environment_id: args.environment_id,
+                project_id: args.project_id,
+                thread_id: args.thread_id,
+                status: Some(status),
+                limit: args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as i64,
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"approvals": approvals}))
+    }
+
     fn ack_events(&self, principal: &str, arguments: Value) -> Result<Value, String> {
         let args: AckEventsArgs = serde_json::from_value(arguments)
             .map_err(|error| format!("invalid arguments: {error}"))?;
@@ -272,6 +341,30 @@ struct GetEventArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GetT3RunArgs {
+    #[serde(alias = "runId")]
+    run_id: String,
+    #[serde(default, alias = "environmentId")]
+    environment_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetT3ApprovalsArgs {
+    #[serde(default, alias = "environmentId")]
+    environment_id: Option<String>,
+    #[serde(default, alias = "projectId")]
+    project_id: Option<String>,
+    #[serde(default, alias = "threadId")]
+    thread_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AckEventsArgs {
     #[serde(alias = "eventIds")]
     event_ids: Vec<String>,
@@ -291,7 +384,16 @@ mod tests {
     fn tool_definitions_are_stable() {
         let tools = definitions();
         let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
-        assert_eq!(names, vec!["list_events", "get_event", "ack_events"]);
+        assert_eq!(
+            names,
+            vec![
+                "list_events",
+                "get_event",
+                "get_t3_run",
+                "get_t3_approvals",
+                "ack_events",
+            ]
+        );
         assert_eq!(get("list_events").unwrap().name, "list_events");
         assert!(get("missing").is_none());
     }

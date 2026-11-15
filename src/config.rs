@@ -31,6 +31,8 @@ pub struct Config {
     pub delivery: DeliveryConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
+    /// Upstream collectors.
+    pub collectors: CollectorsConfig,
 }
 
 /// HTTP listener settings.
@@ -158,6 +160,58 @@ impl Default for DeliveryConfig {
     }
 }
 
+/// Upstream collector settings.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorsConfig {
+    /// T3 Code collector settings.
+    pub t3: T3CollectorConfig,
+}
+
+/// T3 Code collector settings.
+///
+/// The collector reads the T3 Code SQLite database strictly read-only. It
+/// never contains credentials: T3 Code authenticates itself and exposes no
+/// token to this process.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct T3CollectorConfig {
+    /// Start the collector with the hub.
+    pub enabled: bool,
+    /// Path to T3 Code's `statev2.sqlite`. Empty resolves to
+    /// `~/.t3/userdata/statev2.sqlite`.
+    pub state_db_path: PathBuf,
+    /// Explicit environment id. When empty, `environment_id_path` or the
+    /// `environment-id` file next to the state database is used.
+    pub environment_id: Option<String>,
+    /// Path to the T3 Code environment id file.
+    pub environment_id_path: Option<PathBuf>,
+    /// Optional T3 Code web base URL used to build deep links.
+    pub t3_web_base_url: Option<String>,
+    /// Full polling fallback interval.
+    pub poll_interval_ms: u64,
+    /// Probe the WAL/database file metadata at a short interval for lower
+    /// latency. This is still polling; no inotify dependency is required.
+    pub watch_wal: bool,
+    /// Upstream events read per query.
+    pub batch_size: usize,
+}
+
+impl Default for T3CollectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_db_path: PathBuf::new(),
+            environment_id: None,
+            environment_id_path: None,
+            t3_web_base_url: None,
+            poll_interval_ms: 1_000,
+            watch_wal: true,
+            batch_size: 500,
+        }
+    }
+}
+
 /// Logging settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -212,6 +266,32 @@ impl Config {
                 self.subscriptions.min_ttl_secs,
                 self.subscriptions.max_ttl_secs
             );
+        }
+        let t3 = &self.collectors.t3;
+        if t3.poll_interval_ms == 0 {
+            bail!("collectors.t3.poll_interval_ms must be greater than zero");
+        }
+        if t3.batch_size == 0 {
+            bail!("collectors.t3.batch_size must be greater than zero");
+        }
+        if t3
+            .environment_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("collectors.t3.environment_id must not be empty when set");
+        }
+        if let Some(base) = t3.t3_web_base_url.as_deref() {
+            let url = url::Url::parse(base)
+                .with_context(|| format!("collectors.t3.t3_web_base_url `{base}` is not a URL"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("collectors.t3.t3_web_base_url must use http or https");
+            }
+            if url.cannot_be_a_base() || url.query().is_some() || url.fragment().is_some() {
+                bail!(
+                    "collectors.t3.t3_web_base_url must be a hierarchical URL without query or fragment"
+                );
+            }
         }
         Ok(())
     }
@@ -282,6 +362,42 @@ mod tests {
         let error = Config::parse("[server]\nbind = \"127.0.0.1:1\"\nsurprise = true\n")
             .expect_err("unknown key must fail");
         assert!(error.to_string().contains("surprise"), "{error}");
+    }
+
+    #[test]
+    fn t3_collector_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[collectors.t3]\n\
+             enabled = true\n\
+             environment_id = \"env-1\"\n\
+             t3_web_base_url = \"https://t3.example.com\"\n\
+             poll_interval_ms = 500\n\
+             watch_wal = false\n\
+             batch_size = 42\n",
+        )
+        .expect("collector config parses");
+        let t3 = &config.collectors.t3;
+        assert!(t3.enabled);
+        assert_eq!(t3.environment_id.as_deref(), Some("env-1"));
+        assert_eq!(
+            t3.t3_web_base_url.as_deref(),
+            Some("https://t3.example.com")
+        );
+        assert_eq!(t3.poll_interval_ms, 500);
+        assert!(!t3.watch_wal);
+        assert_eq!(t3.batch_size, 42);
+
+        let error = Config::parse("[collectors.t3]\npoll_interval_ms = 0\n")
+            .expect_err("zero poll interval must fail");
+        assert!(error.to_string().contains("poll_interval_ms"), "{error}");
+
+        let error = Config::parse("[collectors.t3]\nt3_web_base_url = \"ftp://example.com\"\n")
+            .expect_err("non-http URL must fail");
+        assert!(error.to_string().contains("http"), "{error}");
+
+        let error = Config::parse("[collectors.t3]\nenvironment_id = \"  \"\n")
+            .expect_err("blank environment id must fail");
+        assert!(error.to_string().contains("environment_id"), "{error}");
     }
 
     #[test]

@@ -6,7 +6,8 @@ T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI �
 - 購読・イベント・配信状態は SQLite に永続化し、再起動後も未配信分から再開します
 - 配信は Standard Webhooks（HMAC-SHA256）署名つき、指数バックオフ再送つき
 
-設計の正本は [docs/DESIGN.md](docs/DESIGN.md) です。
+設計の正本は [docs/DESIGN.md](docs/DESIGN.md)、T3 Code Collector の調査・実装メモは
+[docs/T3-COLLECTOR.md](docs/T3-COLLECTOR.md) です。
 
 ## Phase 1 の実装範囲
 
@@ -20,6 +21,17 @@ T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI �
 - Pull ツール `list_events` / `get_event` / `ack_events`
 - `stdio`: 汎用 MCP クライアント向けの基本初期化
 - `edge`: 骨格のみ（Phase 2 以降）
+
+## Phase 2 の実装範囲（T3 Code Collector）
+
+- T3 Code 0.1.9 の `statev2.sqlite` を **読み取り専用**で参照し、
+  `orchestration_events` の `sequence` をカーソルとして追従
+- 初回起動時は Projection からスナップショットを水和し、過去の完了 Run を配信しない
+- `run.updated` の最終確定だけから `t3.run.completed` / `t3.run.failed` を導出
+  （`provider-turn.updated` / `run-attempt.updated` では発火しない）
+- `runtime-request.updated` から `t3.approval.required` を導出
+- Pull ツール `get_t3_run` / `get_t3_approvals`
+- 詳細は [docs/T3-COLLECTOR.md](docs/T3-COLLECTOR.md)
 
 ## 起動
 
@@ -82,5 +94,5 @@ cargo test
 
 ## 状態
 
-Phase 1 実装済み。ChatGPT 実機との接続（Secure MCP Tunnel の権限・ワークスペース
+Phase 1・Phase 2（T3 Code Collector）実装済み。ChatGPT 実機との接続（Secure MCP Tunnel の権限・ワークスペース
 関連付け、dots の監視指示登録）は運用側の手順として別途行います。

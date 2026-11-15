@@ -14,10 +14,16 @@ pub struct Migration {
 }
 
 /// All migrations in application order.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../../migrations/001_initial.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../../migrations/001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../../migrations/002_t3_collector.sql"),
+    },
+];
 
 /// Apply every migration newer than the connection's `user_version`.
 pub fn run(conn: &mut Connection) -> rusqlite::Result<()> {

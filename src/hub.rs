@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::AppState,
+    collectors::T3Collector,
     config::Config,
     delivery::Dispatcher,
     delivery::verification::CallbackPolicy,
@@ -86,6 +87,35 @@ impl Hub {
         self.dispatcher.drain().await
     }
 
+    /// Start the T3 Code collector when `collectors.t3.enabled` is true.
+    ///
+    /// The collector performs its first-start snapshot before this returns, so
+    /// a misconfigured state database fails hub startup instead of being
+    /// retried silently.
+    pub fn spawn_t3_collector(&self) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
+        if !self.state.config.collectors.t3.enabled {
+            return Ok(None);
+        }
+        let collector = T3Collector::from_config(
+            &self.state.config,
+            self.state.repo.clone(),
+            self.state.bus.clone(),
+        )?;
+        tracing::info!(
+            environment_id = %collector.environment_id(),
+            state_db = %collector.source_path().display(),
+            "T3 collector started"
+        );
+        let cancellation = CancellationToken::new();
+        let child = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(error) = collector.run(child).await {
+                tracing::error!(%error, "T3 collector stopped");
+            }
+        });
+        Ok(Some((cancellation, handle)))
+    }
+
     /// Start the delivery worker.
     pub fn spawn_dispatcher(&self) -> (CancellationToken, JoinHandle<()>) {
         let dispatcher = self.dispatcher.clone();
@@ -106,6 +136,7 @@ impl Hub {
             "events-bridge hub listening"
         );
 
+        let collector = self.spawn_t3_collector()?;
         let (cancellation, dispatcher) = self.spawn_dispatcher();
         let mcp_cancellation = self.mcp_cancellation.clone();
         let router = self.router();
@@ -116,6 +147,10 @@ impl Hub {
             })
             .await;
         cancellation.cancel();
+        if let Some((collector_cancellation, collector_handle)) = collector {
+            collector_cancellation.cancel();
+            let _ = collector_handle.await;
+        }
         let _ = dispatcher.await;
         result?;
         Ok(())

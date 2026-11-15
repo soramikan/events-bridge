@@ -49,3 +49,20 @@ poll_interval_ms = 5000
 
 [logging]
 level = "info,events_bridge=debug"
+
+# T3 Code Collector (Phase 2).
+#
+# The collector opens T3 Code's state database read-only. It needs no token:
+# T3 Code performs its own authentication. Enable this only on the host that
+# runs T3 Code. `state_db_path` defaults to ~/.t3/userdata/statev2.sqlite and
+# `environment_id` is read from the sibling `environment-id` file.
+[collectors.t3]
+enabled = false
+# state_db_path = "/home/example/.t3/userdata/statev2.sqlite"
+# environment_id = "59f9e9a5-51a0-41b4-9790-6bc8cbc2245e"
+# environment_id_path = "/home/example/.t3/userdata/environment-id"
+# Optional web base URL; deep links are only emitted when this is set.
+# t3_web_base_url = "https://t3.example.com"
+poll_interval_ms = 1000
+watch_wal = true
+batch_size = 500
