@@ -36,8 +36,12 @@ use url::Url;
 use crate::{
     app::AppState,
     auth::AuthError,
+    edge_protocol::{
+        EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE, HEADER_EDGE_SIGNATURE,
+        HEADER_EDGE_TIMESTAMP, valid_edge_token, verify as verify_edge_signature,
+    },
     mcp::{error::INVALID_REQUEST, handler::EventsHandler},
-    store::NewEvent,
+    store::{NewEvent, SnapshotCommitError},
     util::constant_time_eq,
 };
 
@@ -84,8 +88,17 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
         .route("/mcp", any(mcp_entry))
         .route("/healthz", get(healthz))
         .route("/internal/events", post(internal_ingest))
+        .route("/internal/edge/t3", post(edge_ingest))
+        .route("/webhooks/github", post(github_webhook_entry))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+async fn github_webhook_entry(
+    State(state): State<Arc<McpHttpState>>,
+    request: Request,
+) -> Response {
+    crate::collectors::github_webhook::handle(state.app.clone(), request).await
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -225,6 +238,10 @@ fn validate_http_security(
         }
     }
     Ok(())
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 /// `POST /mcp` only accepts JSON. Media type parameters such as
@@ -527,6 +544,457 @@ async fn internal_ingest(
         "deliveriesCreated": outcome.deliveries_created,
     }))
     .into_response()
+}
+
+async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -> Response {
+    if !state.app.config.server.enable_edge_ingest {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Err(response) = validate_http_security(
+        request.headers(),
+        request.uri(),
+        &state.app.config.server.allowed_hosts,
+    ) {
+        return response.into_response();
+    }
+    if let Err(response) = require_json_content_type(request.headers()) {
+        return response.into_response();
+    }
+
+    let Some(secret) = state.app.edge_shared_secret.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "edge ingest secret is not configured"})),
+        )
+            .into_response();
+    };
+
+    let headers = request.headers().clone();
+    let limit = state.app.config.server.max_edge_body_bytes.max(1);
+    let body = match axum::body::to_bytes(request.into_body(), limit).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error": "edge request body too large"})),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(edge_id) = header_value(&headers, HEADER_EDGE_ID) else {
+        return edge_unauthorized("missing X-Edge-Id");
+    };
+    if !valid_edge_token(edge_id) {
+        return edge_unauthorized("invalid X-Edge-Id");
+    }
+    let Some(nonce) = header_value(&headers, HEADER_EDGE_NONCE) else {
+        return edge_unauthorized("missing X-Edge-Nonce");
+    };
+    if !valid_edge_token(nonce) {
+        return edge_unauthorized("invalid X-Edge-Nonce");
+    }
+    let Some(timestamp) =
+        header_value(&headers, HEADER_EDGE_TIMESTAMP).and_then(|value| value.parse::<i64>().ok())
+    else {
+        return edge_unauthorized("invalid X-Edge-Timestamp");
+    };
+    let Some(signature) = header_value(&headers, HEADER_EDGE_SIGNATURE) else {
+        return edge_unauthorized("missing X-Edge-Signature");
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    // `abs_diff` is unsigned and cannot overflow or panic for any pair of
+    // i64 values, including i64::MIN and i64::MAX.
+    if now.abs_diff(timestamp) > state.app.config.server.edge_max_skew_secs {
+        return edge_unauthorized("X-Edge-Timestamp outside the accepted window");
+    }
+    if !verify_edge_signature(
+        secret.expose_secret().as_bytes(),
+        edge_id,
+        timestamp,
+        nonce,
+        &body,
+        signature,
+    ) {
+        return edge_unauthorized("invalid X-Edge-Signature");
+    }
+
+    let request: EdgeT3IngestRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid edge payload: {error}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = validate_edge_request(&request) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+
+    // The nonce is consumed only after the signature, timestamp and payload
+    // have all been validated. Inside the repository transaction we also
+    // re-check `timestamp` against the transaction's clock before pruning
+    // expired nonces, so crossing a second boundary between HTTP pre-check and
+    // DB lock acquisition cannot prune a still-valid nonce or accept a replay.
+    match state.app.repo.consume_edge_nonce_checked(
+        edge_id,
+        nonce,
+        timestamp,
+        state.app.config.server.edge_max_skew_secs,
+    ) {
+        Ok(crate::store::EdgeNonceStatus::Accepted) => {}
+        Ok(crate::store::EdgeNonceStatus::Replayed) => {
+            return edge_unauthorized("replayed X-Edge-Nonce");
+        }
+        Ok(crate::store::EdgeNonceStatus::TimestampOutOfWindow) => {
+            return edge_unauthorized("X-Edge-Timestamp outside the accepted window");
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not record edge nonce");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not record edge nonce"})),
+            )
+                .into_response();
+        }
+    }
+
+    match request {
+        EdgeT3IngestRequest::Snapshot {
+            environment_id,
+            max_sequence,
+            snapshot,
+        } => {
+            if let Err(error) =
+                state
+                    .app
+                    .repo
+                    .apply_t3_snapshot(&environment_id, &snapshot, max_sequence)
+            {
+                tracing::warn!(%error, %environment_id, "edge snapshot apply failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not apply edge snapshot"})),
+                )
+                    .into_response();
+            }
+            tracing::info!(
+                edge_id,
+                %environment_id,
+                max_sequence,
+                projects = snapshot.projects.len(),
+                threads = snapshot.threads.len(),
+                runs = snapshot.runs.len(),
+                approvals = snapshot.approvals.len(),
+                "edge snapshot accepted"
+            );
+            Json(json!({
+                "status": "ok",
+                "snapshot": true,
+                "environmentId": environment_id,
+                "maxSequence": max_sequence,
+            }))
+            .into_response()
+        }
+        EdgeT3IngestRequest::SnapshotChunk {
+            environment_id,
+            snapshot_id,
+            chunk_index,
+            snapshot,
+        } => {
+            if let Err(error) = state.app.repo.stage_edge_snapshot_chunk_with_ttl(
+                &environment_id,
+                &snapshot_id,
+                chunk_index,
+                &snapshot,
+                state.app.config.server.edge_stage_ttl_secs,
+            ) {
+                tracing::warn!(%error, %environment_id, %snapshot_id, chunk_index, "edge snapshot chunk stage failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not stage edge snapshot chunk"})),
+                )
+                    .into_response();
+            }
+            Json(json!({
+                "status": "ok",
+                "snapshot": true,
+                "chunk": true,
+                "environmentId": environment_id,
+                "snapshotId": snapshot_id,
+                "chunkIndex": chunk_index,
+            }))
+            .into_response()
+        }
+        EdgeT3IngestRequest::SnapshotPart {
+            environment_id,
+            snapshot_id,
+            chunk_index,
+            data,
+        } => {
+            if let Err(error) = state.app.repo.stage_edge_snapshot_part_with_ttl(
+                &environment_id,
+                &snapshot_id,
+                chunk_index,
+                &data,
+                state.app.config.server.edge_stage_ttl_secs,
+            ) {
+                tracing::warn!(%error, %environment_id, %snapshot_id, chunk_index, "edge snapshot part stage failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not stage edge snapshot part"})),
+                )
+                    .into_response();
+            }
+            Json(json!({
+                "status": "ok",
+                "snapshot": true,
+                "part": true,
+                "environmentId": environment_id,
+                "snapshotId": snapshot_id,
+                "chunkIndex": chunk_index,
+            }))
+            .into_response()
+        }
+        EdgeT3IngestRequest::SnapshotCommit {
+            environment_id,
+            snapshot_id,
+            max_sequence,
+            total_chunks,
+        } => {
+            match state.app.repo.apply_t3_snapshot_chunks_with_ttl(
+                &environment_id,
+                &snapshot_id,
+                max_sequence,
+                total_chunks,
+                state.app.config.server.edge_stage_ttl_secs,
+            ) {
+                Ok(()) => {
+                    tracing::info!(
+                        edge_id,
+                        %environment_id,
+                        %snapshot_id,
+                        max_sequence,
+                        total_chunks,
+                        "edge chunked snapshot committed"
+                    );
+                    Json(json!({
+                        "status": "ok",
+                        "snapshot": true,
+                        "committed": true,
+                        "environmentId": environment_id,
+                        "snapshotId": snapshot_id,
+                        "maxSequence": max_sequence,
+                        "totalChunks": total_chunks,
+                    }))
+                    .into_response()
+                }
+                Err(SnapshotCommitError::MissingChunks {
+                    snapshot_id,
+                    expected,
+                    found,
+                }) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": format!(
+                            "snapshot `{snapshot_id}` is missing chunks: expected {expected}, found {found}"
+                        )
+                    })),
+                )
+                    .into_response(),
+                Err(SnapshotCommitError::Invalid(message)) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error": message})),
+                )
+                    .into_response(),
+                Err(SnapshotCommitError::Store(error)) => {
+                    tracing::warn!(%error, %environment_id, %snapshot_id, "edge snapshot commit failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "could not commit edge snapshot"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        EdgeT3IngestRequest::Batches { batches } => {
+            let outcome = match state.app.repo.apply_t3_batches(&batches) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(%error, edge_id, "edge batches apply failed");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "could not apply edge batches"})),
+                    )
+                        .into_response();
+                }
+            };
+            let new_events = outcome
+                .events
+                .iter()
+                .filter(|event| !event.duplicate)
+                .count();
+            if new_events > 0 {
+                state.app.bus.notify();
+            }
+            tracing::info!(
+                edge_id,
+                batches = batches.len(),
+                events = outcome.events.len(),
+                new_events,
+                deliveries = outcome.deliveries_created,
+                "edge batches accepted"
+            );
+            Json(json!({
+                "status": "ok",
+                "snapshot": false,
+                "batches": batches.len(),
+                "events": outcome.events.len(),
+                "newEvents": new_events,
+                "duplicates": outcome.duplicates,
+                "deliveriesCreated": outcome.deliveries_created,
+            }))
+            .into_response()
+        }
+    }
+}
+
+fn validate_edge_request(request: &EdgeT3IngestRequest) -> Result<(), String> {
+    match request {
+        EdgeT3IngestRequest::Snapshot {
+            environment_id,
+            max_sequence,
+            snapshot,
+        } => {
+            validate_snapshot(environment_id, *max_sequence, snapshot)?;
+        }
+        EdgeT3IngestRequest::SnapshotChunk {
+            environment_id,
+            snapshot_id,
+            chunk_index,
+            snapshot,
+        } => {
+            if environment_id.trim().is_empty() {
+                return Err("snapshot chunk environment_id must not be empty".into());
+            }
+            if !valid_edge_token(snapshot_id) {
+                return Err("snapshot chunk snapshot_id is invalid".into());
+            }
+            if *chunk_index > i64::MAX as usize {
+                return Err("snapshot chunk chunk_index is too large".into());
+            }
+            validate_snapshot_entities(environment_id, snapshot)?;
+        }
+        EdgeT3IngestRequest::SnapshotPart {
+            environment_id,
+            snapshot_id,
+            chunk_index,
+            data,
+        } => {
+            use base64::Engine;
+
+            if environment_id.trim().is_empty() {
+                return Err("snapshot part environment_id must not be empty".into());
+            }
+            if !valid_edge_token(snapshot_id) {
+                return Err("snapshot part snapshot_id is invalid".into());
+            }
+            if *chunk_index > i64::MAX as usize {
+                return Err("snapshot part chunk_index is too large".into());
+            }
+            if data.is_empty()
+                || base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .is_err()
+            {
+                return Err("snapshot part data must be non-empty valid base64".into());
+            }
+        }
+        EdgeT3IngestRequest::SnapshotCommit {
+            environment_id,
+            snapshot_id,
+            max_sequence,
+            total_chunks,
+        } => {
+            if environment_id.trim().is_empty() {
+                return Err("snapshot commit environment_id must not be empty".into());
+            }
+            if !valid_edge_token(snapshot_id) {
+                return Err("snapshot commit snapshot_id is invalid".into());
+            }
+            if *max_sequence < 0 {
+                return Err("snapshot commit max_sequence must not be negative".into());
+            }
+            if *total_chunks == 0 {
+                return Err("snapshot commit total_chunks must be greater than zero".into());
+            }
+            if *total_chunks > i64::MAX as usize {
+                return Err("snapshot commit total_chunks is too large".into());
+            }
+        }
+        EdgeT3IngestRequest::Batches { batches } => {
+            if batches.is_empty() {
+                return Err("batches must not be empty".into());
+            }
+            for batch in batches {
+                crate::store::t3::validate_t3_batch(batch).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot(
+    environment_id: &str,
+    max_sequence: i64,
+    snapshot: &crate::store::T3Snapshot,
+) -> Result<(), String> {
+    if environment_id.trim().is_empty() {
+        return Err("snapshot environment_id must not be empty".into());
+    }
+    if max_sequence < 0 {
+        return Err("snapshot max_sequence must not be negative".into());
+    }
+    validate_snapshot_entities(environment_id, snapshot)
+}
+
+fn validate_snapshot_entities(
+    environment_id: &str,
+    snapshot: &crate::store::T3Snapshot,
+) -> Result<(), String> {
+    for project in &snapshot.projects {
+        if project.environment_id != environment_id {
+            return Err("snapshot project environment_id mismatch".into());
+        }
+    }
+    for thread in &snapshot.threads {
+        if thread.environment_id != environment_id {
+            return Err("snapshot thread environment_id mismatch".into());
+        }
+    }
+    for run in &snapshot.runs {
+        if run.environment_id != environment_id {
+            return Err("snapshot run environment_id mismatch".into());
+        }
+    }
+    for approval in &snapshot.approvals {
+        if approval.environment_id != environment_id {
+            return Err("snapshot approval environment_id mismatch".into());
+        }
+    }
+    Ok(())
+}
+
+fn edge_unauthorized(message: &'static str) -> Response {
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": message}))).into_response()
 }
 
 #[cfg(test)]

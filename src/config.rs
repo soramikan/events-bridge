@@ -15,6 +15,12 @@ use serde::Deserialize;
 /// value may lower this bound but never raise it.
 pub const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
 
+/// Default ceiling for one edge ingest request body (4 MiB).
+pub const DEFAULT_MAX_EDGE_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Absolute ceiling for one edge ingest request body (16 MiB).
+pub const MAX_EDGE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -31,6 +37,10 @@ pub struct Config {
     pub delivery: DeliveryConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
+    /// Upstream collectors.
+    pub collectors: CollectorsConfig,
+    /// Edge forwarding settings (only required by the `edge` subcommand).
+    pub edge: EdgeConfig,
 }
 
 /// HTTP listener settings.
@@ -50,6 +60,20 @@ pub struct ServerConfig {
     pub enable_internal_ingest: bool,
     /// Environment variable holding the internal ingest bearer token.
     pub internal_token_env: Option<String>,
+    /// Enables `POST /internal/edge/t3` for authenticated edge collectors.
+    pub enable_edge_ingest: bool,
+    /// Environment variable holding the shared edge HMAC secret.
+    ///
+    /// Required when `enable_edge_ingest` is true. The secret itself is never
+    /// stored in the configuration file.
+    pub edge_shared_secret_env: Option<String>,
+    /// Maximum accepted clock skew for `X-Edge-Timestamp`, in seconds.
+    pub edge_max_skew_secs: u64,
+    /// Maximum accepted edge ingest request body.
+    pub max_edge_body_bytes: usize,
+    /// Retention period (in seconds) for incomplete chunked snapshot stages
+    /// before abandoned uploads are garbage-collected.
+    pub edge_stage_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -60,7 +84,95 @@ impl Default for ServerConfig {
             public_base_url: None,
             enable_internal_ingest: false,
             internal_token_env: None,
+            enable_edge_ingest: false,
+            edge_shared_secret_env: None,
+            edge_max_skew_secs: 300,
+            max_edge_body_bytes: DEFAULT_MAX_EDGE_BODY_BYTES,
+            edge_stage_ttl_secs: 3600,
         }
+    }
+}
+
+/// Edge collector forwarding settings.
+///
+/// The hub ignores this section entirely; only the `edge` subcommand requires
+/// `hub_url` and `shared_secret_env`. The shared secret is read from the named
+/// environment variable and is never written to the configuration file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EdgeConfig {
+    /// Hub base URL (`http` or `https`, no query or fragment).
+    pub hub_url: Option<String>,
+    /// Environment variable holding the shared edge HMAC secret.
+    pub shared_secret_env: Option<String>,
+    /// Stable edge identifier. Defaults to the resolved T3 environment id or
+    /// the host name.
+    pub edge_id: Option<String>,
+    /// Per-request HTTP timeout.
+    pub request_timeout_secs: u64,
+    /// First retry delay after a failed forward.
+    pub retry_initial_ms: u64,
+    /// Retry delay ceiling.
+    pub retry_max_ms: u64,
+    /// Maximum serialized size of one snapshot chunk request.
+    ///
+    /// Snapshots larger than this are split into `SnapshotChunk` requests and
+    /// finalized with a `SnapshotCommit`.
+    pub max_snapshot_chunk_bytes: usize,
+}
+
+impl Default for EdgeConfig {
+    fn default() -> Self {
+        Self {
+            hub_url: None,
+            shared_secret_env: None,
+            edge_id: None,
+            request_timeout_secs: 15,
+            retry_initial_ms: 500,
+            retry_max_ms: 30_000,
+            max_snapshot_chunk_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl EdgeConfig {
+    /// Validate the settings required by the `edge` subcommand.
+    ///
+    /// The hub deliberately does not call this: a hub deployment may omit the
+    /// whole `[edge]` section.
+    pub fn validate_for_edge(&self) -> Result<()> {
+        let hub_url = self
+            .hub_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("edge.hub_url must be set when running the `edge` subcommand")?;
+        let url = url::Url::parse(hub_url)
+            .with_context(|| format!("edge.hub_url `{hub_url}` is not a URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("edge.hub_url must use http or https");
+        }
+        if url.cannot_be_a_base()
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("edge.hub_url must be a hierarchical URL with a host and no query or fragment");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("edge.hub_url must not contain userinfo");
+        }
+        if !self
+            .shared_secret_env
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!(
+                "edge.shared_secret_env must be set to a non-empty environment variable name \
+                 when running the `edge` subcommand"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -158,6 +270,104 @@ impl Default for DeliveryConfig {
     }
 }
 
+/// Upstream collector settings.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorsConfig {
+    /// T3 Code collector settings.
+    pub t3: T3CollectorConfig,
+    /// GitHub collector settings.
+    pub github: GitHubCollectorConfig,
+}
+
+/// T3 Code collector settings.
+///
+/// The collector reads the T3 Code SQLite database strictly read-only. It
+/// never contains credentials: T3 Code authenticates itself and exposes no
+/// token to this process.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct T3CollectorConfig {
+    /// Start the collector with the hub.
+    pub enabled: bool,
+    /// Path to T3 Code's `statev2.sqlite`. Empty resolves to
+    /// `~/.t3/userdata/statev2.sqlite`.
+    pub state_db_path: PathBuf,
+    /// Explicit environment id. When empty, `environment_id_path` or the
+    /// `environment-id` file next to the state database is used.
+    pub environment_id: Option<String>,
+    /// Path to the T3 Code environment id file.
+    pub environment_id_path: Option<PathBuf>,
+    /// Optional T3 Code web base URL used to build deep links.
+    pub t3_web_base_url: Option<String>,
+    /// Full polling fallback interval.
+    pub poll_interval_ms: u64,
+    /// Probe the WAL/database file metadata at a short interval for lower
+    /// latency. This is still polling; no inotify dependency is required.
+    pub watch_wal: bool,
+    /// Upstream events read per query.
+    pub batch_size: usize,
+}
+
+impl Default for T3CollectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_db_path: PathBuf::new(),
+            environment_id: None,
+            environment_id_path: None,
+            t3_web_base_url: None,
+            poll_interval_ms: 1_000,
+            watch_wal: true,
+            batch_size: 500,
+        }
+    }
+}
+
+/// Absolute ceiling for a GitHub webhook request body (10 MiB).
+pub const MAX_GITHUB_WEBHOOK_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// GitHub collector settings.
+///
+/// Both ingress paths are disabled by default. The webhook secret and the
+/// optional API token are named indirectly through environment variables; the
+/// configuration file never contains credentials.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitHubCollectorConfig {
+    /// Enables `POST /webhooks/github`.
+    pub webhook_enabled: bool,
+    /// Environment variable holding the GitHub webhook HMAC secret.
+    pub webhook_secret_env: Option<String>,
+    /// Enables periodic REST API reconciliation.
+    pub poll_enabled: bool,
+    /// Environment variable holding a GitHub personal/app token.
+    pub token_env: Option<String>,
+    /// Watched repositories in `owner/repo` form.
+    pub repositories: Vec<String>,
+    /// GitHub REST API base URL.
+    pub api_base_url: String,
+    /// Reconciliation interval.
+    pub poll_interval_secs: u64,
+    /// Maximum accepted webhook request body.
+    pub max_webhook_body_bytes: usize,
+}
+
+impl Default for GitHubCollectorConfig {
+    fn default() -> Self {
+        Self {
+            webhook_enabled: false,
+            webhook_secret_env: None,
+            poll_enabled: false,
+            token_env: None,
+            repositories: Vec::new(),
+            api_base_url: "https://api.github.com".into(),
+            poll_interval_secs: 60,
+            max_webhook_body_bytes: 1024 * 1024,
+        }
+    }
+}
+
 /// Logging settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -219,6 +429,192 @@ impl Config {
                 self.delivery.max_attempts
             );
         }
+
+        let server = &self.server;
+        if server.enable_edge_ingest
+            && !server
+                .edge_shared_secret_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!(
+                "server.edge_shared_secret_env must be set to a non-empty environment variable \
+                 name when server.enable_edge_ingest is true"
+            );
+        }
+        if server
+            .edge_shared_secret_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("server.edge_shared_secret_env must not be empty when set");
+        }
+        if server.edge_max_skew_secs == 0 {
+            bail!("server.edge_max_skew_secs must be greater than zero");
+        }
+        if server.max_edge_body_bytes == 0 {
+            bail!("server.max_edge_body_bytes must be greater than zero");
+        }
+        if server.max_edge_body_bytes > MAX_EDGE_BODY_BYTES {
+            bail!(
+                "server.max_edge_body_bytes must not exceed 16 MiB \
+                 ({MAX_EDGE_BODY_BYTES} bytes), got {}",
+                server.max_edge_body_bytes
+            );
+        }
+        if server.edge_stage_ttl_secs == 0 {
+            bail!("server.edge_stage_ttl_secs must be greater than zero");
+        }
+
+        let edge = &self.edge;
+        if let Some(hub_url) = edge.hub_url.as_deref() {
+            let url = url::Url::parse(hub_url)
+                .with_context(|| format!("edge.hub_url `{hub_url}` is not a URL"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("edge.hub_url must use http or https");
+            }
+            if url.cannot_be_a_base()
+                || url.host_str().is_none()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                bail!(
+                    "edge.hub_url must be a hierarchical URL with a host and no query or fragment"
+                );
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                bail!("edge.hub_url must not contain userinfo");
+            }
+        }
+        if edge
+            .shared_secret_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("edge.shared_secret_env must not be empty when set");
+        }
+        if let Some(edge_id) = edge.edge_id.as_deref() {
+            if edge_id.trim().is_empty() {
+                bail!("edge.edge_id must not be empty when set");
+            }
+            let length = edge_id.chars().count();
+            if !(1..=128).contains(&length)
+                || edge_id
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control())
+            {
+                bail!(
+                    "edge.edge_id must be 1..=128 characters without whitespace or control characters"
+                );
+            }
+        }
+        if edge.request_timeout_secs == 0 {
+            bail!("edge.request_timeout_secs must be greater than zero");
+        }
+        if edge.retry_initial_ms == 0 {
+            bail!("edge.retry_initial_ms must be greater than zero");
+        }
+        if edge.retry_initial_ms > edge.retry_max_ms {
+            bail!(
+                "edge.retry_initial_ms must not exceed edge.retry_max_ms, got {} > {}",
+                edge.retry_initial_ms,
+                edge.retry_max_ms
+            );
+        }
+        if edge.max_snapshot_chunk_bytes < 1024 {
+            bail!(
+                "edge.max_snapshot_chunk_bytes must be at least 1024 bytes, got {}",
+                edge.max_snapshot_chunk_bytes
+            );
+        }
+
+        let t3 = &self.collectors.t3;
+        if t3.poll_interval_ms == 0 {
+            bail!("collectors.t3.poll_interval_ms must be greater than zero");
+        }
+        if t3.batch_size == 0 {
+            bail!("collectors.t3.batch_size must be greater than zero");
+        }
+        if t3
+            .environment_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("collectors.t3.environment_id must not be empty when set");
+        }
+        if let Some(base) = t3.t3_web_base_url.as_deref() {
+            let url = url::Url::parse(base)
+                .with_context(|| format!("collectors.t3.t3_web_base_url `{base}` is not a URL"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("collectors.t3.t3_web_base_url must use http or https");
+            }
+            if url.cannot_be_a_base() || url.query().is_some() || url.fragment().is_some() {
+                bail!(
+                    "collectors.t3.t3_web_base_url must be a hierarchical URL without query or fragment"
+                );
+            }
+        }
+
+        let github = &self.collectors.github;
+        if github.webhook_enabled
+            && !github
+                .webhook_secret_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!(
+                "collectors.github.webhook_secret_env must be set to a non-empty environment \
+                 variable name when collectors.github.webhook_enabled is true"
+            );
+        }
+        if github
+            .token_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("collectors.github.token_env must not be empty when set");
+        }
+        for repository in &github.repositories {
+            validate_github_repository(repository)?;
+        }
+        if github.poll_enabled && github.repositories.is_empty() {
+            bail!(
+                "collectors.github.repositories must not be empty when \
+                 collectors.github.poll_enabled is true"
+            );
+        }
+        let api_url = url::Url::parse(&github.api_base_url).with_context(|| {
+            format!(
+                "collectors.github.api_base_url `{}` is not a URL",
+                github.api_base_url
+            )
+        })?;
+        if !matches!(api_url.scheme(), "http" | "https") {
+            bail!("collectors.github.api_base_url must use http or https");
+        }
+        if api_url.cannot_be_a_base()
+            || api_url.host_str().is_none()
+            || api_url.query().is_some()
+            || api_url.fragment().is_some()
+        {
+            bail!(
+                "collectors.github.api_base_url must be a hierarchical URL with a host and no \
+                 query or fragment"
+            );
+        }
+        if github.poll_interval_secs == 0 {
+            bail!("collectors.github.poll_interval_secs must be greater than zero");
+        }
+        if github.max_webhook_body_bytes == 0 {
+            bail!("collectors.github.max_webhook_body_bytes must be greater than zero");
+        }
+        if github.max_webhook_body_bytes > MAX_GITHUB_WEBHOOK_BODY_BYTES {
+            bail!(
+                "collectors.github.max_webhook_body_bytes must not exceed 10 MiB \
+                 ({MAX_GITHUB_WEBHOOK_BODY_BYTES} bytes), got {}",
+                github.max_webhook_body_bytes
+            );
+        }
         Ok(())
     }
 
@@ -238,6 +634,35 @@ impl Config {
         config.subscriptions.min_ttl_secs = 1;
         config
     }
+}
+
+/// Validate a watched repository entry.
+///
+/// GitHub repository names never contain whitespace, `?` or `#`, and the
+/// `owner/repo` form has exactly one separator. Rejecting these here avoids
+/// constructing ambiguous REST API paths later.
+fn validate_github_repository(repository: &str) -> Result<()> {
+    if repository.trim() != repository {
+        bail!("collectors.github.repositories entry `{repository}` has surrounding whitespace");
+    }
+    if repository
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '?' | '#'))
+    {
+        bail!(
+            "collectors.github.repositories entry `{repository}` must not contain whitespace, \
+             `?` or `#`"
+        );
+    }
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        bail!(
+            "collectors.github.repositories entry `{repository}` must have the form `owner/repo`"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -304,9 +729,299 @@ mod tests {
     }
 
     #[test]
+    fn t3_collector_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[collectors.t3]\n\
+             enabled = true\n\
+             environment_id = \"env-1\"\n\
+             t3_web_base_url = \"https://t3.example.com\"\n\
+             poll_interval_ms = 500\n\
+             watch_wal = false\n\
+             batch_size = 42\n",
+        )
+        .expect("collector config parses");
+        let t3 = &config.collectors.t3;
+        assert!(t3.enabled);
+        assert_eq!(t3.environment_id.as_deref(), Some("env-1"));
+        assert_eq!(
+            t3.t3_web_base_url.as_deref(),
+            Some("https://t3.example.com")
+        );
+        assert_eq!(t3.poll_interval_ms, 500);
+        assert!(!t3.watch_wal);
+        assert_eq!(t3.batch_size, 42);
+
+        let error = Config::parse("[collectors.t3]\npoll_interval_ms = 0\n")
+            .expect_err("zero poll interval must fail");
+        assert!(error.to_string().contains("poll_interval_ms"), "{error}");
+
+        let error = Config::parse("[collectors.t3]\nt3_web_base_url = \"ftp://example.com\"\n")
+            .expect_err("non-http URL must fail");
+        assert!(error.to_string().contains("http"), "{error}");
+
+        let error = Config::parse("[collectors.t3]\nenvironment_id = \"  \"\n")
+            .expect_err("blank environment id must fail");
+        assert!(error.to_string().contains("environment_id"), "{error}");
+    }
+
+    #[test]
     fn defaults_are_loopback_only() {
         let config = Config::default();
         assert!(config.server.allowed_hosts.iter().any(|h| h == "127.0.0.1"));
         assert!(!config.server.enable_internal_ingest);
+    }
+
+    #[test]
+    fn github_collector_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[collectors.github]\n\
+             webhook_enabled = true\n\
+             webhook_secret_env = \"EVENTS_BRIDGE_GITHUB_WEBHOOK_SECRET\"\n\
+             poll_enabled = true\n\
+             token_env = \"EVENTS_BRIDGE_GITHUB_TOKEN\"\n\
+             repositories = [\"soramikan/events-bridge\"]\n\
+             api_base_url = \"https://ghe.example.com/api/v3\"\n\
+             poll_interval_secs = 30\n\
+             max_webhook_body_bytes = 2048\n",
+        )
+        .expect("github collector config parses");
+        let github = &config.collectors.github;
+        assert!(github.webhook_enabled);
+        assert!(github.poll_enabled);
+        assert_eq!(github.repositories, vec!["soramikan/events-bridge"]);
+        assert_eq!(github.poll_interval_secs, 30);
+        assert_eq!(github.max_webhook_body_bytes, 2048);
+
+        let defaults = Config::default().collectors.github;
+        assert!(!defaults.webhook_enabled);
+        assert!(!defaults.poll_enabled);
+        assert_eq!(defaults.api_base_url, "https://api.github.com");
+        assert_eq!(defaults.poll_interval_secs, 60);
+    }
+
+    #[test]
+    fn github_webhook_requires_a_non_empty_secret_env_name() {
+        let error = Config::parse("[collectors.github]\nwebhook_enabled = true\n")
+            .expect_err("webhook enabled without a secret env must fail");
+        assert!(error.to_string().contains("webhook_secret_env"), "{error}");
+
+        let error = Config::parse(
+            "[collectors.github]\nwebhook_enabled = true\nwebhook_secret_env = \"  \"\n",
+        )
+        .expect_err("blank secret env must fail");
+        assert!(error.to_string().contains("webhook_secret_env"), "{error}");
+    }
+
+    #[test]
+    fn github_poll_requires_at_least_one_repository() {
+        let error = Config::parse("[collectors.github]\npoll_enabled = true\n")
+            .expect_err("polling without repositories must fail");
+        assert!(error.to_string().contains("repositories"), "{error}");
+    }
+
+    #[test]
+    fn invalid_github_repository_entries_fail() {
+        for repository in [
+            "events-bridge",
+            "/events-bridge",
+            "soramikan/",
+            "soramikan/events-bridge/extra",
+            "soramikan events-bridge",
+            "soramikan/events-bridge?x=1",
+            "soramikan/events-bridge#frag",
+        ] {
+            let contents = format!("[collectors.github]\nrepositories = [\"{repository}\"]\n");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "repository `{repository}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_ingest_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[server]\n\
+             enable_edge_ingest = true\n\
+             edge_shared_secret_env = \"EVENTS_BRIDGE_EDGE_SECRET\"\n\
+             edge_max_skew_secs = 120\n\
+             max_edge_body_bytes = 1048576\n\
+             edge_stage_ttl_secs = 900\n",
+        )
+        .expect("edge ingest config parses");
+        assert!(config.server.enable_edge_ingest);
+        assert_eq!(config.server.edge_max_skew_secs, 120);
+        assert_eq!(config.server.max_edge_body_bytes, 1_048_576);
+        assert_eq!(config.server.edge_stage_ttl_secs, 900);
+
+        let error = Config::parse("[server]\nenable_edge_ingest = true\n")
+            .expect_err("edge ingest without a secret env must fail");
+        assert!(
+            error.to_string().contains("edge_shared_secret_env"),
+            "{error}"
+        );
+
+        let error =
+            Config::parse("[server]\nedge_max_skew_secs = 0\n").expect_err("zero skew must fail");
+        assert!(error.to_string().contains("edge_max_skew_secs"), "{error}");
+
+        let error = Config::parse("[server]\nmax_edge_body_bytes = 0\n")
+            .expect_err("zero edge body limit must fail");
+        assert!(error.to_string().contains("max_edge_body_bytes"), "{error}");
+
+        let error = Config::parse("[server]\nmax_edge_body_bytes = 16777217\n")
+            .expect_err("edge body limit above 16 MiB must fail");
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+
+        let error = Config::parse("[server]\nedge_stage_ttl_secs = 0\n")
+            .expect_err("zero stage ttl must fail");
+        assert!(error.to_string().contains("edge_stage_ttl_secs"), "{error}");
+    }
+
+    #[test]
+    fn edge_forwarding_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[edge]\n\
+             hub_url = \"https://hub.example.com\"\n\
+             shared_secret_env = \"EVENTS_BRIDGE_EDGE_SECRET\"\n\
+             edge_id = \"mac-mini\"\n\
+             request_timeout_secs = 20\n\
+             retry_initial_ms = 250\n\
+             retry_max_ms = 5000\n\
+             max_snapshot_chunk_bytes = 2048\n",
+        )
+        .expect("edge config parses");
+        assert_eq!(
+            config.edge.hub_url.as_deref(),
+            Some("https://hub.example.com")
+        );
+        assert_eq!(config.edge.edge_id.as_deref(), Some("mac-mini"));
+        assert_eq!(config.edge.request_timeout_secs, 20);
+        assert_eq!(config.edge.retry_initial_ms, 250);
+        assert_eq!(config.edge.retry_max_ms, 5_000);
+        assert_eq!(config.edge.max_snapshot_chunk_bytes, 2_048);
+
+        let defaults = Config::default().edge;
+        assert_eq!(defaults.request_timeout_secs, 15);
+        assert_eq!(defaults.retry_initial_ms, 500);
+        assert_eq!(defaults.retry_max_ms, 30_000);
+        assert_eq!(defaults.max_snapshot_chunk_bytes, 1024 * 1024);
+
+        for hub_url in [
+            "ftp://hub.example.com",
+            "https://hub.example.com?x=1",
+            "https://hub.example.com#frag",
+            "https://user:pass@hub.example.com",
+            "not a URL",
+        ] {
+            let contents = format!("[edge]\nhub_url = \"{hub_url}\"\n");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "hub_url `{hub_url}` must be rejected"
+            );
+        }
+
+        let error = Config::parse("[edge]\nrequest_timeout_secs = 0\n")
+            .expect_err("zero timeout must fail");
+        assert!(
+            error.to_string().contains("request_timeout_secs"),
+            "{error}"
+        );
+
+        let error = Config::parse("[edge]\nretry_initial_ms = 0\n")
+            .expect_err("zero retry initial must fail");
+        assert!(error.to_string().contains("retry_initial_ms"), "{error}");
+
+        let error = Config::parse("[edge]\nretry_initial_ms = 1000\nretry_max_ms = 500\n")
+            .expect_err("inverted retry bounds must fail");
+        assert!(error.to_string().contains("retry_max_ms"), "{error}");
+
+        let error = Config::parse("[edge]\nmax_snapshot_chunk_bytes = 1023\n")
+            .expect_err("too-small snapshot chunk must fail");
+        assert!(
+            error.to_string().contains("max_snapshot_chunk_bytes"),
+            "{error}"
+        );
+
+        let error = Config::parse("[edge]\nshared_secret_env = \"  \"\n")
+            .expect_err("blank secret env must fail");
+        assert!(error.to_string().contains("shared_secret_env"), "{error}");
+
+        let error =
+            Config::parse("[edge]\nedge_id = \"  \"\n").expect_err("blank edge id must fail");
+        assert!(error.to_string().contains("edge_id"), "{error}");
+
+        let long = "a".repeat(129);
+        let error = Config::parse(&format!("[edge]\nedge_id = \"{long}\"\n"))
+            .expect_err("overlong edge id must fail");
+        assert!(error.to_string().contains("edge_id"), "{error}");
+
+        let error = Config::parse("[edge]\nedge_id = \"edge 1\"\n")
+            .expect_err("edge id with whitespace must fail");
+        assert!(error.to_string().contains("edge_id"), "{error}");
+    }
+
+    #[test]
+    fn edge_subcommand_requires_hub_url_and_secret_env() {
+        let config = Config::default();
+        let error = config
+            .edge
+            .validate_for_edge()
+            .expect_err("edge without hub_url must fail");
+        assert!(error.to_string().contains("hub_url"), "{error}");
+
+        let config = Config::parse("[edge]\nhub_url = \"https://hub.example.com\"\n")
+            .expect("hub url alone parses");
+        let error = config
+            .edge
+            .validate_for_edge()
+            .expect_err("edge without secret env must fail");
+        assert!(error.to_string().contains("shared_secret_env"), "{error}");
+
+        let config = Config::parse(
+            "[edge]\n\
+             hub_url = \"https://hub.example.com\"\n\
+             shared_secret_env = \"EVENTS_BRIDGE_EDGE_SECRET\"\n",
+        )
+        .expect("complete edge config parses");
+        config
+            .edge
+            .validate_for_edge()
+            .expect("complete edge config validates");
+    }
+
+    #[test]
+    fn github_api_and_body_limits_are_validated() {
+        for base in [
+            "ftp://api.github.com",
+            "https://api.github.com?x=1",
+            "https://api.github.com#frag",
+            "not a URL",
+        ] {
+            let contents = format!("[collectors.github]\napi_base_url = \"{base}\"\n");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "api_base_url `{base}` must be rejected"
+            );
+        }
+
+        let error = Config::parse("[collectors.github]\npoll_interval_secs = 0\n")
+            .expect_err("zero poll interval must fail");
+        assert!(error.to_string().contains("poll_interval_secs"), "{error}");
+
+        let error = Config::parse("[collectors.github]\nmax_webhook_body_bytes = 0\n")
+            .expect_err("zero body limit must fail");
+        assert!(
+            error.to_string().contains("max_webhook_body_bytes"),
+            "{error}"
+        );
+
+        let error = Config::parse("[collectors.github]\nmax_webhook_body_bytes = 10485761\n")
+            .expect_err("body limit above 10 MiB must fail");
+        assert!(error.to_string().contains("10 MiB"), "{error}");
+
+        let error = Config::parse("[collectors.github]\ntoken_env = \"\"\n")
+            .expect_err("empty token env must fail");
+        assert!(error.to_string().contains("token_env"), "{error}");
     }
 }

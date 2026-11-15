@@ -49,7 +49,8 @@ pub struct Event {
 }
 
 /// An event waiting to be persisted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NewEvent {
     /// Optional caller-supplied id. Generated when absent.
     pub id: Option<String>,
@@ -167,6 +168,19 @@ pub struct AttemptOutcome<'a> {
     pub disable_subscription: bool,
 }
 
+/// Outcome of validating and recording an edge request nonce inside the store
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeNonceStatus {
+    /// Nonce was accepted and persisted.
+    Accepted,
+    /// `(edge_id, nonce)` was already consumed and has not expired yet.
+    Replayed,
+    /// The request timestamp fell outside the accepted skew window by the time
+    /// the transaction sampled the clock.
+    TimestampOutOfWindow,
+}
+
 /// Filter for the `list_events` pull tool.
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
@@ -235,9 +249,118 @@ impl Repository {
         self.conn.lock().expect("sqlite mutex poisoned")
     }
 
+    /// Borrow the writer connection for a module that owns an atomic batch.
+    ///
+    /// The guard must be dropped before awaiting anything. It exists so the T3
+    /// collector can write its materialized state, ingested events, cursor and
+    /// checkpoint in one transaction.
+    pub(crate) fn lock_connection(&self) -> MutexGuard<'_, Connection> {
+        self.lock()
+    }
+
     /// Schema version currently applied.
     pub fn schema_version(&self) -> Result<i64> {
         Ok(migrations::current_version(&self.lock())?)
+    }
+
+    /// Outcome of validating and recording one edge request nonce.
+    pub fn consume_edge_nonce_checked(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        max_skew_secs: u64,
+    ) -> Result<EdgeNonceStatus> {
+        self.consume_edge_nonce_checked_with_clock(edge_id, nonce, timestamp, max_skew_secs, || {
+            Utc::now().timestamp()
+        })
+    }
+
+    /// Deterministic clock-injected variant of [`Self::consume_edge_nonce_checked`].
+    ///
+    /// The clock is sampled only after acquiring the repository lock and
+    /// starting the transaction, eliminating any second-boundary race between
+    /// timestamp validation and nonce pruning.
+    pub fn consume_edge_nonce_checked_at(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        max_skew_secs: u64,
+        now: i64,
+    ) -> Result<EdgeNonceStatus> {
+        self.consume_edge_nonce_checked_with_clock(edge_id, nonce, timestamp, max_skew_secs, || now)
+    }
+
+    fn consume_edge_nonce_checked_with_clock(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        max_skew_secs: u64,
+        now_fn: impl FnOnce() -> i64,
+    ) -> Result<EdgeNonceStatus> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_fn();
+        if now.abs_diff(timestamp) > max_skew_secs {
+            return Ok(EdgeNonceStatus::TimestampOutOfWindow);
+        }
+        let max_skew = max_skew_secs.min(i64::MAX as u64) as i64;
+        let expires_at = timestamp.saturating_add(max_skew);
+        tx.execute(
+            "DELETE FROM edge_nonces WHERE expires_at < ?1",
+            params![now],
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO edge_nonces (edge_id, nonce, expires_at) \
+             VALUES (?1, ?2, ?3)",
+            params![edge_id, nonce, expires_at],
+        )?;
+        tx.commit()?;
+        if inserted > 0 {
+            Ok(EdgeNonceStatus::Accepted)
+        } else {
+            Ok(EdgeNonceStatus::Replayed)
+        }
+    }
+
+    /// Record an edge nonce, returning `false` when it was already used.
+    ///
+    /// Expired nonces are deleted in the same transaction, so the table stays
+    /// bounded by the accepted timestamp window.
+    pub fn consume_edge_nonce(&self, edge_id: &str, nonce: &str, expires_at: i64) -> Result<bool> {
+        self.consume_edge_nonce_at(edge_id, nonce, expires_at, Utc::now().timestamp())
+    }
+
+    /// Deterministic clock-injected variant of [`Self::consume_edge_nonce`].
+    pub fn consume_edge_nonce_at(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM edge_nonces WHERE expires_at < ?1",
+            params![now],
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO edge_nonces (edge_id, nonce, expires_at) \
+             VALUES (?1, ?2, ?3)",
+            params![edge_id, nonce, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(inserted > 0)
+    }
+
+    /// Number of retained edge nonces (tests and diagnostics).
+    pub fn edge_nonce_count(&self) -> Result<i64> {
+        Ok(self
+            .lock()
+            .query_row("SELECT COUNT(*) FROM edge_nonces", [], |row| row.get(0))?)
     }
 
     /// Persist an event and create delivery rows for every eligible
@@ -245,95 +368,11 @@ impl Repository {
     ///
     /// The caller is responsible for waking the dispatcher after this returns.
     pub fn ingest_event(&self, new: NewEvent) -> Result<IngestOutcome> {
-        let id = new
-            .id
-            .unwrap_or_else(|| format!("evt_{}", crate::util::random_hex(12)));
-        // `occurred_at` must be RFC 3339. It is normalized to the fixed-width
-        // UTC form so range predicates are reliable and comparable as text.
-        let occurred_at = match new.occurred_at {
-            Some(value) => parse_rfc3339(&value).map(format_rfc3339).with_context(|| {
-                format!("occurred_at `{value}` is not a valid RFC 3339 timestamp")
-            })?,
-            None => now_rfc3339(),
-        };
-        let source = new
-            .source
-            .unwrap_or_else(|| new.kind.split('.').next().unwrap_or("unknown").to_owned());
-        let payload = serde_json::to_string(&new.payload)?;
-
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-
-        if let Some(existing) = load_event(&tx, &id)? {
-            tx.commit()?;
-            return Ok(IngestOutcome {
-                event: existing,
-                deliveries_created: 0,
-                duplicate: true,
-            });
-        }
-
-        let sequence: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events",
-            [],
-            |row| row.get(0),
-        )?;
-        let ingested_at = now_rfc3339();
-        tx.execute(
-            "INSERT INTO events (id, sequence, source, kind, payload, occurred_at, ingested_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id,
-                sequence,
-                source,
-                new.kind,
-                payload,
-                occurred_at,
-                ingested_at
-            ],
-        )?;
-
-        let subscriptions = {
-            let mut stmt = tx.prepare(
-                "SELECT id, arguments FROM subscriptions \
-                 WHERE event_name = ?1 AND verified = 1 AND active = 1 \
-                   AND (refresh_before IS NULL OR refresh_before > ?2) \
-                 ORDER BY id",
-            )?;
-            let rows = stmt.query_map(params![new.kind, ingested_at], |row| {
-                let arguments: String = row.get(1)?;
-                Ok((row.get::<_, String>(0)?, arguments))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
-        let mut deliveries_created = 0usize;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO deliveries \
-                     (subscription_id, event_id, status, next_attempt_at, created_at, updated_at) \
-                 VALUES (?1, ?2, 'pending', ?3, ?3, ?3)",
-            )?;
-            for (subscription_id, arguments) in subscriptions {
-                // A subscription only receives events whose payload satisfies
-                // every filter argument. An empty filter matches everything.
-                // Unparseable arguments must never match; `Null` is treated
-                // as a non-object filter by `arguments_match`.
-                let arguments: Value = serde_json::from_str(&arguments).unwrap_or(Value::Null);
-                if !arguments_match(&arguments, &new.payload) {
-                    continue;
-                }
-                deliveries_created += stmt.execute(params![subscription_id, id, ingested_at])?;
-            }
-        }
-
-        let event = load_event(&tx, &id)?.expect("event inserted in this transaction");
+        let outcome = ingest_event_in_tx(&tx, new, &now_rfc3339())?;
         tx.commit()?;
-        Ok(IngestOutcome {
-            event,
-            deliveries_created,
-            duplicate: false,
-        })
+        Ok(outcome)
     }
 
     /// Fetch an event by id.
@@ -796,6 +835,101 @@ impl Repository {
     }
 }
 
+/// Insert one event and its delivery rows inside an existing transaction.
+///
+/// `ingested_at` is reused for all timestamps so an atomic collector batch has
+/// a consistent ingestion time. A duplicate event id is a no-op that returns
+/// the stored row.
+pub(crate) fn ingest_event_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    new: NewEvent,
+    ingested_at: &str,
+) -> Result<IngestOutcome> {
+    let id = new
+        .id
+        .unwrap_or_else(|| format!("evt_{}", crate::util::random_hex(12)));
+    // `occurred_at` must be RFC 3339. It is normalized to the fixed-width UTC
+    // form so range predicates are reliable and comparable as text.
+    let occurred_at = match new.occurred_at {
+        Some(value) => parse_rfc3339(&value)
+            .map(format_rfc3339)
+            .with_context(|| format!("occurred_at `{value}` is not a valid RFC 3339 timestamp"))?,
+        None => now_rfc3339(),
+    };
+    let source = new
+        .source
+        .unwrap_or_else(|| new.kind.split('.').next().unwrap_or("unknown").to_owned());
+    let payload = serde_json::to_string(&new.payload)?;
+
+    if let Some(existing) = load_event(tx, &id)? {
+        return Ok(IngestOutcome {
+            event: existing,
+            deliveries_created: 0,
+            duplicate: true,
+        });
+    }
+
+    let sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO events (id, sequence, source, kind, payload, occurred_at, ingested_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            sequence,
+            source,
+            new.kind,
+            payload,
+            occurred_at,
+            ingested_at
+        ],
+    )?;
+
+    let subscriptions = {
+        let mut stmt = tx.prepare(
+            "SELECT id, arguments FROM subscriptions \
+             WHERE event_name = ?1 AND verified = 1 AND active = 1 \
+               AND (refresh_before IS NULL OR refresh_before > ?2) \
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![new.kind, ingested_at], |row| {
+            let arguments: String = row.get(1)?;
+            Ok((row.get::<_, String>(0)?, arguments))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut deliveries_created = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO deliveries \
+                 (subscription_id, event_id, status, next_attempt_at, created_at, updated_at) \
+             VALUES (?1, ?2, 'pending', ?3, ?3, ?3)",
+        )?;
+        for (subscription_id, arguments) in subscriptions {
+            // A subscription only receives events whose payload satisfies
+            // every filter argument. An empty filter matches everything.
+            // Unparseable arguments must never match; `Null` is treated
+            // as a non-object filter by `arguments_match`.
+            let arguments: Value = serde_json::from_str(&arguments).unwrap_or(Value::Null);
+            if !arguments_match(&arguments, &new.payload) {
+                continue;
+            }
+            deliveries_created += stmt.execute(params![subscription_id, id, ingested_at])?;
+        }
+    }
+
+    let event = load_event(tx, &id)?.expect("event inserted in this transaction");
+    Ok(IngestOutcome {
+        event,
+        deliveries_created,
+        duplicate: false,
+    })
+}
+
 impl std::fmt::Debug for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Subscription")
@@ -921,7 +1055,7 @@ mod tests {
     #[test]
     fn migrations_create_every_table() {
         let repo = repository();
-        assert_eq!(repo.schema_version().unwrap(), 1);
+        assert_eq!(repo.schema_version().unwrap(), 4);
         let conn = repo.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -936,15 +1070,126 @@ mod tests {
             "collector_checkpoints",
             "delivery_attempts",
             "deliveries",
+            "edge_nonces",
+            "edge_pending_snapshots",
+            "edge_snapshot_stages",
             "events",
+            "github_ci_runs",
+            "github_deliveries",
+            "github_pending_checks",
+            "github_pull_requests",
             "source_cursors",
             "subscriptions",
+            "t3_approvals",
+            "t3_projects",
+            "t3_runs",
+            "t3_threads",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "missing {expected}: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn edge_nonces_reject_replay_and_expire() {
+        let repo = repository();
+        let t = 1_700_000_000_i64;
+        assert!(
+            repo.consume_edge_nonce_at("edge-1", "nonce-1", t + 60, t)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .consume_edge_nonce_at("edge-1", "nonce-1", t + 60, t)
+                .unwrap(),
+            "the same (edge_id, nonce) must be rejected"
+        );
+        assert!(
+            repo.consume_edge_nonce_at("edge-2", "nonce-1", t + 60, t)
+                .unwrap(),
+            "a different edge may use the same nonce"
+        );
+
+        repo.lock()
+            .execute(
+                "INSERT INTO edge_nonces (edge_id, nonce, expires_at) VALUES (?1, ?2, ?3)",
+                params!["edge-boundary", "nonce-boundary", t],
+            )
+            .unwrap();
+        repo.lock()
+            .execute(
+                "INSERT INTO edge_nonces (edge_id, nonce, expires_at) VALUES (?1, ?2, ?3)",
+                params!["edge-old", "nonce-old", t - 1],
+            )
+            .unwrap();
+        assert!(
+            repo.consume_edge_nonce_at("edge-3", "nonce-3", t + 60, t)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .consume_edge_nonce_at("edge-boundary", "nonce-boundary", t + 60, t)
+                .unwrap(),
+            "a nonce expiring at the current boundary second must still reject replay"
+        );
+        assert_eq!(
+            repo.edge_nonce_count().unwrap(),
+            4,
+            "the expired row is deleted while the boundary-second and active nonces are retained"
+        );
+        let expired: i64 = repo
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM edge_nonces WHERE edge_id = 'edge-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired, 0, "expired nonces are deleted on the next insert");
+
+        // Boundary and second-crossing TOCTOU regression:
+        // Request with `timestamp = t + 1` and `max_skew = 1` expires at `t + 2`.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-skew", t + 1, 1, t)
+                .unwrap(),
+            EdgeNonceStatus::Accepted
+        );
+        // At `t + 2` (exact upper skew boundary), pruning runs and replay is still rejected.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-other", t + 2, 1, t + 2)
+                .unwrap(),
+            EdgeNonceStatus::Accepted
+        );
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-skew", t + 1, 1, t + 2)
+                .unwrap(),
+            EdgeNonceStatus::Replayed
+        );
+        // If HTTP pre-checked at `t + 2` but the clock crossed to `t + 3` before the
+        // DB transaction acquired the lock, the transaction rejects with
+        // TimestampOutOfWindow and never deletes-and-reinserts the old nonce.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-skew", t + 1, 1, t + 3)
+                .unwrap(),
+            EdgeNonceStatus::TimestampOutOfWindow
+        );
+        // And `nonce-skew` is only pruned once a valid request arrives at `t + 3`.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-prune", t + 3, 1, t + 3)
+                .unwrap(),
+            EdgeNonceStatus::Accepted
+        );
+        let remaining_skew: i64 = repo
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM edge_nonces WHERE edge_id = 'edge-skew' AND nonce = 'nonce-skew'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_skew, 0);
     }
 
     #[test]
