@@ -49,7 +49,8 @@ pub struct Event {
 }
 
 /// An event waiting to be persisted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NewEvent {
     /// Optional caller-supplied id. Generated when absent.
     pub id: Option<String>,
@@ -167,6 +168,19 @@ pub struct AttemptOutcome<'a> {
     pub disable_subscription: bool,
 }
 
+/// Outcome of validating and recording an edge request nonce inside the store
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeNonceStatus {
+    /// Nonce was accepted and persisted.
+    Accepted,
+    /// `(edge_id, nonce)` was already consumed and has not expired yet.
+    Replayed,
+    /// The request timestamp fell outside the accepted skew window by the time
+    /// the transaction sampled the clock.
+    TimestampOutOfWindow,
+}
+
 /// Filter for the `list_events` pull tool.
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
@@ -247,6 +261,106 @@ impl Repository {
     /// Schema version currently applied.
     pub fn schema_version(&self) -> Result<i64> {
         Ok(migrations::current_version(&self.lock())?)
+    }
+
+    /// Outcome of validating and recording one edge request nonce.
+    pub fn consume_edge_nonce_checked(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        max_skew_secs: u64,
+    ) -> Result<EdgeNonceStatus> {
+        self.consume_edge_nonce_checked_with_clock(edge_id, nonce, timestamp, max_skew_secs, || {
+            Utc::now().timestamp()
+        })
+    }
+
+    /// Deterministic clock-injected variant of [`Self::consume_edge_nonce_checked`].
+    ///
+    /// The clock is sampled only after acquiring the repository lock and
+    /// starting the transaction, eliminating any second-boundary race between
+    /// timestamp validation and nonce pruning.
+    pub fn consume_edge_nonce_checked_at(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        max_skew_secs: u64,
+        now: i64,
+    ) -> Result<EdgeNonceStatus> {
+        self.consume_edge_nonce_checked_with_clock(edge_id, nonce, timestamp, max_skew_secs, || now)
+    }
+
+    fn consume_edge_nonce_checked_with_clock(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        timestamp: i64,
+        max_skew_secs: u64,
+        now_fn: impl FnOnce() -> i64,
+    ) -> Result<EdgeNonceStatus> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now_fn();
+        if now.abs_diff(timestamp) > max_skew_secs {
+            return Ok(EdgeNonceStatus::TimestampOutOfWindow);
+        }
+        let max_skew = max_skew_secs.min(i64::MAX as u64) as i64;
+        let expires_at = timestamp.saturating_add(max_skew);
+        tx.execute(
+            "DELETE FROM edge_nonces WHERE expires_at < ?1",
+            params![now],
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO edge_nonces (edge_id, nonce, expires_at) \
+             VALUES (?1, ?2, ?3)",
+            params![edge_id, nonce, expires_at],
+        )?;
+        tx.commit()?;
+        if inserted > 0 {
+            Ok(EdgeNonceStatus::Accepted)
+        } else {
+            Ok(EdgeNonceStatus::Replayed)
+        }
+    }
+
+    /// Record an edge nonce, returning `false` when it was already used.
+    ///
+    /// Expired nonces are deleted in the same transaction, so the table stays
+    /// bounded by the accepted timestamp window.
+    pub fn consume_edge_nonce(&self, edge_id: &str, nonce: &str, expires_at: i64) -> Result<bool> {
+        self.consume_edge_nonce_at(edge_id, nonce, expires_at, Utc::now().timestamp())
+    }
+
+    /// Deterministic clock-injected variant of [`Self::consume_edge_nonce`].
+    pub fn consume_edge_nonce_at(
+        &self,
+        edge_id: &str,
+        nonce: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM edge_nonces WHERE expires_at < ?1",
+            params![now],
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO edge_nonces (edge_id, nonce, expires_at) \
+             VALUES (?1, ?2, ?3)",
+            params![edge_id, nonce, expires_at],
+        )?;
+        tx.commit()?;
+        Ok(inserted > 0)
+    }
+
+    /// Number of retained edge nonces (tests and diagnostics).
+    pub fn edge_nonce_count(&self) -> Result<i64> {
+        Ok(self
+            .lock()
+            .query_row("SELECT COUNT(*) FROM edge_nonces", [], |row| row.get(0))?)
     }
 
     /// Persist an event and create delivery rows for every eligible
@@ -925,7 +1039,7 @@ mod tests {
     #[test]
     fn migrations_create_every_table() {
         let repo = repository();
-        assert_eq!(repo.schema_version().unwrap(), 3);
+        assert_eq!(repo.schema_version().unwrap(), 4);
         let conn = repo.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -940,6 +1054,9 @@ mod tests {
             "collector_checkpoints",
             "delivery_attempts",
             "deliveries",
+            "edge_nonces",
+            "edge_pending_snapshots",
+            "edge_snapshot_stages",
             "events",
             "github_ci_runs",
             "github_deliveries",
@@ -957,6 +1074,106 @@ mod tests {
                 "missing {expected}: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn edge_nonces_reject_replay_and_expire() {
+        let repo = repository();
+        let t = 1_700_000_000_i64;
+        assert!(
+            repo.consume_edge_nonce_at("edge-1", "nonce-1", t + 60, t)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .consume_edge_nonce_at("edge-1", "nonce-1", t + 60, t)
+                .unwrap(),
+            "the same (edge_id, nonce) must be rejected"
+        );
+        assert!(
+            repo.consume_edge_nonce_at("edge-2", "nonce-1", t + 60, t)
+                .unwrap(),
+            "a different edge may use the same nonce"
+        );
+
+        repo.lock()
+            .execute(
+                "INSERT INTO edge_nonces (edge_id, nonce, expires_at) VALUES (?1, ?2, ?3)",
+                params!["edge-boundary", "nonce-boundary", t],
+            )
+            .unwrap();
+        repo.lock()
+            .execute(
+                "INSERT INTO edge_nonces (edge_id, nonce, expires_at) VALUES (?1, ?2, ?3)",
+                params!["edge-old", "nonce-old", t - 1],
+            )
+            .unwrap();
+        assert!(
+            repo.consume_edge_nonce_at("edge-3", "nonce-3", t + 60, t)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .consume_edge_nonce_at("edge-boundary", "nonce-boundary", t + 60, t)
+                .unwrap(),
+            "a nonce expiring at the current boundary second must still reject replay"
+        );
+        assert_eq!(
+            repo.edge_nonce_count().unwrap(),
+            4,
+            "the expired row is deleted while the boundary-second and active nonces are retained"
+        );
+        let expired: i64 = repo
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM edge_nonces WHERE edge_id = 'edge-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired, 0, "expired nonces are deleted on the next insert");
+
+        // Boundary and second-crossing TOCTOU regression:
+        // Request with `timestamp = t + 1` and `max_skew = 1` expires at `t + 2`.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-skew", t + 1, 1, t)
+                .unwrap(),
+            EdgeNonceStatus::Accepted
+        );
+        // At `t + 2` (exact upper skew boundary), pruning runs and replay is still rejected.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-other", t + 2, 1, t + 2)
+                .unwrap(),
+            EdgeNonceStatus::Accepted
+        );
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-skew", t + 1, 1, t + 2)
+                .unwrap(),
+            EdgeNonceStatus::Replayed
+        );
+        // If HTTP pre-checked at `t + 2` but the clock crossed to `t + 3` before the
+        // DB transaction acquired the lock, the transaction rejects with
+        // TimestampOutOfWindow and never deletes-and-reinserts the old nonce.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-skew", t + 1, 1, t + 3)
+                .unwrap(),
+            EdgeNonceStatus::TimestampOutOfWindow
+        );
+        // And `nonce-skew` is only pruned once a valid request arrives at `t + 3`.
+        assert_eq!(
+            repo.consume_edge_nonce_checked_at("edge-skew", "nonce-prune", t + 3, 1, t + 3)
+                .unwrap(),
+            EdgeNonceStatus::Accepted
+        );
+        let remaining_skew: i64 = repo
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM edge_nonces WHERE edge_id = 'edge-skew' AND nonce = 'nonce-skew'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_skew, 0);
     }
 
     #[test]

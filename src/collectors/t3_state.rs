@@ -70,6 +70,17 @@ impl<'a> T3Reducer<'a> {
 
     /// Apply one upstream event atomically.
     pub fn process(&self, event: &T3SourceEvent) -> Result<T3ApplyOutcome> {
+        let batch = self.reduce(event)?;
+        self.repo.apply_t3_batch(&batch)
+    }
+
+    /// Derive one write batch without committing it.
+    ///
+    /// The hub's local collector applies the returned batch immediately; an
+    /// edge collector forwards it to the hub and only applies it locally after
+    /// the hub accepted it. Both paths therefore share exactly the same
+    /// derivation rules.
+    pub fn reduce(&self, event: &T3SourceEvent) -> Result<T3WriteBatch> {
         let occurred_at = normalize_timestamp(&event.occurred_at).unwrap_or_else(now_rfc3339);
         let mut batch = T3WriteBatch {
             environment_id: self.environment_id.to_string(),
@@ -137,7 +148,7 @@ impl<'a> T3Reducer<'a> {
             _ => {}
         }
 
-        self.repo.apply_t3_batch(&batch)
+        Ok(batch)
     }
 
     fn project_from_payload(&self, payload: &Value, occurred_at: &str) -> Option<T3Project> {

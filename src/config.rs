@@ -15,6 +15,12 @@ use serde::Deserialize;
 /// value may lower this bound but never raise it.
 pub const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
 
+/// Default ceiling for one edge ingest request body (4 MiB).
+pub const DEFAULT_MAX_EDGE_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Absolute ceiling for one edge ingest request body (16 MiB).
+pub const MAX_EDGE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -33,6 +39,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Upstream collectors.
     pub collectors: CollectorsConfig,
+    /// Edge forwarding settings (only required by the `edge` subcommand).
+    pub edge: EdgeConfig,
 }
 
 /// HTTP listener settings.
@@ -52,6 +60,20 @@ pub struct ServerConfig {
     pub enable_internal_ingest: bool,
     /// Environment variable holding the internal ingest bearer token.
     pub internal_token_env: Option<String>,
+    /// Enables `POST /internal/edge/t3` for authenticated edge collectors.
+    pub enable_edge_ingest: bool,
+    /// Environment variable holding the shared edge HMAC secret.
+    ///
+    /// Required when `enable_edge_ingest` is true. The secret itself is never
+    /// stored in the configuration file.
+    pub edge_shared_secret_env: Option<String>,
+    /// Maximum accepted clock skew for `X-Edge-Timestamp`, in seconds.
+    pub edge_max_skew_secs: u64,
+    /// Maximum accepted edge ingest request body.
+    pub max_edge_body_bytes: usize,
+    /// Retention period (in seconds) for incomplete chunked snapshot stages
+    /// before abandoned uploads are garbage-collected.
+    pub edge_stage_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -62,7 +84,95 @@ impl Default for ServerConfig {
             public_base_url: None,
             enable_internal_ingest: false,
             internal_token_env: None,
+            enable_edge_ingest: false,
+            edge_shared_secret_env: None,
+            edge_max_skew_secs: 300,
+            max_edge_body_bytes: DEFAULT_MAX_EDGE_BODY_BYTES,
+            edge_stage_ttl_secs: 3600,
         }
+    }
+}
+
+/// Edge collector forwarding settings.
+///
+/// The hub ignores this section entirely; only the `edge` subcommand requires
+/// `hub_url` and `shared_secret_env`. The shared secret is read from the named
+/// environment variable and is never written to the configuration file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EdgeConfig {
+    /// Hub base URL (`http` or `https`, no query or fragment).
+    pub hub_url: Option<String>,
+    /// Environment variable holding the shared edge HMAC secret.
+    pub shared_secret_env: Option<String>,
+    /// Stable edge identifier. Defaults to the resolved T3 environment id or
+    /// the host name.
+    pub edge_id: Option<String>,
+    /// Per-request HTTP timeout.
+    pub request_timeout_secs: u64,
+    /// First retry delay after a failed forward.
+    pub retry_initial_ms: u64,
+    /// Retry delay ceiling.
+    pub retry_max_ms: u64,
+    /// Maximum serialized size of one snapshot chunk request.
+    ///
+    /// Snapshots larger than this are split into `SnapshotChunk` requests and
+    /// finalized with a `SnapshotCommit`.
+    pub max_snapshot_chunk_bytes: usize,
+}
+
+impl Default for EdgeConfig {
+    fn default() -> Self {
+        Self {
+            hub_url: None,
+            shared_secret_env: None,
+            edge_id: None,
+            request_timeout_secs: 15,
+            retry_initial_ms: 500,
+            retry_max_ms: 30_000,
+            max_snapshot_chunk_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl EdgeConfig {
+    /// Validate the settings required by the `edge` subcommand.
+    ///
+    /// The hub deliberately does not call this: a hub deployment may omit the
+    /// whole `[edge]` section.
+    pub fn validate_for_edge(&self) -> Result<()> {
+        let hub_url = self
+            .hub_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("edge.hub_url must be set when running the `edge` subcommand")?;
+        let url = url::Url::parse(hub_url)
+            .with_context(|| format!("edge.hub_url `{hub_url}` is not a URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("edge.hub_url must use http or https");
+        }
+        if url.cannot_be_a_base()
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("edge.hub_url must be a hierarchical URL with a host and no query or fragment");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("edge.hub_url must not contain userinfo");
+        }
+        if !self
+            .shared_secret_env
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!(
+                "edge.shared_secret_env must be set to a non-empty environment variable name \
+                 when running the `edge` subcommand"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -313,6 +423,105 @@ impl Config {
                 self.subscriptions.max_ttl_secs
             );
         }
+
+        let server = &self.server;
+        if server.enable_edge_ingest
+            && !server
+                .edge_shared_secret_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!(
+                "server.edge_shared_secret_env must be set to a non-empty environment variable \
+                 name when server.enable_edge_ingest is true"
+            );
+        }
+        if server
+            .edge_shared_secret_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("server.edge_shared_secret_env must not be empty when set");
+        }
+        if server.edge_max_skew_secs == 0 {
+            bail!("server.edge_max_skew_secs must be greater than zero");
+        }
+        if server.max_edge_body_bytes == 0 {
+            bail!("server.max_edge_body_bytes must be greater than zero");
+        }
+        if server.max_edge_body_bytes > MAX_EDGE_BODY_BYTES {
+            bail!(
+                "server.max_edge_body_bytes must not exceed 16 MiB \
+                 ({MAX_EDGE_BODY_BYTES} bytes), got {}",
+                server.max_edge_body_bytes
+            );
+        }
+        if server.edge_stage_ttl_secs == 0 {
+            bail!("server.edge_stage_ttl_secs must be greater than zero");
+        }
+
+        let edge = &self.edge;
+        if let Some(hub_url) = edge.hub_url.as_deref() {
+            let url = url::Url::parse(hub_url)
+                .with_context(|| format!("edge.hub_url `{hub_url}` is not a URL"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("edge.hub_url must use http or https");
+            }
+            if url.cannot_be_a_base()
+                || url.host_str().is_none()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                bail!(
+                    "edge.hub_url must be a hierarchical URL with a host and no query or fragment"
+                );
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                bail!("edge.hub_url must not contain userinfo");
+            }
+        }
+        if edge
+            .shared_secret_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("edge.shared_secret_env must not be empty when set");
+        }
+        if let Some(edge_id) = edge.edge_id.as_deref() {
+            if edge_id.trim().is_empty() {
+                bail!("edge.edge_id must not be empty when set");
+            }
+            let length = edge_id.chars().count();
+            if !(1..=128).contains(&length)
+                || edge_id
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch.is_control())
+            {
+                bail!(
+                    "edge.edge_id must be 1..=128 characters without whitespace or control characters"
+                );
+            }
+        }
+        if edge.request_timeout_secs == 0 {
+            bail!("edge.request_timeout_secs must be greater than zero");
+        }
+        if edge.retry_initial_ms == 0 {
+            bail!("edge.retry_initial_ms must be greater than zero");
+        }
+        if edge.retry_initial_ms > edge.retry_max_ms {
+            bail!(
+                "edge.retry_initial_ms must not exceed edge.retry_max_ms, got {} > {}",
+                edge.retry_initial_ms,
+                edge.retry_max_ms
+            );
+        }
+        if edge.max_snapshot_chunk_bytes < 1024 {
+            bail!(
+                "edge.max_snapshot_chunk_bytes must be at least 1024 bytes, got {}",
+                edge.max_snapshot_chunk_bytes
+            );
+        }
+
         let t3 = &self.collectors.t3;
         if t3.poll_interval_ms == 0 {
             bail!("collectors.t3.poll_interval_ms must be greater than zero");
@@ -608,6 +817,158 @@ mod tests {
                 "repository `{repository}` must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn edge_ingest_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[server]\n\
+             enable_edge_ingest = true\n\
+             edge_shared_secret_env = \"EVENTS_BRIDGE_EDGE_SECRET\"\n\
+             edge_max_skew_secs = 120\n\
+             max_edge_body_bytes = 1048576\n\
+             edge_stage_ttl_secs = 900\n",
+        )
+        .expect("edge ingest config parses");
+        assert!(config.server.enable_edge_ingest);
+        assert_eq!(config.server.edge_max_skew_secs, 120);
+        assert_eq!(config.server.max_edge_body_bytes, 1_048_576);
+        assert_eq!(config.server.edge_stage_ttl_secs, 900);
+
+        let error = Config::parse("[server]\nenable_edge_ingest = true\n")
+            .expect_err("edge ingest without a secret env must fail");
+        assert!(
+            error.to_string().contains("edge_shared_secret_env"),
+            "{error}"
+        );
+
+        let error =
+            Config::parse("[server]\nedge_max_skew_secs = 0\n").expect_err("zero skew must fail");
+        assert!(error.to_string().contains("edge_max_skew_secs"), "{error}");
+
+        let error = Config::parse("[server]\nmax_edge_body_bytes = 0\n")
+            .expect_err("zero edge body limit must fail");
+        assert!(error.to_string().contains("max_edge_body_bytes"), "{error}");
+
+        let error = Config::parse("[server]\nmax_edge_body_bytes = 16777217\n")
+            .expect_err("edge body limit above 16 MiB must fail");
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+
+        let error = Config::parse("[server]\nedge_stage_ttl_secs = 0\n")
+            .expect_err("zero stage ttl must fail");
+        assert!(error.to_string().contains("edge_stage_ttl_secs"), "{error}");
+    }
+
+    #[test]
+    fn edge_forwarding_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[edge]\n\
+             hub_url = \"https://hub.example.com\"\n\
+             shared_secret_env = \"EVENTS_BRIDGE_EDGE_SECRET\"\n\
+             edge_id = \"mac-mini\"\n\
+             request_timeout_secs = 20\n\
+             retry_initial_ms = 250\n\
+             retry_max_ms = 5000\n\
+             max_snapshot_chunk_bytes = 2048\n",
+        )
+        .expect("edge config parses");
+        assert_eq!(
+            config.edge.hub_url.as_deref(),
+            Some("https://hub.example.com")
+        );
+        assert_eq!(config.edge.edge_id.as_deref(), Some("mac-mini"));
+        assert_eq!(config.edge.request_timeout_secs, 20);
+        assert_eq!(config.edge.retry_initial_ms, 250);
+        assert_eq!(config.edge.retry_max_ms, 5_000);
+        assert_eq!(config.edge.max_snapshot_chunk_bytes, 2_048);
+
+        let defaults = Config::default().edge;
+        assert_eq!(defaults.request_timeout_secs, 15);
+        assert_eq!(defaults.retry_initial_ms, 500);
+        assert_eq!(defaults.retry_max_ms, 30_000);
+        assert_eq!(defaults.max_snapshot_chunk_bytes, 1024 * 1024);
+
+        for hub_url in [
+            "ftp://hub.example.com",
+            "https://hub.example.com?x=1",
+            "https://hub.example.com#frag",
+            "https://user:pass@hub.example.com",
+            "not a URL",
+        ] {
+            let contents = format!("[edge]\nhub_url = \"{hub_url}\"\n");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "hub_url `{hub_url}` must be rejected"
+            );
+        }
+
+        let error = Config::parse("[edge]\nrequest_timeout_secs = 0\n")
+            .expect_err("zero timeout must fail");
+        assert!(
+            error.to_string().contains("request_timeout_secs"),
+            "{error}"
+        );
+
+        let error = Config::parse("[edge]\nretry_initial_ms = 0\n")
+            .expect_err("zero retry initial must fail");
+        assert!(error.to_string().contains("retry_initial_ms"), "{error}");
+
+        let error = Config::parse("[edge]\nretry_initial_ms = 1000\nretry_max_ms = 500\n")
+            .expect_err("inverted retry bounds must fail");
+        assert!(error.to_string().contains("retry_max_ms"), "{error}");
+
+        let error = Config::parse("[edge]\nmax_snapshot_chunk_bytes = 1023\n")
+            .expect_err("too-small snapshot chunk must fail");
+        assert!(
+            error.to_string().contains("max_snapshot_chunk_bytes"),
+            "{error}"
+        );
+
+        let error = Config::parse("[edge]\nshared_secret_env = \"  \"\n")
+            .expect_err("blank secret env must fail");
+        assert!(error.to_string().contains("shared_secret_env"), "{error}");
+
+        let error =
+            Config::parse("[edge]\nedge_id = \"  \"\n").expect_err("blank edge id must fail");
+        assert!(error.to_string().contains("edge_id"), "{error}");
+
+        let long = "a".repeat(129);
+        let error = Config::parse(&format!("[edge]\nedge_id = \"{long}\"\n"))
+            .expect_err("overlong edge id must fail");
+        assert!(error.to_string().contains("edge_id"), "{error}");
+
+        let error = Config::parse("[edge]\nedge_id = \"edge 1\"\n")
+            .expect_err("edge id with whitespace must fail");
+        assert!(error.to_string().contains("edge_id"), "{error}");
+    }
+
+    #[test]
+    fn edge_subcommand_requires_hub_url_and_secret_env() {
+        let config = Config::default();
+        let error = config
+            .edge
+            .validate_for_edge()
+            .expect_err("edge without hub_url must fail");
+        assert!(error.to_string().contains("hub_url"), "{error}");
+
+        let config = Config::parse("[edge]\nhub_url = \"https://hub.example.com\"\n")
+            .expect("hub url alone parses");
+        let error = config
+            .edge
+            .validate_for_edge()
+            .expect_err("edge without secret env must fail");
+        assert!(error.to_string().contains("shared_secret_env"), "{error}");
+
+        let config = Config::parse(
+            "[edge]\n\
+             hub_url = \"https://hub.example.com\"\n\
+             shared_secret_env = \"EVENTS_BRIDGE_EDGE_SECRET\"\n",
+        )
+        .expect("complete edge config parses");
+        config
+            .edge
+            .validate_for_edge()
+            .expect("complete edge config validates");
     }
 
     #[test]
