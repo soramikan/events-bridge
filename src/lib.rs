@@ -8,6 +8,7 @@ pub mod auth;
 pub mod collectors;
 pub mod config;
 pub mod delivery;
+pub mod edge_protocol;
 pub mod event;
 pub mod hub;
 pub mod mcp;

@@ -37,6 +37,8 @@ pub struct AppState {
     pub github_webhook_secret: Option<SecretString>,
     /// Optional GitHub REST API token.
     pub github_token: Option<SecretString>,
+    /// Shared HMAC secret for authenticated edge ingest.
+    pub edge_shared_secret: Option<SecretString>,
 }
 
 impl AppState {
@@ -81,6 +83,17 @@ impl AppState {
             None => None,
         };
 
+        let edge_shared_secret = if config.server.enable_edge_ingest {
+            let variable = config
+                .server
+                .edge_shared_secret_env
+                .as_deref()
+                .context("server.enable_edge_ingest requires server.edge_shared_secret_env")?;
+            Some(read_secret_env(variable, "edge ingest")?)
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             config: Arc::new(config),
             repo,
@@ -92,6 +105,7 @@ impl AppState {
             internal_token,
             github_webhook_secret,
             github_token,
+            edge_shared_secret,
         }))
     }
 }

@@ -51,41 +51,64 @@ impl T3CollectorSettings {
     /// Resolve settings from the daemon configuration.
     pub fn from_config(config: &Config) -> Result<Self> {
         let t3 = &config.collectors.t3;
-        let state_db_path = if t3.state_db_path.as_os_str().is_empty() {
-            home_directory()?.join(".t3/userdata/statev2.sqlite")
-        } else {
-            expand_tilde(t3.state_db_path.clone())?
-        };
+        let state_db_path = resolve_state_db_path(t3)?;
+        let environment_id = resolve_environment_id(t3, &state_db_path)?;
+        Self::from_parts(t3, state_db_path, environment_id)
+    }
 
-        let environment_id = match t3
-            .environment_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(value) => value.to_string(),
-            None => {
-                let path = match &t3.environment_id_path {
-                    Some(path) => expand_tilde(path.clone())?,
-                    None => state_db_path
-                        .parent()
-                        .map(|parent| parent.join("environment-id"))
-                        .context("T3 state database path has no parent directory")?,
-                };
-                let contents = fs::read_to_string(&path).with_context(|| {
-                    format!(
-                        "reading T3 environment id from {} (set collectors.t3.environment_id)",
-                        path.display()
-                    )
-                })?;
-                let value = contents.trim().to_string();
-                if value.is_empty() {
-                    bail!("T3 environment id file {} is empty", path.display());
+    /// Resolve settings, falling back to the OS host name when no environment
+    /// id is configured and the sibling `environment-id` file is unavailable.
+    ///
+    /// The edge subcommand uses this so an explicit `edge.edge_id` is not
+    /// required just to start. The hub-local collector keeps the strict
+    /// [`Self::from_config`] behavior. When neither an environment id nor a
+    /// usable OS host name is available, this fails instead of silently using
+    /// a shared default that would collide across hosts.
+    pub fn from_config_with_hostname_fallback(config: &Config) -> Result<Self> {
+        Self::from_config_with_hostname_fallback_and_hostname(config, crate::util::os_hostname())
+    }
+
+    /// Testable variant of [`Self::from_config_with_hostname_fallback`].
+    #[doc(hidden)]
+    pub fn from_config_with_hostname_fallback_and_hostname(
+        config: &Config,
+        hostname: Option<String>,
+    ) -> Result<Self> {
+        let t3 = &config.collectors.t3;
+        let state_db_path = resolve_state_db_path(t3)?;
+        let environment_id = match resolve_environment_id(t3, &state_db_path) {
+            Ok(environment_id) => environment_id,
+            Err(error) => {
+                if t3
+                    .environment_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    return Err(error);
                 }
-                value
+                let Some(hostname) = hostname else {
+                    bail!(
+                        "T3 environment id is unavailable and no usable OS host name was found; \
+                         set collectors.t3.environment_id explicitly (or provide an \
+                         environment-id file)"
+                    );
+                };
+                tracing::warn!(
+                    %error,
+                    %hostname,
+                    "T3 environment id is unavailable; using the OS host name"
+                );
+                hostname
             }
         };
+        Self::from_parts(t3, state_db_path, environment_id)
+    }
 
+    fn from_parts(
+        t3: &crate::config::T3CollectorConfig,
+        state_db_path: PathBuf,
+        environment_id: String,
+    ) -> Result<Self> {
         let web_base_url = match t3.t3_web_base_url.as_deref() {
             Some(value) => Some(Url::parse(value).with_context(|| {
                 format!("collectors.t3.t3_web_base_url `{value}` is not a URL")
@@ -814,6 +837,48 @@ fn decision_text(value: &Value) -> Option<String> {
     }
 }
 
+fn resolve_state_db_path(t3: &crate::config::T3CollectorConfig) -> Result<PathBuf> {
+    if t3.state_db_path.as_os_str().is_empty() {
+        Ok(home_directory()?.join(".t3/userdata/statev2.sqlite"))
+    } else {
+        expand_tilde(t3.state_db_path.clone())
+    }
+}
+
+fn resolve_environment_id(
+    t3: &crate::config::T3CollectorConfig,
+    state_db_path: &Path,
+) -> Result<String> {
+    match t3
+        .environment_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Ok(value.to_string()),
+        None => {
+            let path = match &t3.environment_id_path {
+                Some(path) => expand_tilde(path.clone())?,
+                None => state_db_path
+                    .parent()
+                    .map(|parent| parent.join("environment-id"))
+                    .context("T3 state database path has no parent directory")?,
+            };
+            let contents = fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "reading T3 environment id from {} (set collectors.t3.environment_id)",
+                    path.display()
+                )
+            })?;
+            let value = contents.trim().to_string();
+            if value.is_empty() {
+                bail!("T3 environment id file {} is empty", path.display());
+            }
+            Ok(value)
+        }
+    }
+}
+
 fn home_directory() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -916,6 +981,43 @@ mod tests {
         assert!(
             error.to_string().contains("readonly"),
             "unexpected write error: {error}"
+        );
+    }
+
+    #[test]
+    fn edge_settings_fall_back_to_the_host_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.collectors.t3.state_db_path = dir.path().join("statev2.sqlite");
+        config.collectors.t3.environment_id = None;
+        config.collectors.t3.environment_id_path = None;
+
+        let strict = T3CollectorSettings::from_config(&config);
+        assert!(strict.is_err(), "strict resolution must require an id");
+
+        let settings = T3CollectorSettings::from_config_with_hostname_fallback_and_hostname(
+            &config,
+            Some("build-host".into()),
+        )
+        .expect("host name fallback");
+        assert_eq!(settings.environment_id, "build-host");
+        assert_eq!(settings.state_db_path, config.collectors.t3.state_db_path);
+    }
+
+    #[test]
+    fn edge_settings_require_an_explicit_id_when_no_host_name_resolves() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.collectors.t3.state_db_path = dir.path().join("statev2.sqlite");
+        config.collectors.t3.environment_id = None;
+        config.collectors.t3.environment_id_path = None;
+
+        let error =
+            T3CollectorSettings::from_config_with_hostname_fallback_and_hostname(&config, None)
+                .expect_err("unresolved host name must fail");
+        assert!(
+            error.to_string().contains("collectors.t3.environment_id"),
+            "{error}"
         );
     }
 

@@ -28,7 +28,7 @@ enum Command {
         )]
         config: PathBuf,
     },
-    /// Edge collector (skeleton; implemented in a later phase).
+    /// Edge collector: forward T3 Code state to a central hub.
     Edge {
         /// Path to the TOML configuration file.
         #[arg(

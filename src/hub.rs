@@ -93,54 +93,13 @@ impl Hub {
     /// a misconfigured state database fails hub startup instead of being
     /// retried silently.
     pub fn spawn_t3_collector(&self) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
-        if !self.state.config.collectors.t3.enabled {
-            return Ok(None);
-        }
-        let collector = T3Collector::from_config(
-            &self.state.config,
-            self.state.repo.clone(),
-            self.state.bus.clone(),
-        )?;
-        tracing::info!(
-            environment_id = %collector.environment_id(),
-            state_db = %collector.source_path().display(),
-            "T3 collector started"
-        );
-        let cancellation = CancellationToken::new();
-        let child = cancellation.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(error) = collector.run(child).await {
-                tracing::error!(%error, "T3 collector stopped");
-            }
-        });
-        Ok(Some((cancellation, handle)))
+        spawn_t3_collector(&self.state)
     }
 
     /// Start the GitHub REST reconciler when `collectors.github.poll_enabled`
     /// is true.
     pub fn spawn_github_poller(&self) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
-        if !self.state.config.collectors.github.poll_enabled {
-            return Ok(None);
-        }
-        let poller = GitHubPoller::from_config(
-            &self.state.config,
-            self.state.github_token.clone(),
-            self.state.repo.clone(),
-            self.state.bus.clone(),
-        )?;
-        tracing::info!(
-            repositories = self.state.config.collectors.github.repositories.len(),
-            api_base = %self.state.config.collectors.github.api_base_url,
-            "GitHub reconciler started"
-        );
-        let cancellation = CancellationToken::new();
-        let child = cancellation.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(error) = poller.run(child).await {
-                tracing::error!(%error, "GitHub reconciler stopped");
-            }
-        });
-        Ok(Some((cancellation, handle)))
+        spawn_github_poller(&self.state)
     }
 
     /// Start the delivery worker.
@@ -164,7 +123,16 @@ impl Hub {
         );
 
         let collector = self.spawn_t3_collector()?;
-        let github_poller = self.spawn_github_poller()?;
+        let github_poller = match self.spawn_github_poller() {
+            Ok(poller) => poller,
+            Err(error) => {
+                if let Some((collector_cancellation, collector_handle)) = collector {
+                    collector_cancellation.cancel();
+                    let _ = collector_handle.await;
+                }
+                return Err(error);
+            }
+        };
         let (cancellation, dispatcher) = self.spawn_dispatcher();
         let mcp_cancellation = self.mcp_cancellation.clone();
         let router = self.router();
@@ -187,6 +155,61 @@ impl Hub {
         result?;
         Ok(())
     }
+}
+
+/// Start the T3 Code collector when `collectors.t3.enabled` is true.
+///
+/// Shared by the `hub` and `stdio` subcommands so both expose the same local
+/// collector behavior.
+pub fn spawn_t3_collector(
+    state: &Arc<AppState>,
+) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
+    if !state.config.collectors.t3.enabled {
+        return Ok(None);
+    }
+    let collector = T3Collector::from_config(&state.config, state.repo.clone(), state.bus.clone())?;
+    tracing::info!(
+        environment_id = %collector.environment_id(),
+        state_db = %collector.source_path().display(),
+        "T3 collector started"
+    );
+    let cancellation = CancellationToken::new();
+    let child = cancellation.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = collector.run(child).await {
+            tracing::error!(%error, "T3 collector stopped");
+        }
+    });
+    Ok(Some((cancellation, handle)))
+}
+
+/// Start the GitHub REST reconciler when `collectors.github.poll_enabled` is
+/// true. Shared by the `hub` and `stdio` subcommands.
+pub fn spawn_github_poller(
+    state: &Arc<AppState>,
+) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
+    if !state.config.collectors.github.poll_enabled {
+        return Ok(None);
+    }
+    let poller = GitHubPoller::from_config(
+        &state.config,
+        state.github_token.clone(),
+        state.repo.clone(),
+        state.bus.clone(),
+    )?;
+    tracing::info!(
+        repositories = state.config.collectors.github.repositories.len(),
+        api_base = %state.config.collectors.github.api_base_url,
+        "GitHub reconciler started"
+    );
+    let cancellation = CancellationToken::new();
+    let child = cancellation.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = poller.run(child).await {
+            tracing::error!(%error, "GitHub reconciler stopped");
+        }
+    });
+    Ok(Some((cancellation, handle)))
 }
 
 async fn shutdown_signal() {
