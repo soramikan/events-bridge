@@ -1,0 +1,51 @@
+# events-bridge example configuration.
+#
+# Copy to /etc/events-bridge/config.toml (or pass `--config`) and adjust.
+# Never commit the real file: it is listed in .gitignore.
+
+[server]
+# Behind Secure MCP Tunnel or Cloudflare Tunnel this can stay on loopback.
+bind = "127.0.0.1:8787"
+
+# Host header authorities accepted by the Streamable HTTP endpoint.
+# Add the public hostname when the hub is exposed through a tunnel.
+allowed_hosts = ["localhost", "127.0.0.1", "::1"]
+
+# public_base_url = "https://bridge.example.com"
+
+# Local event injection endpoint. Requires network-level protection. When
+# `internal_token_env` is set, requests must present that separate token in
+# `X-Internal-Token` (it does not reuse the MCP bearer token). When
+# `[auth].token_env` is also configured, MCP bearer authentication applies
+# independently.
+enable_internal_ingest = false
+# internal_token_env = "EVENTS_BRIDGE_INTERNAL_TOKEN"
+
+[database]
+path = "/var/lib/events-bridge/events.db"
+
+[auth]
+# Name of the environment variable containing the MCP bearer token.
+# When omitted the hub runs unauthenticated (acceptable only on loopback).
+# token_env = "EVENTS_BRIDGE_TOKEN"
+principal = "chatgpt"
+
+[subscriptions]
+default_ttl_secs = 3600
+min_ttl_secs = 60
+max_ttl_secs = 86400
+
+[delivery]
+timeout_secs = 10
+max_attempts = 5
+base_backoff_ms = 1000
+max_backoff_ms = 300000
+# Protocol ceiling is 256 KiB; values above it are rejected at startup.
+max_body_bytes = 262144
+# A delivery left `in_progress` longer than this is reclaimed after a worker
+# crash or a failed state update.
+lease_secs = 300
+poll_interval_ms = 5000
+
+[logging]
+level = "info,events_bridge=debug"

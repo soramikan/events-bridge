@@ -1,0 +1,64 @@
+[package]
+name = "events-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Signed MCP Events webhook bridge for T3 Code and GitHub events"
+license = "MIT"
+publish = false
+
+[lib]
+name = "events_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "events-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+hmac = "0.12"
+http = "1.0"
+metrics = "0.24"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "http2",
+] }
+rmcp = { version = "3.10", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = "1.0"
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+standardwebhooks = "1.0"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.13"
+
+[profile.release]
+lto = "thin"
+strip = true
