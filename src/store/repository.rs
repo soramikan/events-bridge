@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn migrations_create_every_table() {
         let repo = repository();
-        assert_eq!(repo.schema_version().unwrap(), 2);
+        assert_eq!(repo.schema_version().unwrap(), 3);
         let conn = repo.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -941,6 +941,10 @@ mod tests {
             "delivery_attempts",
             "deliveries",
             "events",
+            "github_ci_runs",
+            "github_deliveries",
+            "github_pending_checks",
+            "github_pull_requests",
             "source_cursors",
             "subscriptions",
             "t3_approvals",

@@ -23,6 +23,17 @@ pub fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Whether `left` is strictly older than `right`.
+///
+/// Both values are normally canonical fixed-width RFC 3339 timestamps, so a
+/// lexicographic comparison is a safe fallback if either side is malformed.
+pub fn timestamp_lt(left: &str, right: &str) -> bool {
+    match (parse_rfc3339(left), parse_rfc3339(right)) {
+        (Some(left), Some(right)) => left < right,
+        _ => left < right,
+    }
+}
+
 /// Cryptographically random lowercase hex string of `bytes` bytes.
 pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
@@ -58,6 +69,23 @@ mod tests {
         assert_eq!(value.len(), 16);
         assert!(value.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(value, random_hex(8));
+    }
+
+    #[test]
+    fn timestamp_ordering_handles_offsets() {
+        assert!(timestamp_lt("2026-11-16T01:00:00Z", "2026-11-16T01:00:01Z"));
+        assert!(!timestamp_lt(
+            "2026-11-16T01:00:01Z",
+            "2026-11-16T01:00:00Z"
+        ));
+        assert!(!timestamp_lt(
+            "2026-11-16T01:00:00Z",
+            "2026-11-16T01:00:00Z"
+        ));
+        assert!(timestamp_lt(
+            "2026-11-16T00:00:00Z",
+            "2026-11-16T01:00:01+01:00"
+        ));
     }
 
     #[test]

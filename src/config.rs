@@ -166,6 +166,8 @@ impl Default for DeliveryConfig {
 pub struct CollectorsConfig {
     /// T3 Code collector settings.
     pub t3: T3CollectorConfig,
+    /// GitHub collector settings.
+    pub github: GitHubCollectorConfig,
 }
 
 /// T3 Code collector settings.
@@ -208,6 +210,50 @@ impl Default for T3CollectorConfig {
             poll_interval_ms: 1_000,
             watch_wal: true,
             batch_size: 500,
+        }
+    }
+}
+
+/// Absolute ceiling for a GitHub webhook request body (10 MiB).
+pub const MAX_GITHUB_WEBHOOK_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// GitHub collector settings.
+///
+/// Both ingress paths are disabled by default. The webhook secret and the
+/// optional API token are named indirectly through environment variables; the
+/// configuration file never contains credentials.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitHubCollectorConfig {
+    /// Enables `POST /webhooks/github`.
+    pub webhook_enabled: bool,
+    /// Environment variable holding the GitHub webhook HMAC secret.
+    pub webhook_secret_env: Option<String>,
+    /// Enables periodic REST API reconciliation.
+    pub poll_enabled: bool,
+    /// Environment variable holding a GitHub personal/app token.
+    pub token_env: Option<String>,
+    /// Watched repositories in `owner/repo` form.
+    pub repositories: Vec<String>,
+    /// GitHub REST API base URL.
+    pub api_base_url: String,
+    /// Reconciliation interval.
+    pub poll_interval_secs: u64,
+    /// Maximum accepted webhook request body.
+    pub max_webhook_body_bytes: usize,
+}
+
+impl Default for GitHubCollectorConfig {
+    fn default() -> Self {
+        Self {
+            webhook_enabled: false,
+            webhook_secret_env: None,
+            poll_enabled: false,
+            token_env: None,
+            repositories: Vec::new(),
+            api_base_url: "https://api.github.com".into(),
+            poll_interval_secs: 60,
+            max_webhook_body_bytes: 1024 * 1024,
         }
     }
 }
@@ -293,6 +339,67 @@ impl Config {
                 );
             }
         }
+
+        let github = &self.collectors.github;
+        if github.webhook_enabled
+            && !github
+                .webhook_secret_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!(
+                "collectors.github.webhook_secret_env must be set to a non-empty environment \
+                 variable name when collectors.github.webhook_enabled is true"
+            );
+        }
+        if github
+            .token_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("collectors.github.token_env must not be empty when set");
+        }
+        for repository in &github.repositories {
+            validate_github_repository(repository)?;
+        }
+        if github.poll_enabled && github.repositories.is_empty() {
+            bail!(
+                "collectors.github.repositories must not be empty when \
+                 collectors.github.poll_enabled is true"
+            );
+        }
+        let api_url = url::Url::parse(&github.api_base_url).with_context(|| {
+            format!(
+                "collectors.github.api_base_url `{}` is not a URL",
+                github.api_base_url
+            )
+        })?;
+        if !matches!(api_url.scheme(), "http" | "https") {
+            bail!("collectors.github.api_base_url must use http or https");
+        }
+        if api_url.cannot_be_a_base()
+            || api_url.host_str().is_none()
+            || api_url.query().is_some()
+            || api_url.fragment().is_some()
+        {
+            bail!(
+                "collectors.github.api_base_url must be a hierarchical URL with a host and no \
+                 query or fragment"
+            );
+        }
+        if github.poll_interval_secs == 0 {
+            bail!("collectors.github.poll_interval_secs must be greater than zero");
+        }
+        if github.max_webhook_body_bytes == 0 {
+            bail!("collectors.github.max_webhook_body_bytes must be greater than zero");
+        }
+        if github.max_webhook_body_bytes > MAX_GITHUB_WEBHOOK_BODY_BYTES {
+            bail!(
+                "collectors.github.max_webhook_body_bytes must not exceed 10 MiB \
+                 ({MAX_GITHUB_WEBHOOK_BODY_BYTES} bytes), got {}",
+                github.max_webhook_body_bytes
+            );
+        }
         Ok(())
     }
 
@@ -312,6 +419,35 @@ impl Config {
         config.subscriptions.min_ttl_secs = 1;
         config
     }
+}
+
+/// Validate a watched repository entry.
+///
+/// GitHub repository names never contain whitespace, `?` or `#`, and the
+/// `owner/repo` form has exactly one separator. Rejecting these here avoids
+/// constructing ambiguous REST API paths later.
+fn validate_github_repository(repository: &str) -> Result<()> {
+    if repository.trim() != repository {
+        bail!("collectors.github.repositories entry `{repository}` has surrounding whitespace");
+    }
+    if repository
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '?' | '#'))
+    {
+        bail!(
+            "collectors.github.repositories entry `{repository}` must not contain whitespace, \
+             `?` or `#`"
+        );
+    }
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        bail!(
+            "collectors.github.repositories entry `{repository}` must have the form `owner/repo`"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -405,5 +541,107 @@ mod tests {
         let config = Config::default();
         assert!(config.server.allowed_hosts.iter().any(|h| h == "127.0.0.1"));
         assert!(!config.server.enable_internal_ingest);
+    }
+
+    #[test]
+    fn github_collector_settings_parse_and_validate() {
+        let config = Config::parse(
+            "[collectors.github]\n\
+             webhook_enabled = true\n\
+             webhook_secret_env = \"EVENTS_BRIDGE_GITHUB_WEBHOOK_SECRET\"\n\
+             poll_enabled = true\n\
+             token_env = \"EVENTS_BRIDGE_GITHUB_TOKEN\"\n\
+             repositories = [\"soramikan/events-bridge\"]\n\
+             api_base_url = \"https://ghe.example.com/api/v3\"\n\
+             poll_interval_secs = 30\n\
+             max_webhook_body_bytes = 2048\n",
+        )
+        .expect("github collector config parses");
+        let github = &config.collectors.github;
+        assert!(github.webhook_enabled);
+        assert!(github.poll_enabled);
+        assert_eq!(github.repositories, vec!["soramikan/events-bridge"]);
+        assert_eq!(github.poll_interval_secs, 30);
+        assert_eq!(github.max_webhook_body_bytes, 2048);
+
+        let defaults = Config::default().collectors.github;
+        assert!(!defaults.webhook_enabled);
+        assert!(!defaults.poll_enabled);
+        assert_eq!(defaults.api_base_url, "https://api.github.com");
+        assert_eq!(defaults.poll_interval_secs, 60);
+    }
+
+    #[test]
+    fn github_webhook_requires_a_non_empty_secret_env_name() {
+        let error = Config::parse("[collectors.github]\nwebhook_enabled = true\n")
+            .expect_err("webhook enabled without a secret env must fail");
+        assert!(error.to_string().contains("webhook_secret_env"), "{error}");
+
+        let error = Config::parse(
+            "[collectors.github]\nwebhook_enabled = true\nwebhook_secret_env = \"  \"\n",
+        )
+        .expect_err("blank secret env must fail");
+        assert!(error.to_string().contains("webhook_secret_env"), "{error}");
+    }
+
+    #[test]
+    fn github_poll_requires_at_least_one_repository() {
+        let error = Config::parse("[collectors.github]\npoll_enabled = true\n")
+            .expect_err("polling without repositories must fail");
+        assert!(error.to_string().contains("repositories"), "{error}");
+    }
+
+    #[test]
+    fn invalid_github_repository_entries_fail() {
+        for repository in [
+            "events-bridge",
+            "/events-bridge",
+            "soramikan/",
+            "soramikan/events-bridge/extra",
+            "soramikan events-bridge",
+            "soramikan/events-bridge?x=1",
+            "soramikan/events-bridge#frag",
+        ] {
+            let contents = format!("[collectors.github]\nrepositories = [\"{repository}\"]\n");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "repository `{repository}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_api_and_body_limits_are_validated() {
+        for base in [
+            "ftp://api.github.com",
+            "https://api.github.com?x=1",
+            "https://api.github.com#frag",
+            "not a URL",
+        ] {
+            let contents = format!("[collectors.github]\napi_base_url = \"{base}\"\n");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "api_base_url `{base}` must be rejected"
+            );
+        }
+
+        let error = Config::parse("[collectors.github]\npoll_interval_secs = 0\n")
+            .expect_err("zero poll interval must fail");
+        assert!(error.to_string().contains("poll_interval_secs"), "{error}");
+
+        let error = Config::parse("[collectors.github]\nmax_webhook_body_bytes = 0\n")
+            .expect_err("zero body limit must fail");
+        assert!(
+            error.to_string().contains("max_webhook_body_bytes"),
+            "{error}"
+        );
+
+        let error = Config::parse("[collectors.github]\nmax_webhook_body_bytes = 10485761\n")
+            .expect_err("body limit above 10 MiB must fail");
+        assert!(error.to_string().contains("10 MiB"), "{error}");
+
+        let error = Config::parse("[collectors.github]\ntoken_env = \"\"\n")
+            .expect_err("empty token env must fail");
+        assert!(error.to_string().contains("token_env"), "{error}");
     }
 }

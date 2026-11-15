@@ -84,8 +84,16 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
         .route("/mcp", any(mcp_entry))
         .route("/healthz", get(healthz))
         .route("/internal/events", post(internal_ingest))
+        .route("/webhooks/github", post(github_webhook_entry))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+async fn github_webhook_entry(
+    State(state): State<Arc<McpHttpState>>,
+    request: Request,
+) -> Response {
+    crate::collectors::github_webhook::handle(state.app.clone(), request).await
 }
 
 async fn healthz() -> impl IntoResponse {

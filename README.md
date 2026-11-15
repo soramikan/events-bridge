@@ -33,6 +33,36 @@ T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI �
 - Pull ツール `get_t3_run` / `get_t3_approvals`
 - 詳細は [docs/T3-COLLECTOR.md](docs/T3-COLLECTOR.md)
 
+## Phase 3 の実装範囲（GitHub Collector）
+
+- `POST /webhooks/github`（MCP の Bearer / `allowed_hosts` とは独立）
+  - `X-Hub-Signature-256` を生バイト列に対して HMAC-SHA256 検証
+  - `X-GitHub-Delivery` で重複排除し、配信記録・状態・イベントを単一トランザクションで保存
+  - `ping`、`workflow_run`、`check_run`、`pull_request`、`pull_request_review`、
+    `pull_request_review_comment` に対応
+- `workflow_run` と `check_run` の CI 失敗を「run id + attempt」で正規化し、
+  どちらの順序でも 1 回だけ `github.workflow.failed` を配信
+  - GitHub Actions の `check_run` はジョブ名しか持たないため、真の workflow 名と
+    attempt が分かるまで `github_pending_checks` に保留し、イベントを発火しない
+  - 後から来た `workflow_run`（Webhook または REST 照合）が正規の workflow 名・
+    attempt で 1 回だけ通知し、対応する保留行を削除
+  - Actions 以外の外部 `check_run` は `check_run:<id>` を正規キーとし、
+    success / in_progress などの非失敗状態も反映
+  - rerun（attempt 2 以降）は新しい失敗として通知
+- REST API による定期照合（`collectors.github.poll_enabled`）
+  - `collector_checkpoints` に ETag / watermark を保存し、`304 Not Modified` を尊重
+  - `Link: rel="next"` を辿ってページングし、設定した API origin / path prefix 以外へは
+    リクエストしない
+  - watermark より古いページで打ち切り、初回ベースラインでは既存のマージ済み PR・
+    失敗 Run を通知しない
+  - ローカルで追跡中の未完了 Run と保留中の Actions check は、一覧ページに無くても
+    `GET /actions/runs/{id}` で個別に照合
+  - 取りこぼしたマージ・レビュー要求・CI 失敗を補完し、後続 Webhook と重複しない
+  - 古い Webhook / ポーリング応答では `updated_at` を巻き戻さず、レビュー要求も
+    再発火しない
+- Pull ツール `get_github_status`（PR・CI の最新状態とサマリー）
+- 環境変数で秘密情報を指定: `webhook_secret_env`、任意の `token_env`
+
 ## 起動
 
 ```sh
@@ -94,5 +124,6 @@ cargo test
 
 ## 状態
 
-Phase 1・Phase 2（T3 Code Collector）実装済み。ChatGPT 実機との接続（Secure MCP Tunnel の権限・ワークスペース
+Phase 1・Phase 2（T3 Code Collector）・Phase 3（GitHub Collector）実装済み。
+ChatGPT 実機との接続（Secure MCP Tunnel の権限・ワークスペース
 関連付け、dots の監視指示登録）は運用側の手順として別途行います。

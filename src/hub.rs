@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::AppState,
-    collectors::T3Collector,
+    collectors::{GitHubPoller, T3Collector},
     config::Config,
     delivery::Dispatcher,
     delivery::verification::CallbackPolicy,
@@ -116,6 +116,33 @@ impl Hub {
         Ok(Some((cancellation, handle)))
     }
 
+    /// Start the GitHub REST reconciler when `collectors.github.poll_enabled`
+    /// is true.
+    pub fn spawn_github_poller(&self) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
+        if !self.state.config.collectors.github.poll_enabled {
+            return Ok(None);
+        }
+        let poller = GitHubPoller::from_config(
+            &self.state.config,
+            self.state.github_token.clone(),
+            self.state.repo.clone(),
+            self.state.bus.clone(),
+        )?;
+        tracing::info!(
+            repositories = self.state.config.collectors.github.repositories.len(),
+            api_base = %self.state.config.collectors.github.api_base_url,
+            "GitHub reconciler started"
+        );
+        let cancellation = CancellationToken::new();
+        let child = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(error) = poller.run(child).await {
+                tracing::error!(%error, "GitHub reconciler stopped");
+            }
+        });
+        Ok(Some((cancellation, handle)))
+    }
+
     /// Start the delivery worker.
     pub fn spawn_dispatcher(&self) -> (CancellationToken, JoinHandle<()>) {
         let dispatcher = self.dispatcher.clone();
@@ -137,6 +164,7 @@ impl Hub {
         );
 
         let collector = self.spawn_t3_collector()?;
+        let github_poller = self.spawn_github_poller()?;
         let (cancellation, dispatcher) = self.spawn_dispatcher();
         let mcp_cancellation = self.mcp_cancellation.clone();
         let router = self.router();
@@ -150,6 +178,10 @@ impl Hub {
         if let Some((collector_cancellation, collector_handle)) = collector {
             collector_cancellation.cancel();
             let _ = collector_handle.await;
+        }
+        if let Some((poller_cancellation, poller_handle)) = github_poller {
+            poller_cancellation.cancel();
+            let _ = poller_handle.await;
         }
         let _ = dispatcher.await;
         result?;

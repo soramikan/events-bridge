@@ -66,3 +66,35 @@ enabled = false
 poll_interval_ms = 1000
 watch_wal = true
 batch_size = 500
+
+# GitHub Collector (Phase 3).
+#
+# GitHub authenticates webhook deliveries with an HMAC-SHA256 signature, not
+# the MCP bearer token. The secret and the optional REST API token are read
+# from environment variables and must never be written to this file.
+#
+# `webhook_enabled` exposes POST /webhooks/github. `poll_enabled` periodically
+# reconciles pull requests and workflow runs through the REST API (and needs at
+# least one repository). Both paths can run together; duplicate CI failures are
+# normalized by workflow run id and attempt.
+[collectors.github]
+webhook_enabled = false
+poll_enabled = false
+
+# Environment variable holding the GitHub webhook HMAC secret.
+# Required when webhook_enabled = true.
+# webhook_secret_env = "EVENTS_BRIDGE_GITHUB_WEBHOOK_SECRET"
+
+# Optional environment variable holding a GitHub personal/app token. When set,
+# the token is sent as `Authorization: Bearer ...` on REST reconciliation.
+# token_env = "EVENTS_BRIDGE_GITHUB_TOKEN"
+
+# Watched "owner/repo" entries. Required when poll_enabled = true. When set,
+# webhook deliveries for other repositories are acknowledged and ignored.
+repositories = []
+# repositories = ["soramikan/events-bridge"]
+
+api_base_url = "https://api.github.com"
+poll_interval_secs = 60
+# Accepted webhook body ceiling (at most 10 MiB).
+max_webhook_body_bytes = 1048576
