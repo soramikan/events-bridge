@@ -98,6 +98,8 @@ pub enum OAuthError {
     InvalidGrant(String),
     /// A requested scope is unknown or exceeds the grant.
     InvalidScope(String),
+    /// The requested RFC 8707 resource target is invalid or not served here.
+    InvalidTarget(String),
     /// The grant type is not implemented.
     UnsupportedGrantType,
     /// Durable state could not be read or written.
@@ -123,6 +125,7 @@ impl OAuthError {
             Self::InvalidClient => "invalid_client",
             Self::InvalidGrant(_) => "invalid_grant",
             Self::InvalidScope(_) => "invalid_scope",
+            Self::InvalidTarget(_) => "invalid_target",
             Self::UnsupportedGrantType => "unsupported_grant_type",
             Self::Server(_) => "server_error",
         }
@@ -133,7 +136,8 @@ impl OAuthError {
         match self {
             Self::InvalidRequest(message)
             | Self::InvalidGrant(message)
-            | Self::InvalidScope(message) => message.clone(),
+            | Self::InvalidScope(message)
+            | Self::InvalidTarget(message) => message.clone(),
             Self::InvalidClient => "client authentication failed".into(),
             Self::UnsupportedGrantType => "unsupported grant type".into(),
             Self::Server(_) => "the authorization server could not complete the request".into(),
@@ -229,6 +233,8 @@ pub struct TokenParams {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// Form parameters accepted by `POST /oauth/revoke`.
@@ -257,6 +263,9 @@ pub struct ClientAuthentication {
 
 impl ClientAuthentication {
     /// Parse an `Authorization: Basic ...` header.
+    ///
+    /// Per RFC 6749 §2.3.1, `client_id` and `client_secret` are individually
+    /// `application/x-www-form-urlencoded` decoded after splitting on `:`.
     pub fn from_headers(headers: &HeaderMap) -> Result<Self, OAuthError> {
         let Some(value) = headers.get(header::AUTHORIZATION) else {
             return Ok(Self::default());
@@ -270,15 +279,52 @@ impl ClientAuthentication {
             .decode(encoded)
             .map_err(|_| OAuthError::InvalidClient)?;
         let decoded = String::from_utf8(decoded).map_err(|_| OAuthError::InvalidClient)?;
-        let (client_id, client_secret) =
+        let (raw_client_id, raw_client_secret) =
             decoded.split_once(':').ok_or(OAuthError::InvalidClient)?;
+        let client_id = decode_form_component(raw_client_id)?;
+        let client_secret = decode_form_component(raw_client_secret)?;
         if client_id.is_empty() {
             return Err(OAuthError::InvalidClient);
         }
         Ok(Self {
-            basic: Some((client_id.to_string(), client_secret.to_string())),
+            basic: Some((client_id, client_secret)),
             ..Self::default()
         })
+    }
+}
+
+fn decode_form_component(raw: &str) -> Result<String, OAuthError> {
+    let raw = raw.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                let hi = *raw.get(i + 1).ok_or(OAuthError::InvalidClient)?;
+                let lo = *raw.get(i + 2).ok_or(OAuthError::InvalidClient)?;
+                let byte = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
+                out.push(byte);
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| OAuthError::InvalidClient)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, OAuthError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(OAuthError::InvalidClient),
     }
 }
 
@@ -310,6 +356,8 @@ struct OAuthClient {
 #[derive(Clone)]
 pub struct OAuthService {
     issuer: String,
+    issuer_origin: String,
+    base_path: String,
     store: OAuthStore,
     admin_secret: SecretString,
     clients: BTreeMap<String, OAuthClient>,
@@ -327,6 +375,20 @@ impl std::fmt::Debug for OAuthService {
     }
 }
 
+fn parse_issuer_parts(raw: &str) -> Result<(String, String, String)> {
+    let issuer = raw.trim_end_matches('/').to_string();
+    if issuer.is_empty() {
+        bail!("oauth.issuer must not be empty");
+    }
+    let url = Url::parse(&issuer).with_context(|| format!("oauth.issuer `{raw}` is not a URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("oauth.issuer must use http or https with a host");
+    }
+    let issuer_origin = url.origin().ascii_serialization();
+    let base_path = url.path().trim_end_matches('/').to_string();
+    Ok((issuer, issuer_origin, base_path))
+}
+
 impl OAuthService {
     /// Build the service, reading the administrator and client secrets from the
     /// environment. Returns `None` when OAuth is disabled.
@@ -334,15 +396,11 @@ impl OAuthService {
         if !config.enabled {
             return Ok(None);
         }
-        let issuer = config
+        let raw_issuer = config
             .issuer
             .as_deref()
-            .context("oauth.issuer is required when oauth.enabled is true")?
-            .trim_end_matches('/')
-            .to_string();
-        if issuer.is_empty() {
-            bail!("oauth.issuer must not be empty");
-        }
+            .context("oauth.issuer is required when oauth.enabled is true")?;
+        let (issuer, issuer_origin, base_path) = parse_issuer_parts(raw_issuer)?;
         let admin_variable = config
             .admin_secret_env
             .as_deref()
@@ -365,6 +423,8 @@ impl OAuthService {
 
         Ok(Some(Self {
             issuer,
+            issuer_origin,
+            base_path,
             store: OAuthStore::new(repo),
             admin_secret,
             clients,
@@ -377,6 +437,36 @@ impl OAuthService {
     /// Normalized issuer identifier (no trailing slash).
     pub fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    /// Normalized path prefix of `issuer` (empty string when mounted at root).
+    pub fn base_path(&self) -> &str {
+        &self.base_path
+    }
+
+    /// Path for the authorization/consent endpoint, preserving any issuer base path.
+    pub fn authorize_path(&self) -> String {
+        format!("{}/oauth/authorize", self.base_path)
+    }
+
+    /// Path for the token endpoint, preserving any issuer base path.
+    pub fn token_path(&self) -> String {
+        format!("{}/oauth/token", self.base_path)
+    }
+
+    /// Path for the revocation endpoint, preserving any issuer base path.
+    pub fn revoke_path(&self) -> String {
+        format!("{}/oauth/revoke", self.base_path)
+    }
+
+    /// RFC 8414 authorization-server metadata path for this issuer.
+    pub fn authorization_server_metadata_path(&self) -> String {
+        format!("/.well-known/oauth-authorization-server{}", self.base_path)
+    }
+
+    /// RFC 9728 protected-resource metadata path for this issuer.
+    pub fn protected_resource_metadata_path(&self) -> String {
+        format!("/.well-known/oauth-protected-resource{}", self.base_path)
     }
 
     /// RFC 9728 protected-resource metadata document.
@@ -416,7 +506,11 @@ impl OAuthService {
 
     /// URL advertised in `WWW-Authenticate: Bearer`.
     pub fn protected_resource_metadata_url(&self) -> String {
-        self.endpoint("/.well-known/oauth-protected-resource")
+        format!(
+            "{}{}",
+            self.issuer_origin,
+            self.protected_resource_metadata_path()
+        )
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -435,9 +529,19 @@ impl OAuthService {
         } else {
             ""
         };
-        format!(
-            "{CSRF_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=600{secure}"
-        )
+        let path = self.authorize_path();
+        format!("{CSRF_COOKIE}={token}; HttpOnly; SameSite=Lax; Path={path}; Max-Age=600{secure}")
+    }
+
+    /// `Set-Cookie` value that clears the double-submit CSRF cookie.
+    pub fn clear_csrf_cookie(&self) -> String {
+        let secure = if self.issuer.starts_with("https://") {
+            "; Secure"
+        } else {
+            ""
+        };
+        let path = self.authorize_path();
+        format!("{CSRF_COOKIE}=; HttpOnly; SameSite=Lax; Path={path}; Max-Age=0{secure}")
     }
 
     /// Extract the double-submit cookie from request headers.
@@ -521,12 +625,7 @@ impl OAuthService {
         }
         let scopes = resolve_scopes(params.scope.as_deref(), &client.scopes)?;
         let state = optional_bounded(params.state.as_deref(), "state")?;
-        let resource = optional_bounded(params.resource.as_deref(), "resource")?;
-        if resource.is_some_and(|value| Url::parse(value).is_err()) {
-            return Err(OAuthError::InvalidRequest(
-                "resource must be an absolute URI".into(),
-            ));
-        }
+        let resource = self.validate_resource(params.resource.as_deref())?;
 
         Ok(AuthorizedRequest {
             client_id: client.client_id.clone(),
@@ -535,9 +634,42 @@ impl OAuthService {
             redirect_uri_raw: redirect_raw.to_string(),
             scopes,
             state: state.map(ToOwned::to_owned),
-            resource: resource.map(ToOwned::to_owned),
+            resource,
             code_challenge: code_challenge.to_string(),
         })
+    }
+
+    fn validate_resource(&self, raw: Option<&str>) -> Result<Option<String>, OAuthError> {
+        let Some(value) = optional_bounded(raw, "resource")? else {
+            return Ok(None);
+        };
+        let requested = Url::parse(value)
+            .map_err(|_| OAuthError::InvalidTarget("resource must be an absolute URI".into()))?;
+        if requested.cannot_be_a_base()
+            || !matches!(requested.scheme(), "http" | "https")
+            || requested.host_str().is_none()
+            || requested.query().is_some()
+            || requested.fragment().is_some()
+            || !requested.username().is_empty()
+            || requested.password().is_some()
+        {
+            return Err(OAuthError::InvalidTarget(
+                "resource must be an HTTP(S) URI without userinfo, query, or fragment".into(),
+            ));
+        }
+        let expected = Url::parse(&self.issuer).map_err(|error| {
+            OAuthError::Server(anyhow::anyhow!("configured issuer is invalid: {error}"))
+        })?;
+        let matches_target = requested.scheme() == expected.scheme()
+            && requested.host() == expected.host()
+            && requested.port_or_known_default() == expected.port_or_known_default()
+            && requested.path().trim_end_matches('/') == expected.path().trim_end_matches('/');
+        if !matches_target {
+            return Err(OAuthError::InvalidTarget(
+                "resource does not match this protected resource".into(),
+            ));
+        }
+        Ok(Some(self.issuer.clone()))
     }
 
     /// Render the consent page. Every dynamic value is HTML-escaped.
@@ -550,6 +682,7 @@ impl OAuthService {
             )
         };
         let scope = request.scope_string();
+        let authorize_action = escape_html(&self.authorize_path());
         format!(
             "<!doctype html>\n\
 <html lang=\"en\">\n\
@@ -575,7 +708,7 @@ button[value=approve] {{ background: #0969da; color: white; border-color: #0969d
 <p><strong>{client}</strong> is requesting access as principal <code>{principal}</code>.</p>\n\
 <p>Redirect URI:<br><code>{redirect}</code></p>\n\
 <p>Requested scopes:<br><code>{scope}</code></p>\n\
-<form method=\"post\" action=\"/oauth/authorize\">\n\
+<form method=\"post\" action=\"{authorize_action}\">\n\
 {response_type}{client_field}{redirect_field}{scope_field}{state_field}{resource_field}{challenge_field}{method_field}{csrf_field}\n\
 <label for=\"admin-secret\">Administrator approval secret</label>\n\
 <input id=\"admin-secret\" type=\"password\" name=\"{admin_field}\" autocomplete=\"current-password\" required>\n\
@@ -591,6 +724,7 @@ button[value=approve] {{ background: #0969da; color: white; border-color: #0969d
             principal = escape_html(&request.principal),
             redirect = escape_html(request.redirect_uri.as_str()),
             scope = escape_html(&scope),
+            authorize_action = authorize_action,
             response_type = hidden("response_type", "code"),
             client_field = hidden("client_id", &request.client_id),
             redirect_field = hidden("redirect_uri", &request.redirect_uri_raw),
@@ -675,6 +809,7 @@ button[value=approve] {{ background: #0969da; color: white; border-color: #0969d
                 "code_verifier is malformed".into(),
             ));
         }
+        let requested_resource = self.validate_resource(params.resource.as_deref())?;
 
         let code_hash = hash_secret(code);
         let record = self
@@ -690,6 +825,13 @@ button[value=approve] {{ background: #0969da; color: white; border-color: #0969d
         if record.redirect_uri != redirect_uri {
             return Err(OAuthError::InvalidGrant(
                 "redirect_uri does not match the authorization request".into(),
+            ));
+        }
+        if let (Some(granted), Some(requested)) = (&record.resource, &requested_resource)
+            && granted != requested
+        {
+            return Err(OAuthError::InvalidTarget(
+                "resource does not match the authorization request".into(),
             ));
         }
         if record.used_at.is_some() {
@@ -759,6 +901,7 @@ button[value=approve] {{ background: #0969da; color: white; border-color: #0969d
     ) -> Result<TokenResponse, OAuthError> {
         let client = self.authenticate_client(authentication)?;
         let refresh_token = required(params.refresh_token.as_deref(), "refresh_token")?;
+        let _requested_resource = self.validate_resource(params.resource.as_deref())?;
         let refresh_hash = hash_secret(refresh_token);
         let record = self
             .store
@@ -1149,8 +1292,11 @@ mod tests {
         }
     }
 
-    fn service() -> OAuthService {
+    fn service_with_issuer(issuer: &str) -> OAuthService {
         let mut config = config();
+        config.issuer = Some(issuer.into());
+        let (issuer, issuer_origin, base_path) =
+            parse_issuer_parts(config.issuer.as_deref().unwrap()).unwrap();
         // Tests bypass environment loading so they do not mutate the process
         // environment and can run in parallel with other test binaries.
         let admin_secret = SecretString::from(crate::util::random_hex(16));
@@ -1169,7 +1315,9 @@ mod tests {
             })
             .collect();
         OAuthService {
-            issuer: config.issuer.clone().unwrap().trim_end_matches('/').into(),
+            issuer,
+            issuer_origin,
+            base_path,
             store: OAuthStore::new(Arc::new(Repository::open_in_memory().unwrap())),
             admin_secret,
             clients,
@@ -1177,6 +1325,10 @@ mod tests {
             refresh_token_ttl_secs: 86_400,
             authorization_code_ttl_secs: 300,
         }
+    }
+
+    fn service() -> OAuthService {
+        service_with_issuer("https://issuer.example.com")
     }
 
     fn verifier() -> String {
@@ -1217,6 +1369,150 @@ mod tests {
             resource["authorization_servers"][0],
             "https://issuer.example.com"
         );
+        assert_eq!(
+            service.protected_resource_metadata_url(),
+            "https://issuer.example.com/.well-known/oauth-protected-resource"
+        );
+    }
+
+    #[test]
+    fn path_bearing_issuer_derives_prefixed_paths_and_well_known_urls() {
+        let service = service_with_issuer("https://bridge.example/base/");
+        assert_eq!(service.issuer(), "https://bridge.example/base");
+        assert_eq!(service.base_path(), "/base");
+        assert_eq!(service.authorize_path(), "/base/oauth/authorize");
+        assert_eq!(
+            service.protected_resource_metadata_path(),
+            "/.well-known/oauth-protected-resource/base"
+        );
+        assert_eq!(
+            service.authorization_server_metadata_path(),
+            "/.well-known/oauth-authorization-server/base"
+        );
+        assert_eq!(
+            service.protected_resource_metadata_url(),
+            "https://bridge.example/.well-known/oauth-protected-resource/base"
+        );
+        let cookie = service.csrf_cookie("csrf-1");
+        assert!(cookie.contains("Path=/base/oauth/authorize"), "{cookie}");
+        let clear = service.clear_csrf_cookie();
+        assert!(clear.contains("Path=/base/oauth/authorize"), "{clear}");
+        let request = service
+            .validate_authorization(&auth_params(&challenge(&verifier())))
+            .unwrap();
+        let html = service.render_consent(&request, "csrf-1");
+        assert!(
+            html.contains("<form method=\"post\" action=\"/base/oauth/authorize\">"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn resource_target_must_match_issuer() {
+        let service = service_with_issuer("https://issuer.example.com/base");
+        let verifier = verifier();
+        let mut params = auth_params(&challenge(&verifier));
+        params.resource = Some("https://evil.example".into());
+        assert!(matches!(
+            service.validate_authorization(&params),
+            Err(OAuthError::InvalidTarget(_))
+        ));
+
+        params.resource = Some("https://issuer.example.com/other".into());
+        assert!(matches!(
+            service.validate_authorization(&params),
+            Err(OAuthError::InvalidTarget(_))
+        ));
+
+        params.resource = Some("https://issuer.example.com/base#frag".into());
+        assert!(matches!(
+            service.validate_authorization(&params),
+            Err(OAuthError::InvalidTarget(_))
+        ));
+
+        params.resource = Some("https://issuer.example.com/base".into());
+        let request = service.validate_authorization(&params).unwrap();
+        assert_eq!(
+            request.resource.as_deref(),
+            Some("https://issuer.example.com/base")
+        );
+        let code = service.issue_authorization_code(&request).unwrap();
+        let auth = ClientAuthentication {
+            form_client_id: Some("client-a".into()),
+            ..ClientAuthentication::default()
+        };
+
+        // Token exchange rejects a mismatched resource without consuming the code.
+        let bad_token = TokenParams {
+            grant_type: Some("authorization_code".into()),
+            code: Some(code.clone()),
+            redirect_uri: Some("https://client.example/callback".into()),
+            code_verifier: Some(verifier.clone()),
+            resource: Some("https://other.example".into()),
+            ..TokenParams::default()
+        };
+        assert!(matches!(
+            service.exchange_authorization_code(&bad_token, &auth),
+            Err(OAuthError::InvalidTarget(_))
+        ));
+
+        let good_token = TokenParams {
+            resource: Some("https://issuer.example.com/base/".into()),
+            ..bad_token
+        };
+        let issued = service
+            .exchange_authorization_code(&good_token, &auth)
+            .unwrap();
+
+        let bad_refresh = TokenParams {
+            grant_type: Some("refresh_token".into()),
+            refresh_token: Some(issued.refresh_token.clone()),
+            resource: Some("https://other.example".into()),
+            ..TokenParams::default()
+        };
+        assert!(matches!(
+            service.refresh_token(&bad_refresh, &auth),
+            Err(OAuthError::InvalidTarget(_))
+        ));
+
+        let good_refresh = TokenParams {
+            resource: Some("https://issuer.example.com/base".into()),
+            ..bad_refresh
+        };
+        assert!(service.refresh_token(&good_refresh, &auth).is_ok());
+    }
+
+    #[test]
+    fn basic_auth_decodes_rfc6749_form_encoded_components() {
+        let encoded_id = "client%3Aone+id%25";
+        let encoded_secret = "sec%3Aret+plus%2B%25%E2%9C%93";
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(format!("{encoded_id}:{encoded_secret}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {b64}").parse().unwrap(),
+        );
+        let parsed = ClientAuthentication::from_headers(&headers).unwrap();
+        assert_eq!(
+            parsed.basic,
+            Some(("client:one id%".into(), "sec:ret plus+%✓".into()))
+        );
+
+        for invalid in ["bad%ZZ:secret", "client:bad%", "client:%FF"] {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(invalid);
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Basic {b64}").parse().unwrap(),
+            );
+            assert!(
+                matches!(
+                    ClientAuthentication::from_headers(&headers),
+                    Err(OAuthError::InvalidClient)
+                ),
+                "invalid Basic component `{invalid}` must fail"
+            );
+        }
     }
 
     #[test]

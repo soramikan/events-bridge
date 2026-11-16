@@ -234,12 +234,12 @@ principal = "alice"
             .unwrap()
     }
 
-    async fn authorization_code(
+    async fn issue_authorization_code(
         &self,
         client_id: &str,
         redirect_uri: &str,
         scope: &str,
-    ) -> (String, String, Value) {
+    ) -> (String, String) {
         let verifier = pkce_verifier();
         let state = format!("state-{}", Uuid::new_v4());
         let response = self
@@ -305,6 +305,18 @@ principal = "alice"
         let location = Url::parse(location).unwrap();
         let code = query_value(&location, "code");
         assert_eq!(query_value(&location, "state"), state);
+        (verifier, code)
+    }
+
+    async fn authorization_code(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+        scope: &str,
+    ) -> (String, String, Value) {
+        let (verifier, code) = self
+            .issue_authorization_code(client_id, redirect_uri, scope)
+            .await;
 
         let form = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
@@ -1170,8 +1182,8 @@ async fn oauth_is_required_without_static_token_and_static_token_coexists() {
 #[tokio::test]
 async fn token_redirect_and_verifier_errors_are_invalid_grant() {
     let fixture = OAuthFixture::start().await;
-    let (verifier, code, _tokens) = fixture
-        .authorization_code("confidential", CONFIDENTIAL_REDIRECT, SCOPE_EVENTS_READ)
+    let (verifier, code) = fixture
+        .issue_authorization_code("confidential", CONFIDENTIAL_REDIRECT, SCOPE_EVENTS_READ)
         .await;
 
     let response = fixture
@@ -1190,6 +1202,13 @@ async fn token_redirect_and_verifier_errors_are_invalid_grant() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"], "invalid_grant");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("redirect_uri"),
+        "{body}"
+    );
 
     let wrong_verifier = pkce_verifier();
     let response = fixture
@@ -1208,6 +1227,32 @@ async fn token_redirect_and_verifier_errors_are_invalid_grant() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"], "invalid_grant");
+    assert_eq!(body["error_description"], "PKCE verification failed");
+
+    // Failed redirect_uri/PKCE attempts must not have consumed the code:
+    // presenting the genuine verifier still succeeds.
+    let response = fixture
+        .http
+        .post(format!("{}{TOKEN_PATH}", fixture.base_url))
+        .basic_auth("confidential", Some(&fixture.confidential_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("code_verifier", &verifier),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let tokens: Value = response.json().await.unwrap();
+    assert_eq!(
+        fixture
+            .consumer_probe(tokens["access_token"].as_str().unwrap())
+            .await
+            .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -1408,5 +1453,437 @@ redirect_uris = ["https://client.example/callback"]
     assert!(
         format!("{error:#}").contains(&missing),
         "startup error should name the variable: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn resource_target_is_enforced_across_authorize_token_and_refresh() {
+    let fixture = OAuthFixture::start().await;
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+
+    // Mismatched resource on GET /oauth/authorize fails with invalid_target.
+    let bad_authz = fixture
+        .http
+        .get(format!("{}{AUTHORIZE_PATH}", fixture.base_url))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", "confidential"),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("scope", SCOPE_EVENTS_READ),
+            ("state", "s1"),
+            ("resource", "https://other-service.example"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_authz.status(), StatusCode::BAD_REQUEST);
+    let body: Value = bad_authz.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_target");
+
+    // Matching resource succeeds through consent, token exchange, and refresh.
+    let good_authz = fixture
+        .http
+        .get(format!("{}{AUTHORIZE_PATH}", fixture.base_url))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", "confidential"),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("scope", SCOPE_EVENTS_READ),
+            ("state", "s2"),
+            ("resource", "https://bridge.example.com"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(good_authz.status(), StatusCode::OK);
+    let cookie = good_authz
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let html = good_authz.text().await.unwrap();
+    assert_eq!(
+        hidden_value(&html, "resource"),
+        "https://bridge.example.com"
+    );
+    let csrf = hidden_value(&html, CSRF_FIELD);
+
+    let approve = fixture
+        .http
+        .post(format!("{}{AUTHORIZE_PATH}", fixture.base_url))
+        .header(reqwest::header::COOKIE, &cookie)
+        .form(&[
+            ("response_type", "code"),
+            ("client_id", "confidential"),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("scope", SCOPE_EVENTS_READ),
+            ("state", "s2"),
+            ("resource", "https://bridge.example.com"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            (CSRF_FIELD, &csrf),
+            (ADMIN_SECRET_FIELD, &fixture.admin_secret),
+            (DECISION_FIELD, "approve"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::SEE_OTHER);
+    let code = query_value(
+        &Url::parse(
+            approve
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap(),
+        "code",
+    );
+
+    // Mismatched resource on /oauth/token is rejected without consuming the code.
+    let bad_token = fixture
+        .http
+        .post(format!("{}{TOKEN_PATH}", fixture.base_url))
+        .basic_auth("confidential", Some(&fixture.confidential_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("code_verifier", &verifier),
+            ("resource", "https://bridge.example.com/other"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_token.status(), StatusCode::BAD_REQUEST);
+    let body: Value = bad_token.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_target");
+
+    let good_token = fixture
+        .http
+        .post(format!("{}{TOKEN_PATH}", fixture.base_url))
+        .basic_auth("confidential", Some(&fixture.confidential_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("code_verifier", &verifier),
+            ("resource", "https://bridge.example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(good_token.status(), StatusCode::OK);
+    let tokens: Value = good_token.json().await.unwrap();
+    let refresh = tokens["refresh_token"].as_str().unwrap();
+
+    // Mismatched resource on refresh fails without burning the refresh token.
+    let bad_refresh = fixture
+        .http
+        .post(format!("{}{TOKEN_PATH}", fixture.base_url))
+        .basic_auth("confidential", Some(&fixture.confidential_secret))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("resource", "https://other-service.example"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_refresh.status(), StatusCode::BAD_REQUEST);
+    let body: Value = bad_refresh.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_target");
+
+    let good_refresh = fixture
+        .http
+        .post(format!("{}{TOKEN_PATH}", fixture.base_url))
+        .basic_auth("confidential", Some(&fixture.confidential_secret))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("resource", "https://bridge.example.com"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(good_refresh.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn basic_auth_form_decodes_rfc6749_special_character_credentials() {
+    let temp = TempDir::new().unwrap();
+    let admin_secret = Uuid::new_v4().to_string();
+    let special_id = "svc:client one";
+    let special_secret = format!("s:ec+ret %✓ {}", Uuid::new_v4().simple());
+    let (admin_var, admin_env) = EnvGuard::set("OAUTH_ADMIN", &admin_secret);
+    let (client_var, client_env) = EnvGuard::set("OAUTH_SPECIAL_CLIENT", &special_secret);
+    let env = admin_env.merge(client_env);
+    let config = Config::parse(&format!(
+        r#"
+[server]
+allowed_hosts = ["localhost", "127.0.0.1", "::1"]
+
+[oauth]
+enabled = true
+issuer = "https://bridge.example.com"
+admin_secret_env = "{admin_var}"
+
+[[oauth.clients]]
+client_id = "{special_id}"
+client_secret_env = "{client_var}"
+redirect_uris = ["{CONFIDENTIAL_REDIRECT}"]
+scopes = ["events.read"]
+principal = "special-svc"
+"#
+    ))
+    .unwrap();
+    let fixture =
+        OAuthFixture::start_with_config(temp, config, env, admin_secret, special_secret.clone())
+            .await;
+
+    let (verifier, code) = fixture
+        .issue_authorization_code(special_id, CONFIDENTIAL_REDIRECT, SCOPE_EVENTS_READ)
+        .await;
+
+    // Encode per RFC 6749 §2.3.1: application/x-www-form-urlencoded each component.
+    let form_id: String = url::form_urlencoded::byte_serialize(special_id.as_bytes()).collect();
+    let form_secret: String =
+        url::form_urlencoded::byte_serialize(special_secret.as_bytes()).collect();
+    let basic_value = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{form_id}:{form_secret}"))
+    );
+
+    let token_res = fixture
+        .http
+        .post(format!("{}{TOKEN_PATH}", fixture.base_url))
+        .header(reqwest::header::AUTHORIZATION, &basic_value)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("code_verifier", &verifier),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token_res.status(), StatusCode::OK);
+    let tokens: Value = token_res.json().await.unwrap();
+    let access = tokens["access_token"].as_str().unwrap();
+    assert_eq!(
+        fixture.consumer_probe(access).await.status(),
+        StatusCode::OK
+    );
+
+    let revoke_res = fixture
+        .http
+        .post(format!("{}/oauth/revoke", fixture.base_url))
+        .header(reqwest::header::AUTHORIZATION, &basic_value)
+        .form(&[("token", access)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke_res.status(), StatusCode::OK);
+    assert_eq!(
+        fixture.consumer_probe(access).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn path_bearing_issuer_flow_and_prefixed_well_known_work_end_to_end() {
+    let temp = TempDir::new().unwrap();
+    let admin_secret = Uuid::new_v4().to_string();
+    let confidential_secret = Uuid::new_v4().to_string();
+    let (admin_var, admin_env) = EnvGuard::set("OAUTH_ADMIN", &admin_secret);
+    let (client_var, client_env) = EnvGuard::set("OAUTH_CLIENT", &confidential_secret);
+    let env = admin_env.merge(client_env);
+    let config = Config::parse(&format!(
+        r#"
+[server]
+allowed_hosts = ["localhost", "127.0.0.1", "::1"]
+
+[oauth]
+enabled = true
+issuer = "https://bridge.example.com/base"
+admin_secret_env = "{admin_var}"
+
+[[oauth.clients]]
+client_id = "confidential"
+client_secret_env = "{client_var}"
+redirect_uris = ["{CONFIDENTIAL_REDIRECT}"]
+scopes = ["events.read"]
+principal = "alice"
+"#
+    ))
+    .unwrap();
+    let fixture =
+        OAuthFixture::start_with_config(temp, config, env, admin_secret, confidential_secret).await;
+
+    // 401 advertises RFC 9728 path-suffixed protected-resource metadata URL.
+    let unauth = fixture
+        .http
+        .get(format!("{}/consumers/muse/probe", fixture.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauth
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some(
+            "Bearer resource_metadata=\"https://bridge.example.com/.well-known/oauth-protected-resource/base\""
+        )
+    );
+
+    // Path-suffixed well-known endpoints are served.
+    let prm: Value = fixture
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-protected-resource/base",
+            fixture.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prm["resource"], "https://bridge.example.com/base");
+
+    let asm: Value = fixture
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-authorization-server/base",
+            fixture.base_url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        asm["authorization_endpoint"],
+        "https://bridge.example.com/base/oauth/authorize"
+    );
+
+    // Prefixed authorize GET renders prefixed form action and cookie Path=/base/oauth/authorize.
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    let authz_get = fixture
+        .http
+        .get(format!("{}/base/oauth/authorize", fixture.base_url))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", "confidential"),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("scope", SCOPE_EVENTS_READ),
+            ("state", "prefixed"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authz_get.status(), StatusCode::OK);
+    let set_cookie = authz_get
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        set_cookie.contains("Path=/base/oauth/authorize"),
+        "{set_cookie}"
+    );
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    let html = authz_get.text().await.unwrap();
+    assert!(
+        html.contains("<form method=\"post\" action=\"/base/oauth/authorize\">"),
+        "{html}"
+    );
+    let csrf = hidden_value(&html, CSRF_FIELD);
+
+    // POST to /base/oauth/authorize succeeds and clears the cookie with Path=/base/oauth/authorize.
+    let authz_post = fixture
+        .http
+        .post(format!("{}/base/oauth/authorize", fixture.base_url))
+        .header(reqwest::header::COOKIE, &cookie)
+        .form(&[
+            ("response_type", "code"),
+            ("client_id", "confidential"),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("scope", SCOPE_EVENTS_READ),
+            ("state", "prefixed"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            (CSRF_FIELD, &csrf),
+            (ADMIN_SECRET_FIELD, &fixture.admin_secret),
+            (DECISION_FIELD, "approve"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authz_post.status(), StatusCode::SEE_OTHER);
+    let clear_cookie = authz_post
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        clear_cookie.contains("Path=/base/oauth/authorize; Max-Age=0"),
+        "{clear_cookie}"
+    );
+    let code = query_value(
+        &Url::parse(
+            authz_post
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap(),
+        "code",
+    );
+
+    // Prefixed /base/oauth/token issues a usable bearer token.
+    let token_res = fixture
+        .http
+        .post(format!("{}/base/oauth/token", fixture.base_url))
+        .basic_auth("confidential", Some(&fixture.confidential_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", CONFIDENTIAL_REDIRECT),
+            ("code_verifier", &verifier),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token_res.status(), StatusCode::OK);
+    let tokens: Value = token_res.json().await.unwrap();
+    assert_eq!(
+        fixture
+            .consumer_probe(tokens["access_token"].as_str().unwrap())
+            .await
+            .status(),
+        StatusCode::OK
     );
 }

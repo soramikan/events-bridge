@@ -88,9 +88,20 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
         )
     };
 
+    let oauth_routes = app.oauth.as_deref().map(|oauth| {
+        (
+            oauth.base_path().to_string(),
+            oauth.authorization_server_metadata_path(),
+            oauth.protected_resource_metadata_path(),
+            oauth.authorize_path(),
+            oauth.token_path(),
+            oauth.revoke_path(),
+        )
+    });
+
     let state = Arc::new(McpHttpState { app, service });
 
-    Router::new()
+    let mut router = Router::new()
         .route("/mcp", any(mcp_entry))
         .route("/healthz", get(healthz))
         .route(
@@ -106,7 +117,36 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
             get(oauth_authorize_get).post(oauth_authorize_post),
         )
         .route("/oauth/token", post(oauth_token))
-        .route("/oauth/revoke", post(oauth_revoke))
+        .route("/oauth/revoke", post(oauth_revoke));
+
+    if let Some((
+        base_path,
+        auth_server_meta_path,
+        protected_resource_meta_path,
+        authorize_path,
+        token_path,
+        revoke_path,
+    )) = oauth_routes
+        && !base_path.is_empty()
+    {
+        router = router
+            .route(
+                &auth_server_meta_path,
+                get(oauth_authorization_server_metadata),
+            )
+            .route(
+                &protected_resource_meta_path,
+                get(oauth_protected_resource_metadata),
+            )
+            .route(
+                &authorize_path,
+                get(oauth_authorize_get).post(oauth_authorize_post),
+            )
+            .route(&token_path, post(oauth_token))
+            .route(&revoke_path, post(oauth_revoke));
+    }
+
+    router
         .route("/internal/events", post(internal_ingest))
         .route("/internal/edge/t3", post(edge_ingest))
         .route("/webhooks/github", post(github_webhook_entry))
@@ -483,17 +523,14 @@ fn authorization_security_headers(mut response: Response) -> Response {
     response
 }
 
-fn clear_csrf_cookie(mut response: Response) -> Response {
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static(
-            "oauth_csrf=; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age=0",
-        ),
-    );
+fn clear_csrf_cookie(oauth: &OAuthService, mut response: Response) -> Response {
+    if let Ok(value) = HeaderValue::from_str(&oauth.clear_csrf_cookie()) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
     response
 }
 
-fn authorization_redirect(url: &Url) -> Response {
+fn authorization_redirect(oauth: &OAuthService, url: &Url) -> Response {
     let mut response = StatusCode::SEE_OTHER.into_response();
     match HeaderValue::from_str(url.as_str()) {
         Ok(value) => {
@@ -501,7 +538,7 @@ fn authorization_redirect(url: &Url) -> Response {
             response
                 .headers_mut()
                 .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-            authorization_security_headers(clear_csrf_cookie(response))
+            authorization_security_headers(clear_csrf_cookie(oauth, response))
         }
         Err(_) => oauth_error_response(OAuthError::Server(anyhow::anyhow!(
             "could not encode redirect URI"
@@ -606,9 +643,9 @@ async fn oauth_authorize_post(
         )));
     }
     match params.decision.as_deref() {
-        Some("deny") => authorization_redirect(&oauth.deny_redirect(&authorized)),
+        Some("deny") => authorization_redirect(oauth, &oauth.deny_redirect(&authorized)),
         Some("approve") => match oauth.approve_redirect(&authorized) {
-            Ok(url) => authorization_redirect(&url),
+            Ok(url) => authorization_redirect(oauth, &url),
             Err(error) => authorization_security_headers(oauth_error_response(error)),
         },
         _ => authorization_security_headers(oauth_error_response(OAuthError::InvalidRequest(

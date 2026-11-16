@@ -22,6 +22,7 @@ pub struct AuthorizationCodeRecord {
     pub redirect_uri: String,
     pub scopes: Vec<String>,
     pub code_challenge: String,
+    pub resource: Option<String>,
     pub family_id: String,
     pub created_at: String,
     pub expires_at: String,
@@ -165,7 +166,7 @@ impl OAuthStore {
         let conn = self.repo.lock_connection();
         conn.query_row(
             "SELECT code_hash, client_id, principal, redirect_uri, scopes, code_challenge, \
-                    family_id, created_at, expires_at, used_at \
+                    resource, family_id, created_at, expires_at, used_at \
              FROM oauth_authorization_codes WHERE code_hash = ?1",
             params![code_hash],
             |row| {
@@ -176,10 +177,11 @@ impl OAuthStore {
                     redirect_uri: row.get(3)?,
                     scopes: decode_scopes(row.get::<_, String>(4)?),
                     code_challenge: row.get(5)?,
-                    family_id: row.get(6)?,
-                    created_at: row.get(7)?,
-                    expires_at: row.get(8)?,
-                    used_at: row.get(9)?,
+                    resource: row.get(6)?,
+                    family_id: row.get(7)?,
+                    created_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                    used_at: row.get(10)?,
                 })
             },
         )

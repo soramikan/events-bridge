@@ -673,6 +673,9 @@ impl Config {
             if !url.username().is_empty() || url.password().is_some() {
                 bail!("oauth.issuer must not contain userinfo");
             }
+            if url.scheme() == "http" && !is_loopback_oauth_host(&url) {
+                bail!("oauth.issuer must use https for non-loopback hosts");
+            }
         }
         let mut seen_client_ids: BTreeMap<&str, ()> = BTreeMap::new();
         for client in &oauth.clients {
@@ -727,6 +730,11 @@ impl Config {
                 }
                 if !url.username().is_empty() || url.password().is_some() {
                     bail!("oauth redirect_uri `{redirect_uri}` must not contain userinfo");
+                }
+                if url.scheme() == "http" && !is_loopback_oauth_host(&url) {
+                    bail!(
+                        "oauth redirect_uri `{redirect_uri}` must use https for non-loopback hosts"
+                    );
                 }
             }
             let mut seen_scopes: BTreeMap<&str, ()> = BTreeMap::new();
@@ -1026,6 +1034,15 @@ fn validate_github_repository(repository: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_loopback_oauth_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1563,6 +1580,8 @@ mod tests {
                       redirect_uris = [\"https://client.example/callback\"]\n";
         for issuer in [
             "ftp://bridge.example.com",
+            "http://bridge.example.com",
+            "http://192.0.2.10:8787",
             "https://bridge.example.com?x=1",
             "https://bridge.example.com#fragment",
             "https://user:pass@bridge.example.com",
@@ -1574,18 +1593,22 @@ mod tests {
                 "issuer `{issuer}` must be rejected"
             );
         }
-        let ok = Config::parse(&format!(
-            "{prefix}issuer = \"https://bridge.example.com/base\"\n{client}"
-        ))
-        .expect("path-bearing issuer is accepted");
-        assert_eq!(
-            ok.oauth.issuer.as_deref(),
-            Some("https://bridge.example.com/base")
-        );
+        for issuer in [
+            "https://bridge.example.com/base",
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+        ] {
+            let ok = Config::parse(&format!("{prefix}issuer = \"{issuer}\"\n{client}"))
+                .unwrap_or_else(|err| panic!("issuer `{issuer}` must be accepted: {err}"));
+            assert_eq!(ok.oauth.issuer.as_deref(), Some(issuer));
+        }
 
         for redirect in [
             "client/callback",
             "javascript:alert(1)",
+            "http://client.example/callback",
+            "http://198.51.100.2/callback",
             "https://client.example/callback#fragment",
             "https://user:pass@client.example/callback",
         ] {
@@ -1602,6 +1625,24 @@ mod tests {
                 Config::parse(&contents).is_err(),
                 "redirect `{redirect}` must be rejected"
             );
+        }
+
+        for redirect in [
+            "http://localhost:9999/callback",
+            "http://127.0.0.1:9999/callback",
+            "http://[::1]:9999/callback",
+        ] {
+            let contents = format!(
+                "[oauth]\n\
+                 enabled = true\n\
+                 issuer = \"https://bridge.example.com\"\n\
+                 admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n\
+                 [[oauth.clients]]\n\
+                 client_id = \"client\"\n\
+                 redirect_uris = [\"{redirect}\"]\n"
+            );
+            Config::parse(&contents)
+                .unwrap_or_else(|err| panic!("loopback redirect `{redirect}` must pass: {err}"));
         }
     }
 
