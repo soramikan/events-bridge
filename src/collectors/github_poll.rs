@@ -32,7 +32,7 @@ use crate::{
     collectors::github_state::{
         bounded_display, bounded_url, is_failure_conclusion, parse_actions_run_ref,
         pr_merged_event, review_requested_event, reviewer_key, reviewer_name, valid_identifier,
-        workflow_failed_event,
+        workflow_failed_event_with_excerpt_max_chars,
     },
     config::Config,
     event::EventBus,
@@ -119,6 +119,7 @@ pub struct GitHubPollSummary {
 /// Periodic GitHub REST reconciler.
 pub struct GitHubPoller {
     settings: GitHubPollerSettings,
+    error_excerpt_max_chars: usize,
     repo: std::sync::Arc<Repository>,
     bus: EventBus,
     client: Client,
@@ -161,11 +162,18 @@ impl GitHubPoller {
             .context("building GitHub API client")?;
         Ok(Self {
             settings,
+            error_excerpt_max_chars: super::github_state::DEFAULT_ERROR_EXCERPT_MAX_CHARS,
             repo,
             bus,
             client,
             run_poll_sequences: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Override the maximum characters kept in `error_excerpt` payloads.
+    pub fn with_error_excerpt_max_chars(mut self, max_chars: usize) -> Self {
+        self.error_excerpt_max_chars = max_chars.max(1);
+        self
     }
 
     fn next_run_poll_sequence(&self, repository: &str) -> u64 {
@@ -186,7 +194,9 @@ impl GitHubPoller {
         repo: std::sync::Arc<Repository>,
         bus: EventBus,
     ) -> Result<Self> {
-        Self::new(GitHubPollerSettings::from_config(config, token)?, repo, bus)
+        Self::new(GitHubPollerSettings::from_config(config, token)?, repo, bus).map(|poller| {
+            poller.with_error_excerpt_max_chars(config.payload.error_excerpt_max_chars)
+        })
     }
 
     /// Reconcile every configured repository once.
@@ -777,16 +787,19 @@ impl GitHubPoller {
                                 delete_fallback_ci_runs(tx, repository, check_suite_id, attempt)?;
                             }
                         } else {
-                            changes.events.push(workflow_failed_event(
-                                repository,
-                                &workflow_name,
-                                &canonical_run_id,
-                                attempt,
-                                dto.conclusion.as_deref().unwrap_or("failure"),
-                                head_branch.as_deref(),
-                                &url,
-                                &updated_at,
-                            ));
+                            changes
+                                .events
+                                .push(workflow_failed_event_with_excerpt_max_chars(
+                                    repository,
+                                    &workflow_name,
+                                    &canonical_run_id,
+                                    attempt,
+                                    dto.conclusion.as_deref().unwrap_or("failure"),
+                                    head_branch.as_deref(),
+                                    &url,
+                                    &updated_at,
+                                    self.error_excerpt_max_chars,
+                                ));
                         }
                     }
                     if !stale {

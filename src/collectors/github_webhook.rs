@@ -43,6 +43,7 @@ const HANDLED_EVENTS: &[&str] = &[
 /// Handle one GitHub webhook request.
 pub async fn handle(app: Arc<AppState>, request: Request) -> Response {
     let config = &app.config.collectors.github;
+    let error_excerpt_max_chars = app.config.payload.error_excerpt_max_chars;
     if !config.webhook_enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -118,7 +119,14 @@ pub async fn handle(app: Arc<AppState>, request: Request) -> Response {
             if ignored || !handled {
                 return Ok(Default::default());
             }
-            github_state::normalize_webhook(tx, event_type, &payload, delivery_id, &now_rfc3339())
+            github_state::normalize_webhook_with_excerpt_max_chars(
+                tx,
+                event_type,
+                &payload,
+                delivery_id,
+                &now_rfc3339(),
+                error_excerpt_max_chars,
+            )
         },
     );
 

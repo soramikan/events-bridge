@@ -55,6 +55,7 @@ pub struct Edge {
     poll_interval: Duration,
     watch_wal: bool,
     batch_size: usize,
+    error_excerpt_max_chars: usize,
     max_snapshot_chunk_bytes: usize,
     web_base_url: Option<Url>,
     state_db_path: PathBuf,
@@ -123,6 +124,7 @@ impl Edge {
             poll_interval: settings.poll_interval,
             watch_wal: settings.watch_wal,
             batch_size: settings.batch_size,
+            error_excerpt_max_chars: settings.error_excerpt_max_chars,
             max_snapshot_chunk_bytes: config.edge.max_snapshot_chunk_bytes,
             web_base_url: settings.web_base_url,
             state_db_path: settings.state_db_path,
@@ -505,7 +507,8 @@ impl Edge {
                 &self.repo,
                 source,
                 self.web_base_url.as_ref(),
-            );
+            )
+            .with_error_excerpt_max_chars(self.error_excerpt_max_chars);
             reducer.reduce(event)
         })
     }

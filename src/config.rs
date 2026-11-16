@@ -43,6 +43,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Upstream collectors.
     pub collectors: CollectorsConfig,
+    /// Derived event payload shaping.
+    pub payload: PayloadConfig,
     /// Edge forwarding settings (only required by the `edge` subcommand).
     pub edge: EdgeConfig,
     /// Named server-side polling consumer profiles.
@@ -51,6 +53,25 @@ pub struct Config {
     /// built-in `muse` profile is resolved even when this map is empty.
     #[serde(default)]
     pub consumers: BTreeMap<String, ConsumerProfileConfig>,
+}
+
+/// Derived event payload settings.
+///
+/// These bounds apply to convenience fields such as `error_excerpt`; they never
+/// change the required payload fields, so existing subscribers keep working.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PayloadConfig {
+    /// Maximum number of characters kept in `error_excerpt`.
+    pub error_excerpt_max_chars: usize,
+}
+
+impl Default for PayloadConfig {
+    fn default() -> Self {
+        Self {
+            error_excerpt_max_chars: 500,
+        }
+    }
 }
 
 /// HTTP listener settings.
@@ -621,6 +642,9 @@ impl Config {
         if self.delivery.lease_secs == 0 {
             bail!("delivery.lease_secs must be greater than zero");
         }
+        if self.payload.error_excerpt_max_chars == 0 {
+            bail!("payload.error_excerpt_max_chars must be greater than zero");
+        }
         if self.subscriptions.min_ttl_secs > self.subscriptions.max_ttl_secs {
             bail!(
                 "subscriptions.min_ttl_secs must not exceed subscriptions.max_ttl_secs, got {} > {}",
@@ -1056,6 +1080,21 @@ mod tests {
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.subscriptions.max_ttl_secs, 86_400);
         assert_eq!(config.delivery.max_body_bytes, MAX_WEBHOOK_BODY_BYTES);
+        assert_eq!(config.payload.error_excerpt_max_chars, 500);
+    }
+
+    #[test]
+    fn payload_error_excerpt_bound_parses_and_is_validated() {
+        let config = Config::parse("[payload]\nerror_excerpt_max_chars = 120\n")
+            .expect("payload config parses");
+        assert_eq!(config.payload.error_excerpt_max_chars, 120);
+
+        let error = Config::parse("[payload]\nerror_excerpt_max_chars = 0\n")
+            .expect_err("zero excerpt bound must fail");
+        assert!(
+            error.to_string().contains("error_excerpt_max_chars"),
+            "{error}"
+        );
     }
 
     #[test]

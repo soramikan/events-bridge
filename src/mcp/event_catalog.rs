@@ -84,7 +84,12 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                     "thread_id": {"type": "string"},
                     "run_id": {"type": "string"},
                     "summary": {"type": "string"},
-                    "url": {"type": "string"}
+                    "url": {"type": "string"},
+                    "title": {"type": "string"},
+                    "project_name": {"type": "string"},
+                    "thread_title": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "normal"]},
+                    "requires_action": {"type": "boolean"}
                 },
                 "required": [
                     "environment_id", "project_id", "thread_id", "run_id", "summary"
@@ -106,7 +111,13 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                     "run_id": {"type": "string"},
                     "summary": {"type": "string"},
                     "error": {"type": "string"},
-                    "url": {"type": "string"}
+                    "url": {"type": "string"},
+                    "title": {"type": "string"},
+                    "project_name": {"type": "string"},
+                    "thread_title": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "normal"]},
+                    "requires_action": {"type": "boolean"},
+                    "error_excerpt": {"type": "string"}
                 },
                 "required": [
                     "environment_id", "project_id", "thread_id", "run_id",
@@ -129,7 +140,12 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                     "run_id": {"type": "string"},
                     "approval_id": {"type": "string"},
                     "summary": {"type": "string"},
-                    "url": {"type": "string"}
+                    "url": {"type": "string"},
+                    "title": {"type": "string"},
+                    "project_name": {"type": "string"},
+                    "thread_title": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "normal"]},
+                    "requires_action": {"type": "boolean"}
                 },
                 "required": [
                     "environment_id", "project_id", "thread_id", "run_id",
@@ -161,7 +177,11 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                     "conclusion": {"type": "string"},
                     "branch": {"type": "string"},
                     "summary": {"type": "string"},
-                    "url": {"type": "string"}
+                    "url": {"type": "string"},
+                    "title": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "normal"]},
+                    "requires_action": {"type": "boolean"},
+                    "error_excerpt": {"type": "string"}
                 },
                 "required": ["repository", "workflow", "run_id", "conclusion", "url"],
                 "additionalProperties": false
@@ -189,7 +209,9 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                     "author": {"type": "string"},
                     "reviewer": {"type": "string"},
                     "summary": {"type": "string"},
-                    "url": {"type": "string"}
+                    "url": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "normal"]},
+                    "requires_action": {"type": "boolean"}
                 },
                 "required": ["repository", "pull_number", "title", "url"],
                 "additionalProperties": false
@@ -218,7 +240,9 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                     "merged_by": {"type": "string"},
                     "base_branch": {"type": "string"},
                     "summary": {"type": "string"},
-                    "url": {"type": "string"}
+                    "url": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "normal"]},
+                    "requires_action": {"type": "boolean"}
                 },
                 "required": ["repository", "pull_number", "title", "url"],
                 "additionalProperties": false
@@ -289,6 +313,16 @@ fn validate_object(schema: &Value, value: &Value) -> Result<(), Vec<String>> {
                 && !matches_json_type(property_value, expected)
             {
                 errors.push(format!("property `{key}` must be of type `{expected}`"));
+            }
+            if let Some(allowed) = property_schema.get("enum").and_then(Value::as_array)
+                && !allowed.contains(property_value)
+            {
+                let allowed = allowed
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                errors.push(format!("property `{key}` must be one of {allowed}"));
             }
         }
     }
@@ -376,5 +410,72 @@ mod tests {
         );
         assert!(validate_payload("t3.run.completed", &json!({"environment_id": "x"})).is_err());
         assert!(validate_payload("unknown.event", &json!({})).is_err());
+    }
+
+    #[test]
+    fn optional_enrichment_fields_are_advertised_but_never_required() {
+        let completed = get("t3.run.completed").unwrap();
+        let failed = get("t3.run.failed").unwrap();
+        let approval = get("t3.approval.required").unwrap();
+        let workflow = get("github.workflow.failed").unwrap();
+        let review = get("github.review.requested").unwrap();
+        let merged = get("github.pr.merged").unwrap();
+
+        for event in [completed, failed, approval, workflow, review, merged] {
+            let properties = event.payload_schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("severity"), "{}", event.name);
+            assert!(properties.contains_key("requires_action"), "{}", event.name);
+            let required = event.payload_schema["required"].as_array().unwrap();
+            for optional in ["severity", "requires_action"] {
+                assert!(
+                    !required
+                        .iter()
+                        .any(|value| value.as_str() == Some(optional)),
+                    "{} must not require {optional}",
+                    event.name
+                );
+            }
+            if !matches!(event.name, "github.review.requested" | "github.pr.merged") {
+                assert!(
+                    !required.iter().any(|value| value.as_str() == Some("title")),
+                    "{} must not require title",
+                    event.name
+                );
+            }
+            assert!(
+                !required
+                    .iter()
+                    .any(|value| value.as_str() == Some("error_excerpt")),
+                "{} must not require error_excerpt",
+                event.name
+            );
+        }
+        let completed_properties = completed.payload_schema["properties"].as_object().unwrap();
+        assert!(completed_properties.contains_key("title"));
+        assert!(completed_properties.contains_key("project_name"));
+        assert!(completed_properties.contains_key("thread_title"));
+        let failed_properties = failed.payload_schema["properties"].as_object().unwrap();
+        assert!(failed_properties.contains_key("error_excerpt"));
+        let workflow_properties = workflow.payload_schema["properties"].as_object().unwrap();
+        assert!(workflow_properties.contains_key("title"));
+        assert!(workflow_properties.contains_key("error_excerpt"));
+    }
+
+    #[test]
+    fn severity_enum_values_are_enforced_when_present() {
+        let payload = json!({
+            "environment_id": "linux-main",
+            "project_id": "lnako",
+            "thread_id": "thread-42",
+            "run_id": "run-102",
+            "summary": "done",
+            "severity": "urgent"
+        });
+        let error = validate_payload("t3.run.completed", &payload).unwrap_err();
+        assert!(error.contains("severity"), "{error}");
+
+        let mut accepted = payload;
+        accepted["severity"] = json!("high");
+        assert!(validate_payload("t3.run.completed", &accepted).is_ok());
     }
 }

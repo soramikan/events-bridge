@@ -550,6 +550,23 @@ async fn workflow_run_then_check_run_emits_once() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(event_kinds(hub.repo()), vec!["github.workflow.failed"]);
+    let failure = &events(hub.repo())[0].payload;
+    assert_eq!(failure["severity"], "high");
+    assert_eq!(failure["requires_action"], true);
+    assert!(
+        failure["title"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("[{REPO}] CI failed:")),
+        "{failure}"
+    );
+    assert!(
+        failure["error_excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("failure"),
+        "{failure}"
+    );
 
     // A job URL without `/attempts/<n>` cannot be correlated safely. It is
     // parked and emits nothing, even though the canonical run already exists.
@@ -957,6 +974,10 @@ async fn pull_request_review_request_merge_and_review_state() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(event_kinds(hub.repo()), vec!["github.review.requested"]);
+    let review = &events(hub.repo())[0].payload;
+    assert_eq!(review["severity"], "normal");
+    assert_eq!(review["requires_action"], true);
+    assert!(review["title"].as_str().is_some());
     let pull = hub
         .repo()
         .get_github_pull_request(REPO, 10)
@@ -1051,6 +1072,13 @@ async fn pull_request_review_request_merge_and_review_state() {
         event_kinds(hub.repo()),
         vec!["github.review.requested", "github.pr.merged"]
     );
+    let merged_event = events(hub.repo())
+        .into_iter()
+        .find(|event| event.kind == "github.pr.merged")
+        .expect("merged event");
+    assert_eq!(merged_event.payload["severity"], "normal");
+    assert_eq!(merged_event.payload["requires_action"], false);
+    assert!(merged_event.payload["title"].as_str().is_some());
     let merged = hub
         .repo()
         .get_github_pull_request(REPO, 11)

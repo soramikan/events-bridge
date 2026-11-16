@@ -90,6 +90,14 @@ poll_interval_ms = 5000
 [logging]
 level = "info,events_bridge=debug"
 
+# Derived event payload shaping (Phase B6).
+#
+# Collectors add optional convenience fields (`title`, `project_name`,
+# `thread_title`, `severity`, `requires_action`, `error_excerpt`) without
+# making them required, so payloads that omit them remain valid.
+# [payload]
+# Maximum characters kept in `error_excerpt` (must be > 0).
+# error_excerpt_max_chars = 500
 # Polling consumers (Phase A).
 #
 # Consumers are server-side cursors resolved by name. `poll` never advances a

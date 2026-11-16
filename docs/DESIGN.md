@@ -351,6 +351,34 @@ Webhook のイベント本文には、dots が判断するのに必要な短い�
 
 `ack_events` は MCP Events の配信確認ではない。ChatGPT が受信済みであることと、ユーザーが確認したことは区別する。初期バージョンは読み取り専用ツールだけでも成立する。
 
+### 6.1 Phase B6: ペイロードの任意拡張フィールド
+
+Webhook の `data` には、既存の必須フィールドを変えずに次の任意フィールドを追加する。すべて省略可能であり、`additionalProperties: false` と既存の必須項目は維持するため、旧形式のペイロードはそのまま検証・配信できる。
+
+| フィールド | 型 | 意味 |
+| --- | --- | --- |
+| `title` | string | 通知一覧向けの 1 行タイトル。改行・制御空白は 1 スペースへ畳み、200 文字程度で打ち切る。 |
+| `project_name` | string | T3 Code のプロジェクト表示名。解決できた場合のみ付与する。 |
+| `thread_title` | string | T3 Code のスレッド表示名。解決できた場合のみ付与する。 |
+| `severity` | `"high"` / `"normal"` | イベント自体の重要度。購読フィルターの `severity` と同じ語彙。 |
+| `requires_action` | boolean | ユーザーまたはエージェントの対応が必要かどうか。 |
+| `error_excerpt` | string | 失敗理由の 1 行抜粋。改行を畳み、`payload.error_excerpt_max_chars` 文字以内に収める。 |
+
+`requires_action` の意味は「このイベントを受け取ったエージェントが、通知だけでなく確認・承認・修正などの操作を検討すべきか」である。`t3.run.completed` と `github.pr.merged` は `false`、`t3.run.failed`・`t3.approval.required`・`github.workflow.failed`・`github.review.requested` は `true` とする。
+
+`severity` は `high` / `normal` の列挙値のみを受け付ける。スキーマに `enum` がある場合、`validate_payload` は文字列型の一致だけでなく列挙値も検証する。
+
+`error_excerpt` の長さは `[payload]` セクションの `error_excerpt_max_chars`（既定 500、0 は起動時に拒否）で制御する。T3 Collector は `T3Reducer::with_error_excerpt_max_chars`、GitHub Collector は webhook / poller の設定配線を通じて同じ上限を使う。抜粋は UTF-8 境界を壊さず、切り詰め時は上限に収まる範囲で `...` を付ける。
+
+### 6.2 Phase B7: `list_events` の差分取得
+
+`list_events` は `after`（integer、0 以上）を受け付ける。`after` はイベントの `sequence` に対する厳密な下限（`sequence > after`）であり、`limit` と組み合わせることで「前回の続きから N 件だけ取得」する差分取得ができる。
+
+- 既存の `cursor` は `nextCursor`（`seq_<n>`）をそのまま渡す方式として維持する。
+- `after` と `cursor` を同時に指定した場合はエラーにする（どちらか一方のみ）。
+- `since` / `until` / `source` / `kind` / `severity` / `limit` / `cursor` の既存動作は変更しない。
+- 差分取得の典型例: 初回に `{"limit": 50}` を呼び、`nextCursor` があれば次回 `{"after": <最後の sequence>, "limit": 50}` を呼ぶ。`after` は `cursor` と違い、クライアントが保存した数値シーケンスから直接再開できる。
+
 ## 7. 認証と接続経路
 
 ### 推奨：Secure MCP Tunnel

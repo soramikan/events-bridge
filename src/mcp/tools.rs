@@ -58,6 +58,7 @@ pub fn definitions() -> Vec<Tool> {
                         "kind": {"type": "string", "description": "Exact event name, e.g. t3.run.failed."},
                         "severity": {"type": "string", "enum": ["high", "normal"]},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                        "after": {"type": "integer", "minimum": 0, "description": "Return events with sequence strictly greater than this value."},
                         "cursor": {"type": "string", "description": "Opaque cursor from a previous response."}
                     },
                     "additionalProperties": false
@@ -287,9 +288,18 @@ impl ToolService {
             Some(other) => return Err(format!("unknown severity `{other}`")),
         };
 
-        let after_sequence = match args.cursor.as_deref() {
-            None => None,
-            Some(cursor) => Some(parse_cursor(cursor)?),
+        let after_sequence = match (args.after, args.cursor.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err("specify either `after` or `cursor`, not both".into());
+            }
+            (Some(after), None) => {
+                if after < 0 {
+                    return Err(format!("`after` must be at least 0, got {after}"));
+                }
+                Some(after)
+            }
+            (None, Some(cursor)) => Some(parse_cursor(cursor)?),
+            (None, None) => None,
         };
 
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -517,6 +527,8 @@ struct ListEventsArgs {
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
+    after: Option<i64>,
+    #[serde(default)]
     cursor: Option<String>,
 }
 
@@ -665,5 +677,138 @@ mod tests {
         };
         let value = fetched.into_typed::<Value>().unwrap();
         assert_eq!(value["event"]["id"], "evt_tool");
+    }
+
+    async fn call_list(service: &ToolService, arguments: Value) -> CallToolResponse {
+        service
+            .call(
+                "local",
+                CallToolRequestParams::new("list_events")
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn tool_text(response: &CallToolResponse) -> String {
+        let CallToolResponse::Complete(result) = response else {
+            panic!("expected a complete tool response");
+        };
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn seeded_service() -> ToolService {
+        let repo = Arc::new(Repository::open_in_memory().unwrap());
+        repo.ingest_event(crate::store::NewEvent {
+            id: Some("evt_failed".into()),
+            source: None,
+            kind: "t3.run.failed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": "run-1",
+                "summary": "failed",
+                "error": "boom"
+            }),
+            occurred_at: Some("2026-11-16T01:00:00Z".into()),
+        })
+        .unwrap();
+        repo.ingest_event(crate::store::NewEvent {
+            id: Some("evt_merged".into()),
+            source: None,
+            kind: "github.pr.merged".into(),
+            payload: json!({
+                "repository": "o/r",
+                "pull_number": 7,
+                "title": "Fix parser",
+                "url": "https://github.com/o/r/pull/7"
+            }),
+            occurred_at: Some("2026-11-16T01:00:01Z".into()),
+        })
+        .unwrap();
+        repo.ingest_event(crate::store::NewEvent {
+            id: Some("evt_completed".into()),
+            source: None,
+            kind: "t3.run.completed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": "run-2",
+                "summary": "done"
+            }),
+            occurred_at: Some("2026-11-16T01:00:02Z".into()),
+        })
+        .unwrap();
+        ToolService::new(repo)
+    }
+
+    #[tokio::test]
+    async fn after_fetches_differentially_and_combines_with_filters() {
+        let service = seeded_service();
+
+        let page = call_list(&service, json!({"after": 1, "limit": 1})).await;
+        let CallToolResponse::Complete(result) = page else {
+            panic!("expected a complete tool response");
+        };
+        assert_eq!(result.is_error, Some(false));
+        let value = result.into_typed::<Value>().unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["sequence"], 2);
+        assert_eq!(value["nextCursor"], "seq_2");
+
+        let by_source = call_list(&service, json!({"after": 1, "source": "github"})).await;
+        let CallToolResponse::Complete(by_source) = by_source else {
+            panic!("expected a complete tool response");
+        };
+        let value = by_source.into_typed::<Value>().unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], "evt_merged");
+
+        let by_severity = call_list(&service, json!({"after": 1, "severity": "normal"})).await;
+        let CallToolResponse::Complete(by_severity) = by_severity else {
+            panic!("expected a complete tool response");
+        };
+        let value = by_severity.into_typed::<Value>().unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["id"], "evt_merged");
+        assert_eq!(events[1]["id"], "evt_completed");
+    }
+
+    #[tokio::test]
+    async fn after_rejects_cursor_together_and_negative_values() {
+        let service = seeded_service();
+
+        let both = call_list(&service, json!({"after": 1, "cursor": "seq_1"})).await;
+        let CallToolResponse::Complete(result) = &both else {
+            panic!("expected a complete tool response");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            tool_text(&both).contains("not both"),
+            "{}",
+            tool_text(&both)
+        );
+
+        let negative = call_list(&service, json!({"after": -1})).await;
+        let CallToolResponse::Complete(result) = &negative else {
+            panic!("expected a complete tool response");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            tool_text(&negative).contains("after"),
+            "{}",
+            tool_text(&negative)
+        );
     }
 }
