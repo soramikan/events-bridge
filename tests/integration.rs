@@ -2175,6 +2175,8 @@ async fn consumer_http_endpoints_require_auth_and_support_probe_poll_ack() {
 
     let http = reqwest::Client::new();
     let probe_url = format!("{}/consumers/muse/probe", hub.base_url);
+    let poll_url = format!("{}/consumers/muse/poll?limit=1", hub.base_url);
+    let ack_url = format!("{}/consumers/muse/ack", hub.base_url);
 
     let unauthorized = http.get(&probe_url).send().await.unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -2185,6 +2187,38 @@ async fn consumer_http_endpoints_require_auth_and_support_probe_poll_ack() {
             .and_then(|value| value.to_str().ok()),
         Some("Bearer")
     );
+    assert_eq!(
+        http.get(&poll_url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http.post(&ack_url)
+            .json(&json!({"upToSequence": 1}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Non-allowlisted Host and non-local Origin must be rejected even with a valid token.
+    let bad_host = http
+        .get(&probe_url)
+        .header(header::HOST, "evil.example:8787")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_host.status(), StatusCode::FORBIDDEN);
+    let bad_origin = http
+        .post(&ack_url)
+        .header(header::ORIGIN, "https://evil.example")
+        .bearer_auth(&token)
+        .json(&json!({"upToSequence": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
 
     let (status, probe) = response_json(
         http.get(&probe_url)
@@ -2201,7 +2235,6 @@ async fn consumer_http_endpoints_require_auth_and_support_probe_poll_ack() {
     assert_eq!(probe["unreadCount"], 1);
     assert_eq!(probe["hasUpdates"], true);
 
-    let poll_url = format!("{}/consumers/muse/poll?limit=1", hub.base_url);
     let (status, poll) = response_json(
         http.get(&poll_url)
             .bearer_auth(&token)
@@ -2221,7 +2254,6 @@ async fn consumer_http_endpoints_require_auth_and_support_probe_poll_ack() {
     assert_eq!(poll["events"][0]["eventId"], "evt_consumer_http");
     assert_eq!(poll["events"][0]["disposition"], "immediate");
 
-    let ack_url = format!("{}/consumers/muse/ack", hub.base_url);
     let (status, ack) = response_json(
         http.post(&ack_url)
             .bearer_auth(&token)

@@ -763,9 +763,21 @@ impl Config {
             );
         }
 
+        let mut seen_consumers: BTreeMap<String, &str> = BTreeMap::new();
         for (name, profile) in &self.consumers {
-            if name.trim().is_empty() {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
                 bail!("consumer names must not be empty");
+            }
+            if trimmed != name {
+                bail!("consumer name `{name}` must not have leading or trailing whitespace");
+            }
+            let lower = name.to_ascii_lowercase();
+            if let Some(existing) = seen_consumers.insert(lower, name.as_str()) {
+                bail!(
+                    "duplicate consumer profile names `{existing}` and `{name}` \
+                     (consumer names are matched case-insensitively)"
+                );
             }
             if profile.digest_window_secs == 0 {
                 bail!("consumers.{name}.digest_window_secs must be greater than zero");
@@ -993,6 +1005,27 @@ mod tests {
         let error = Config::parse("[consumers.muse.filters]\nsurprise = []\n")
             .expect_err("unknown filter key must fail");
         assert!(error.to_string().contains("surprise"), "{error}");
+
+        let duplicate_muse = Config::parse("[consumers.Muse]\n[consumers.muse]\n")
+            .expect_err("case-insensitive duplicate muse profiles must fail");
+        assert!(
+            duplicate_muse.to_string().contains("duplicate consumer"),
+            "{duplicate_muse}"
+        );
+
+        let duplicate_custom = Config::parse("[consumers.Reviewer]\n[consumers.reviewer]\n")
+            .expect_err("case-insensitive duplicate custom profiles must fail");
+        assert!(
+            duplicate_custom.to_string().contains("duplicate consumer"),
+            "{duplicate_custom}"
+        );
+
+        let padded_name = Config::parse("[consumers.\" muse \"]\n")
+            .expect_err("consumer name with surrounding whitespace must fail");
+        assert!(
+            padded_name.to_string().contains("whitespace"),
+            "{padded_name}"
+        );
     }
 
     #[test]

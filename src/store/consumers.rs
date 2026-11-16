@@ -52,6 +52,17 @@ pub struct ConsumerAckOutcome {
     pub advanced: bool,
 }
 
+/// Consistent snapshot of a consumer's cursor, latest sequence, and unread count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerProbeSnapshot {
+    /// Last acknowledged event sequence.
+    pub cursor_sequence: i64,
+    /// Highest stored event sequence.
+    pub latest_sequence: i64,
+    /// Number of matching events after the cursor.
+    pub unread_count: i64,
+}
+
 /// Why a consumer acknowledgement was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum ConsumerAckError {
@@ -123,6 +134,30 @@ fn consumer_event_sql(
     (sql, args)
 }
 
+fn read_probe_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    cursor_sequence: i64,
+    kinds: &[String],
+    filters: &ConsumerEventFilter<'_>,
+) -> Result<ConsumerProbeSnapshot> {
+    let latest_sequence: i64 =
+        tx.query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+    let unread_count = if kinds.is_empty() {
+        0
+    } else {
+        let (sql, args) = consumer_event_sql("COUNT(*)", cursor_sequence, kinds, filters);
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?
+    };
+    Ok(ConsumerProbeSnapshot {
+        cursor_sequence,
+        latest_sequence,
+        unread_count,
+    })
+}
+
 impl Repository {
     /// Read a consumer row without creating it.
     pub fn get_consumer(&self, name: &str) -> Result<Option<ConsumerRow>> {
@@ -186,6 +221,45 @@ impl Repository {
         let conn = self.lock_connection();
         let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?)
+    }
+
+    /// Ensure a consumer row exists and read its cursor, latest event sequence,
+    /// and matching unread count within a single SQLite transaction snapshot.
+    pub fn probe_consumer_snapshot(
+        &self,
+        name: &str,
+        kinds: &[String],
+        filters: &ConsumerEventFilter<'_>,
+    ) -> Result<ConsumerProbeSnapshot> {
+        let mut conn = self.lock_connection();
+        let tx = conn.transaction()?;
+        if let Some(cursor_sequence) = tx
+            .query_row(
+                "SELECT cursor_sequence FROM consumers WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            return read_probe_snapshot(&tx, cursor_sequence, kinds, filters);
+        }
+        drop(tx);
+
+        let now = now_rfc3339();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO consumers \
+             (name, cursor_sequence, created_at, updated_at) VALUES (?1, 0, ?2, ?2)",
+            params![name, &now],
+        )?;
+        let cursor_sequence: i64 = tx.query_row(
+            "SELECT cursor_sequence FROM consumers WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        let snapshot = read_probe_snapshot(&tx, cursor_sequence, kinds, filters)?;
+        tx.commit()?;
+        Ok(snapshot)
     }
 
     /// Select events after `after_sequence` in ascending sequence order.

@@ -168,19 +168,17 @@ impl ConsumerService {
     /// Count matching events after the cursor without consuming them.
     pub fn probe(&self, name: &str) -> Result<ConsumerProbe, ConsumerError> {
         let (consumer, profile) = self.resolve(name)?;
-        let row = self.repo.ensure_consumer(&consumer)?;
         let kinds = enabled_kinds(&profile);
         let filters = event_filter(&profile);
-        let latest_sequence = self.repo.latest_event_sequence()?;
-        let unread_count =
-            self.repo
-                .count_consumer_events(row.cursor_sequence, &kinds, &filters)?;
+        let snapshot = self
+            .repo
+            .probe_consumer_snapshot(&consumer, &kinds, &filters)?;
         Ok(ConsumerProbe {
             consumer,
-            latest_sequence,
-            cursor_sequence: row.cursor_sequence,
-            unread_count,
-            has_updates: unread_count > 0,
+            latest_sequence: snapshot.latest_sequence,
+            cursor_sequence: snapshot.cursor_sequence,
+            unread_count: snapshot.unread_count,
+            has_updates: snapshot.unread_count > 0,
         })
     }
 
@@ -712,5 +710,75 @@ mod tests {
         let error = service.probe("does-not-exist").unwrap_err();
         assert!(matches!(error, ConsumerError::UnknownConsumer(_)));
         assert!(error.to_string().contains("[consumers.does-not-exist]"));
+    }
+
+    #[test]
+    fn probe_reads_consistent_snapshot_under_concurrent_ingest_and_ack() {
+        struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let writer_repo = Arc::new(Repository::open(temp.path()).unwrap());
+        let reader_repo = Arc::new(Repository::open(temp.path()).unwrap());
+        let writer_service = ConsumerService::new(writer_repo.clone(), Config::default().consumers);
+        let reader_service = ConsumerService::new(reader_repo, Config::default().consumers);
+        assert_eq!(reader_service.probe("muse").unwrap().latest_sequence, 0);
+
+        let total = 80;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = stop.clone();
+
+        let writer = std::thread::spawn(move || {
+            let _guard = StopOnDrop(stop);
+            for index in 1..=total {
+                ingest(
+                    &writer_repo,
+                    &format!("evt_conc_{index}"),
+                    "t3.run.failed",
+                    json!({
+                        "environment_id": "linux-main",
+                        "project_id": "lnako",
+                        "thread_id": "thread-1",
+                        "run_id": format!("run-{index}"),
+                        "summary": "failed",
+                        "error": "boom"
+                    }),
+                );
+                if index % 3 == 0 {
+                    writer_service.ack("muse", index).unwrap();
+                }
+            }
+        });
+
+        while !stop_reader.load(std::sync::atomic::Ordering::Acquire) {
+            let probe = reader_service.probe("muse").unwrap();
+            assert!(
+                probe.cursor_sequence <= probe.latest_sequence,
+                "cursor {} > latest {}",
+                probe.cursor_sequence,
+                probe.latest_sequence
+            );
+            assert!(
+                probe.unread_count <= probe.latest_sequence - probe.cursor_sequence,
+                "unread {} > window ({}..={})",
+                probe.unread_count,
+                probe.cursor_sequence,
+                probe.latest_sequence
+            );
+            assert_eq!(probe.has_updates, probe.unread_count > 0);
+            std::thread::yield_now();
+        }
+
+        writer.join().unwrap();
+        let final_probe = reader_service.probe("muse").unwrap();
+        assert_eq!(final_probe.latest_sequence, total);
+        assert_eq!(
+            final_probe.unread_count,
+            final_probe.latest_sequence - final_probe.cursor_sequence
+        );
     }
 }

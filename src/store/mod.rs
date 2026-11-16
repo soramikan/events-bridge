@@ -6,7 +6,9 @@ pub mod migrations;
 pub mod repository;
 pub mod t3;
 
-pub use consumers::{ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, ConsumerRow};
+pub use consumers::{
+    ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, ConsumerProbeSnapshot, ConsumerRow,
+};
 pub use github::{
     GITHUB_COLLECTOR, GitHubApplyOutcome, GitHubCheckpoint, GitHubCiRun, GitHubDelivery,
     GitHubPendingCheck, GitHubPendingCheckResolution, GitHubPendingCheckUpdate, GitHubPollChanges,
