@@ -7,9 +7,9 @@
 //!
 //! * `capabilities.events` is injected into `initialize` and `server/discover`
 //!   responses.
-//! * `events/list`, `events/subscribe`, and `events/unsubscribe` are dispatched
-//!   by a JSON-RPC layer before the request reaches the SDK, so they work even
-//!   when the client has not retained a legacy session id.
+//! * `events/list`, `events/poll`, `events/subscribe`, and `events/unsubscribe`
+//!   are dispatched by a JSON-RPC layer before the request reaches the SDK, so
+//!   they work even when the client has not retained a legacy session id.
 //!
 //! Everything else is forwarded byte-for-byte to the SDK service.
 

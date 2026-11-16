@@ -11,6 +11,7 @@ pub use github::{
     GitHubPollCommit, GitHubPollContinuation, GitHubPullRequest, GitHubStatus, GitHubStatusQuery,
     GitHubWebhookChanges, pulls_scope, runs_scope,
 };
+pub(crate) use repository::arguments_match;
 pub use repository::{
     AttemptOutcome, DueDelivery, EdgeNonceStatus, Event, EventQuery, IngestOutcome, NewEvent,
     NewSubscription, Repository, Subscription,

@@ -2658,6 +2658,166 @@ async fn send_line(writer: &mut DuplexStream, value: Value) {
 }
 
 #[tokio::test]
+async fn stdio_surface_supports_events_poll() {
+    init_env();
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("stdio-poll.db");
+
+    // Seed the database before the stdio server opens it so polling has a
+    // deterministic watermark and replayable history.
+    {
+        let repo = Repository::open(&database).unwrap();
+        for index in 0..2 {
+            repo.ingest_event(NewEvent {
+                id: Some(format!("evt_stdio_poll_{index}")),
+                source: None,
+                kind: "t3.run.completed".into(),
+                payload: json!({
+                    "environment_id": "env-stdio",
+                    "project_id": "lnako",
+                    "thread_id": "thread-42",
+                    "run_id": format!("run-{index}"),
+                    "summary": "done"
+                }),
+                occurred_at: None,
+            })
+            .unwrap();
+        }
+    }
+
+    let config = Config::for_tests(database);
+    let (server_reader, mut client_writer) = tokio::io::duplex(1024 * 1024);
+    let (mut client_reader, server_writer) = tokio::io::duplex(1024 * 1024);
+    let server = tokio::spawn(async move {
+        events_bridge::transport::stdio::serve_with_io(
+            config,
+            CallbackPolicy::for_tests(),
+            server_reader,
+            server_writer,
+        )
+        .await
+    });
+    let mut lines = BufReader::new(&mut client_reader).lines();
+
+    send_line(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "stdio-poll", "version": "1.0.0"}
+            }
+        }),
+    )
+    .await;
+    let initialized: Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert!(initialized.pointer("/result/capabilities/tools").is_some());
+
+    send_line(
+        &mut client_writer,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+
+    send_line(
+        &mut client_writer,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "events/list", "params": {}}),
+    )
+    .await;
+    let listed: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    for definition in listed["result"]["events"].as_array().unwrap() {
+        assert_eq!(definition["delivery"], json!(["webhook", "poll"]));
+    }
+
+    send_line(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "events/poll",
+            "params": {
+                "name": "t3.run.completed",
+                "arguments": {"environment_id": "env-stdio"}
+            }
+        }),
+    )
+    .await;
+    let start: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(start["result"]["events"], json!([]));
+    assert_eq!(start["result"]["cursor"], "seq_2");
+    assert_eq!(start["result"]["nextPollMs"], 5000);
+
+    send_line(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "events/poll",
+            "params": {
+                "name": "t3.run.completed",
+                "arguments": {"environment_id": "env-stdio"},
+                "cursor": "seq_0"
+            }
+        }),
+    )
+    .await;
+    let polled: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let events = polled["result"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{polled}");
+    assert_eq!(events[0]["eventId"], "evt_stdio_poll_0");
+    assert_eq!(events[1]["eventId"], "evt_stdio_poll_1");
+    assert_eq!(polled["result"]["cursor"], "seq_2");
+    assert_eq!(polled["result"]["hasMore"], false);
+
+    send_line(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "events/poll",
+            "params": {
+                "name": "t3.run.completed",
+                "arguments": {"environment_id": "env-stdio"},
+                "cursor": "seq_2"
+            }
+        }),
+    )
+    .await;
+    let empty: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(empty["result"]["events"], json!([]));
+    assert_eq!(empty["result"]["cursor"], "seq_2");
+
+    send_line(
+        &mut client_writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "events/poll",
+            "params": {
+                "name": "t3.run.completed",
+                "arguments": {"environment_id": "env-stdio"},
+                "maxEvents": 0
+            }
+        }),
+    )
+    .await;
+    let invalid: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(invalid["error"]["code"], -32602);
+
+    drop(client_writer);
+    drop(lines);
+    let result = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("stdio server exits on EOF")
+        .expect("stdio task");
+    assert!(result.is_ok(), "stdio server failed: {result:?}");
+}
+
+#[tokio::test]
 async fn stdio_surface_serves_tools_and_events() {
     init_env();
     let temp = TempDir::new().unwrap();

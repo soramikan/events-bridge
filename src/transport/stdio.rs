@@ -1,10 +1,10 @@
 //! stdio MCP transport for generic MCP clients.
 //!
 //! The stdio surface exposes exactly the same `EventsHandler` as the HTTP
-//! transport: the six pull tools plus `events/list`, `events/subscribe` and
-//! `events/unsubscribe`. When a configuration file enables the local T3
-//! collector or the GitHub poller, those background tasks start here too and
-//! are cancelled and joined on exit.
+//! transport: the six pull tools plus `events/list`, `events/poll`,
+//! `events/subscribe` and `events/unsubscribe`. When a configuration file
+//! enables the local T3 collector or the GitHub poller, those background tasks
+//! start here too and are cancelled and joined on exit.
 
 use std::{path::PathBuf, time::Duration};
 

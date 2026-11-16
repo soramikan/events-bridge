@@ -423,6 +423,18 @@ impl Repository {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Highest event sequence currently stored (`0` when the log is empty).
+    ///
+    /// `events/poll` uses this as the watermark for an empty or exhausted
+    /// poll so the next request does not rescan events that cannot match.
+    pub fn latest_event_sequence(&self) -> Result<i64> {
+        Ok(self
+            .lock()
+            .query_row("SELECT COALESCE(MAX(sequence), 0) FROM events", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     /// Record user acknowledgements. Webhook delivery state is unaffected.
     pub fn ack_events(&self, principal: &str, event_ids: &[String]) -> Result<Vec<String>> {
         let mut conn = self.lock();
@@ -960,7 +972,10 @@ impl std::fmt::Debug for NewSubscription {
 ///
 /// Every key/value pair in `arguments` must be present with an equal value in
 /// the payload. An empty filter object matches every payload.
-fn arguments_match(arguments: &Value, payload: &Value) -> bool {
+///
+/// `events/poll` reuses this exact predicate so polling cannot drift from the
+/// webhook subscription filter semantics.
+pub(crate) fn arguments_match(arguments: &Value, payload: &Value) -> bool {
     let Some(filter) = arguments.as_object() else {
         return false;
     };

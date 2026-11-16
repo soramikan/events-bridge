@@ -642,11 +642,391 @@ async fn initialize_advertises_events_and_lists_the_catalog() {
         ]
     );
     for event in events {
-        assert_eq!(event["delivery"], json!(["webhook"]));
+        assert_eq!(event["delivery"], json!(["webhook", "poll"]));
         assert!(event["inputSchema"].is_object());
         assert!(event["payloadSchema"].is_object());
         assert!(event["description"].as_str().is_some());
     }
+}
+
+#[tokio::test]
+async fn events_poll_starts_from_now_and_filters_by_arguments() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let start = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"}
+                }),
+            )
+            .await,
+    );
+    assert_eq!(start["events"], json!([]));
+    assert_eq!(start["cursor"], "seq_0");
+    assert_eq!(start["truncated"], false);
+    assert_eq!(start["hasMore"], false);
+    assert_eq!(start["nextPollMs"], 5000);
+
+    let completed =
+        |id: &str, environment: &str, project: &str, occurred_at: Option<&str>| NewEvent {
+            id: Some(id.into()),
+            source: None,
+            kind: "t3.run.completed".into(),
+            payload: json!({
+                "environment_id": environment,
+                "project_id": project,
+                "thread_id": "thread-42",
+                "run_id": "run-102",
+                "summary": "done"
+            }),
+            occurred_at: occurred_at.map(str::to_owned),
+        };
+    hub.hub
+        .ingest_event(completed("evt_poll_1", "linux-main", "lnako", None))
+        .unwrap();
+    hub.hub
+        .ingest_event(completed("evt_poll_2", "linux-main", "other", None))
+        .unwrap();
+    hub.hub
+        .ingest_event(completed("evt_poll_3", "linux-other", "lnako", None))
+        .unwrap();
+    hub.hub
+        .ingest_event(NewEvent {
+            id: Some("evt_poll_4".into()),
+            source: None,
+            kind: "github.review.requested".into(),
+            payload: json!({
+                "repository": "soramikan/events-bridge",
+                "pull_number": 7,
+                "title": "Review me",
+                "url": "https://github.com/soramikan/events-bridge/pull/7"
+            }),
+            occurred_at: None,
+        })
+        .unwrap();
+    hub.hub
+        .ingest_event(NewEvent {
+            id: Some("evt_poll_5".into()),
+            source: None,
+            kind: "github.review.requested".into(),
+            payload: json!({
+                "repository": "soramikan/other",
+                "pull_number": 8,
+                "title": "Review me too",
+                "url": "https://github.com/soramikan/other/pull/8"
+            }),
+            occurred_at: None,
+        })
+        .unwrap();
+
+    let polled = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main", "project_id": "lnako"},
+                    "cursor": start["cursor"]
+                }),
+            )
+            .await,
+    );
+    let events = polled["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{polled}");
+    assert_eq!(events[0]["eventId"], "evt_poll_1");
+    assert_eq!(events[0]["name"], "t3.run.completed");
+    assert!(events[0]["timestamp"].as_str().is_some());
+    assert_eq!(events[0]["data"]["project_id"], "lnako");
+    assert_eq!(polled["cursor"], "seq_5");
+    assert_eq!(polled["truncated"], false);
+    assert_eq!(polled["hasMore"], false);
+
+    // The GitHub filter matches on `repository`, and starts behind the
+    // watermark because the cursor is explicit.
+    let reviews = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "github.review.requested",
+                    "arguments": {"repository": "soramikan/other"},
+                    "cursor": "seq_0"
+                }),
+            )
+            .await,
+    );
+    let events = reviews["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{reviews}");
+    assert_eq!(events[0]["eventId"], "evt_poll_5");
+    assert_eq!(reviews["cursor"], "seq_5");
+
+    // Empty polls must advance the watermark instead of rescanning.
+    let empty = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"},
+                    "cursor": polled["cursor"]
+                }),
+            )
+            .await,
+    );
+    assert_eq!(empty["events"], json!([]));
+    assert_eq!(empty["cursor"], "seq_5");
+    assert_eq!(empty["truncated"], false);
+    assert_eq!(empty["hasMore"], false);
+
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn events_poll_paginates_with_max_events_and_drains() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let start = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"}
+                }),
+            )
+            .await,
+    );
+    assert_eq!(start["cursor"], "seq_0");
+
+    for index in 0..5 {
+        hub.hub
+            .ingest_event(NewEvent {
+                id: Some(format!("evt_page_{index}")),
+                source: None,
+                kind: "t3.run.completed".into(),
+                payload: json!({
+                    "environment_id": "linux-main",
+                    "project_id": "lnako",
+                    "thread_id": "thread-42",
+                    "run_id": format!("run-{index}"),
+                    "summary": "done"
+                }),
+                occurred_at: None,
+            })
+            .unwrap();
+    }
+
+    let mut cursor = start["cursor"].as_str().unwrap().to_string();
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = rpc_result(
+            client
+                .request(
+                    "events/poll",
+                    json!({
+                        "name": "t3.run.completed",
+                        "arguments": {"environment_id": "linux-main"},
+                        "cursor": cursor,
+                        "maxEvents": 2
+                    }),
+                )
+                .await,
+        );
+        pages += 1;
+        seen.extend(
+            page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["eventId"].as_str().unwrap().to_string()),
+        );
+        cursor = page["cursor"].as_str().unwrap().to_string();
+        if page["hasMore"] == false {
+            break;
+        }
+        assert_eq!(page["events"].as_array().unwrap().len(), 2, "{page}");
+    }
+
+    assert_eq!(pages, 3);
+    assert_eq!(
+        seen,
+        [
+            "evt_page_0",
+            "evt_page_1",
+            "evt_page_2",
+            "evt_page_3",
+            "evt_page_4"
+        ]
+    );
+    assert_eq!(cursor, "seq_5");
+
+    let drained = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"},
+                    "cursor": cursor
+                }),
+            )
+            .await,
+    );
+    assert_eq!(drained["events"], json!([]));
+    assert_eq!(drained["hasMore"], false);
+
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn events_poll_max_age_marks_truncation() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let start = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"}
+                }),
+            )
+            .await,
+    );
+
+    let event = |id: &str, occurred_at: String| NewEvent {
+        id: Some(id.into()),
+        source: None,
+        kind: "t3.run.completed".into(),
+        payload: json!({
+            "environment_id": "linux-main",
+            "project_id": "lnako",
+            "thread_id": "thread-42",
+            "run_id": "run-102",
+            "summary": "done"
+        }),
+        occurred_at: Some(occurred_at),
+    };
+    hub.hub
+        .ingest_event(event("evt_old", "2020-01-01T00:00:00.000Z".into()))
+        .unwrap();
+    hub.hub
+        .ingest_event(event("evt_recent", format_rfc3339(Utc::now())))
+        .unwrap();
+
+    let polled = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"},
+                    "cursor": start["cursor"],
+                    "maxAgeMs": 60_000
+                }),
+            )
+            .await,
+    );
+    let events = polled["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{polled}");
+    assert_eq!(events[0]["eventId"], "evt_recent");
+    assert_eq!(polled["truncated"], true);
+    assert_eq!(polled["cursor"], "seq_2");
+
+    let after = rpc_result(
+        client
+            .request(
+                "events/poll",
+                json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"},
+                    "cursor": "seq_2",
+                    "maxAgeMs": 60_000
+                }),
+            )
+            .await,
+    );
+    assert_eq!(after["events"], json!([]));
+    assert_eq!(after["truncated"], false);
+
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn events_poll_rejects_invalid_parameters() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let response = client
+        .request("events/poll", json!({"name": "unknown.event"}))
+        .await;
+    let (code, data) = rpc_error(&response);
+    assert_eq!(code, -32023, "{response}");
+    assert_eq!(data, json!({"kind": "event"}));
+
+    for params in [
+        json!({"name": "t3.run.completed"}),
+        json!({
+            "name": "t3.run.completed",
+            "arguments": {"environment_id": 1}
+        }),
+        json!({
+            "name": "t3.run.completed",
+            "arguments": {"environment_id": "linux-main"},
+            "cursor": "not-a-cursor"
+        }),
+        json!({
+            "name": "t3.run.completed",
+            "arguments": {"environment_id": "linux-main"},
+            "maxEvents": 0
+        }),
+        json!({
+            "name": "t3.run.completed",
+            "arguments": {"environment_id": "linux-main"},
+            "_meta": ["not", "an", "object"]
+        }),
+    ] {
+        let response = client.request("events/poll", params.clone()).await;
+        let (code, _) = rpc_error(&response);
+        assert_eq!(code, -32602, "params {params}: {response}");
+    }
+
+    hub.stop().await;
 }
 
 #[tokio::test]

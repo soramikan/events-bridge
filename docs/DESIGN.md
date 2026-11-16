@@ -16,6 +16,7 @@ ChatGPT には dots や Work から利用できる専用の「MCP Events」機�
 | `events/list` | 必須 |
 | `events/subscribe` | 必須 |
 | `events/unsubscribe` | 必須 |
+| `events/poll`（SEP-3415） | 任意（カーソルベースのポーリング） |
 | Standard Webhooks による署名付き POST | 必須 |
 | SQLite でのイベント・購読管理 | 採用 |
 
@@ -52,7 +53,7 @@ ChatGPT の MCP Events は、Work のクラウド実行、対応するデスク�
 {
   "name": "t3.run.completed",
   "description": "A T3 Code coding-agent run has completed.",
-  "delivery": ["webhook"],
+  "delivery": ["webhook", "poll"],
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -186,6 +187,79 @@ ChatGPT の `2xx` は **Webhook の受信確認**であり、dots が処理を�
 
 チャレンジ不一致やタイムアウト時は `CallbackEndpointError`（JSON-RPC `-32015`）を返す。検証成功前に通常イベントを配信してはいけない。
 
+### 2.6 `events/poll`（SEP-3415）
+
+`events/list` の `delivery` は `["webhook", "poll"]` を返す。Webhook を使わないクライアントは `events/poll` でカーソルベースの取得ができる。HTTP の `POST /mcp` と `stdio` の両方で同じ JSON-RPC メソッドとして提供し、HTTP では既存の認証・Host/Origin 検証を通過したリクエストだけを処理する。
+
+リクエスト:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "events/poll",
+  "params": {
+    "name": "t3.run.completed",
+    "arguments": {"environment_id": "linux-main"},
+    "cursor": "seq_42",
+    "maxAgeMs": 600000,
+    "maxEvents": 50,
+    "_meta": {"progressToken": "poll-1"}
+  }
+}
+```
+
+| パラメータ | 必須 | 内容 |
+| --- | --- | --- |
+| `name` | 必須 | `events/list` が公開するイベント名。未知の名前は `-32023 NotFound`（`data.kind = "event"`）。 |
+| `arguments` | 任意 | `inputSchema` に対する購読フィルター。省略時は `{}`。検証失敗は `-32602 InvalidParams`。 |
+| `cursor` | 任意 | `"seq_<N>"` 形式の不透明カーソル。`null` / 省略は「現在時刻から開始」。 |
+| `maxAgeMs` | 任意 | 0 より大きい場合、`now - maxAgeMs` より古いイベントをスキップし、スキップが発生したら `truncated: true` を返す。`0` は無効。 |
+| `maxEvents` | 任意 | 1 レスポンスあたりの最大件数。既定 50、上限 200 にクランプ。`0` は `-32602`。 |
+| `_meta` | 任意 | MCP 2.0 のリクエストメタデータ。JSON オブジェクト以外は `-32602`。 |
+
+レスポンス:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "events": [
+      {
+        "eventId": "evt_...",
+        "name": "t3.run.completed",
+        "timestamp": "2026-11-16T01:00:00.000Z",
+        "data": {"environment_id": "linux-main"}
+      }
+    ],
+    "cursor": "seq_42",
+    "truncated": false,
+    "hasMore": false,
+    "nextPollMs": 5000
+  }
+}
+```
+
+カーソルとページングの規則:
+
+- `cursor: null` / 省略: 履歴を返さず、`events: []` と現在のウォーターマーク `"seq_<latest_sequence>"` を返す。以後に発生したイベントだけが対象になる。
+- `cursor: "seq_<N>"`: `name` が一致し `sequence > N` のイベントを昇順に走査し、`arguments` を Webhook 購読と同じ `arguments_match` でフィルタする。
+- `maxAgeMs` でスキップした一致イベントがある場合、または `N` が現在のウォーターマークより未来（DB リセット・別 DB のカーソル）の場合は `truncated: true`。未来カーソルは履歴を再生せず、`cursor` を最新に戻す。
+- 一致イベントが `maxEvents` を超える場合は先頭 `maxEvents` 件を返し、`hasMore: true`、`cursor` は最後に返したイベントの `sequence` にする。次回はその続きから読む。
+- 一致イベントが残っていない場合は `hasMore: false` とし、`cursor` を現在のウォーターマークまで進める。一致 0 件や `arguments` 不一致のみのポーリングでも再走査しない。
+- `nextPollMs` は次回ポーリングの推奨間隔（既定 5000 ms）。
+
+エラー:
+
+| 条件 | コード |
+| --- | --- |
+| 未知の `name` | `-32023`（`data: {"kind": "event"}`） |
+| `arguments` が `inputSchema` に違反 | `-32602` |
+| `cursor` が `"seq_<非負整数>"` でない | `-32602` |
+| `maxEvents: 0`（負値・非整数を含む） | `-32602` |
+| `_meta` が JSON オブジェクトでない | `-32602` |
+
 ## 3. T3 Code / GitHub 側のイベント取得方式
 
 T3 Code では、ファイルシステム監視よりも **Orchestrator V2 の永続イベントと状態遷移**を利用する方が正確である。
@@ -308,6 +382,9 @@ HTTP /mcp
     +-- events/unsubscribe
     |       -> SubscriptionManager
     |
+    +-- events/poll
+    |       -> SubscriptionManager（SEP-3415）
+    |
     +-- tools/* その他
             -> rmcp ServerHandler
 ```
@@ -330,7 +407,7 @@ HTTP /mcp
 
 `tokio::sync::broadcast` は永続キューではなく、ワーカーを起こすための通知経路として使用する。イベントの取り込み時には、イベント本体と配信対象レコードを SQLite の単一トランザクションで保存してから `broadcast` に通知する。再起動後は `deliveries` の未完了レコードから送信を再開する。
 
-`cursor` を使った履歴再生は、最初は配送確認が取れた連続範囲のみカーソルを進める方式にする。MCP Events の `cursor` と、T3 Code 自体の `sequence` は別々に管理する。
+Webhook の `cursor` と、T3 Code 自体の `sequence` は別々に管理する。`events/poll` のカーソルは Hub の `events.sequence` を `seq_<N>` 形式で表し、`sequence > N` のイベントを昇順に返す。
 
 ## 6. ChatGPT 向け Pull ツール
 
@@ -378,7 +455,7 @@ dots への監視指示の例:
 
 ## 9. 実装・検証の優先順位
 
-1. **MCP Events プロトコルの最小実装**: events/list・subscribe・unsubscribe、Webhook 検証、署名、SQLite 永続化
+1. **MCP Events プロトコルの最小実装**: events/list・poll・subscribe・unsubscribe、Webhook 検証、署名、SQLite 永続化
 2. **T3 Code Collector**: Run 完了・承認待ち・失敗の3種類を取得し、再接続後の状態を復元
 3. **GitHub Collector**: Webhook 受信、API 補正、重複排除、PR・CI の対応付け
 4. **複数ホスト統合**: Linux と macOS の Edge Collector、中央 Hub への認証済み転送
