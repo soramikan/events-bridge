@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -36,6 +36,7 @@ use url::Url;
 use crate::{
     app::AppState,
     auth::AuthError,
+    consumers::ConsumerError,
     edge_protocol::{
         EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE, HEADER_EDGE_SIGNATURE,
         HEADER_EDGE_TIMESTAMP, valid_edge_token, verify as verify_edge_signature,
@@ -90,6 +91,9 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
         .route("/internal/events", post(internal_ingest))
         .route("/internal/edge/t3", post(edge_ingest))
         .route("/webhooks/github", post(github_webhook_entry))
+        .route("/consumers/{name}/probe", get(consumer_probe))
+        .route("/consumers/{name}/poll", get(consumer_poll))
+        .route("/consumers/{name}/ack", post(consumer_ack))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
@@ -544,6 +548,92 @@ async fn internal_ingest(
         "deliveriesCreated": outcome.deliveries_created,
     }))
     .into_response()
+}
+
+/// Shared auth checks for the consumer endpoints.
+fn authorize_consumer(
+    state: &Arc<McpHttpState>,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Option<Response> {
+    if let Err(response) =
+        validate_http_security(headers, uri, &state.app.config.server.allowed_hosts)
+    {
+        return Some(response.into_response());
+    }
+    if let Err(error) = state.app.auth.authenticate(headers) {
+        return Some(unauthorized(error));
+    }
+    None
+}
+
+fn consumer_error_response(error: ConsumerError) -> Response {
+    let status = match &error {
+        ConsumerError::UnknownConsumer(_) => StatusCode::NOT_FOUND,
+        ConsumerError::AckOutOfRange { .. } => StatusCode::BAD_REQUEST,
+        ConsumerError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error": error.to_string()}))).into_response()
+}
+
+async fn consumer_probe(
+    State(state): State<Arc<McpHttpState>>,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize_consumer(&state, &headers, &uri) {
+        return response;
+    }
+    match state.app.consumers.probe(&name) {
+        Ok(probe) => Json(probe).into_response(),
+        Err(error) => consumer_error_response(error),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConsumerPollQuery {
+    limit: Option<usize>,
+}
+
+async fn consumer_poll(
+    State(state): State<Arc<McpHttpState>>,
+    Path(name): Path<String>,
+    Query(query): Query<ConsumerPollQuery>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize_consumer(&state, &headers, &uri) {
+        return response;
+    }
+    match state.app.consumers.poll(&name, query.limit) {
+        Ok(poll) => Json(poll).into_response(),
+        Err(error) => consumer_error_response(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerAckRequest {
+    #[serde(alias = "upToSequence", alias = "cursor")]
+    up_to_sequence: i64,
+}
+
+async fn consumer_ack(
+    State(state): State<Arc<McpHttpState>>,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(body): Json<ConsumerAckRequest>,
+) -> Response {
+    if let Some(response) = authorize_consumer(&state, &headers, &uri) {
+        return response;
+    }
+    match state.app.consumers.ack(&name, body.up_to_sequence) {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => consumer_error_response(error),
+    }
 }
 
 async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -> Response {

@@ -13,6 +13,8 @@ use rmcp::model::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::config::Config;
+use crate::consumers::{ConsumerService, MAX_CONSUMER_POLL_LIMIT};
 use crate::mcp::event_catalog;
 use crate::store::{Event, EventQuery, GitHubStatusQuery, Repository, T3ApprovalQuery};
 use crate::util::{format_rfc3339, parse_rfc3339};
@@ -141,6 +143,47 @@ pub fn definitions() -> Vec<Tool> {
                 }),
                 false,
             ),
+            tool(
+                "probe_consumer",
+                "Check whether a named polling consumer has unread events without fetching or consuming them.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "consumer": {"type": "string", "description": "Consumer name, e.g. muse."}
+                    },
+                    "required": ["consumer"],
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
+                "poll_consumer_events",
+                "Fetch unacknowledged events for a named polling consumer. Polling does not advance the consumer cursor.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "consumer": {"type": "string", "description": "Consumer name, e.g. muse."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+                    },
+                    "required": ["consumer"],
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
+                "ack_consumer_events",
+                "Advance a named polling consumer cursor after events were processed. This is separate from ack_events.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "consumer": {"type": "string", "description": "Consumer name, e.g. muse."},
+                        "up_to_sequence": {"type": "integer", "minimum": 0}
+                    },
+                    "required": ["consumer", "up_to_sequence"],
+                    "additionalProperties": false
+                }),
+                false,
+            ),
         ]
     });
     TOOLS.clone()
@@ -155,12 +198,25 @@ pub fn get(name: &str) -> Option<Tool> {
 #[derive(Clone)]
 pub struct ToolService {
     repo: Arc<Repository>,
+    consumers: Arc<ConsumerService>,
 }
 
 impl ToolService {
-    /// Create a tool service.
+    /// Create a tool service with built-in consumer profiles.
+    ///
+    /// Hub construction uses [`Self::with_consumers`] so configured profiles
+    /// are visible to the consumer tools.
     pub fn new(repo: Arc<Repository>) -> Self {
-        Self { repo }
+        let consumers = Arc::new(ConsumerService::new(
+            repo.clone(),
+            Config::default().consumers,
+        ));
+        Self { repo, consumers }
+    }
+
+    /// Create a tool service sharing the hub's consumer service.
+    pub fn with_consumers(repo: Arc<Repository>, consumers: Arc<ConsumerService>) -> Self {
+        Self { repo, consumers }
     }
 
     /// Dispatch a `tools/call`.
@@ -181,6 +237,9 @@ impl ToolService {
             "get_t3_approvals" => self.get_t3_approvals(arguments),
             "get_github_status" => self.get_github_status(arguments),
             "ack_events" => self.ack_events(principal, arguments),
+            "probe_consumer" => self.probe_consumer(arguments),
+            "poll_consumer_events" => self.poll_consumer_events(arguments),
+            "ack_consumer_events" => self.ack_consumer_events(arguments),
             other => Err(format!("unknown tool `{other}`")),
         };
 
@@ -392,6 +451,46 @@ impl ToolService {
             "note": "This records user acknowledgement only; webhook delivery state is unchanged.",
         }))
     }
+
+    fn probe_consumer(&self, arguments: Value) -> Result<Value, String> {
+        let args: ConsumerArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let probe = self
+            .consumers
+            .probe(&args.consumer)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(probe).map_err(|error| error.to_string())
+    }
+
+    fn poll_consumer_events(&self, arguments: Value) -> Result<Value, String> {
+        let args: PollConsumerArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        if let Some(limit) = args.limit
+            && !(1..=MAX_CONSUMER_POLL_LIMIT).contains(&limit)
+        {
+            return Err(format!(
+                "`limit` must be between 1 and {MAX_CONSUMER_POLL_LIMIT}, got {limit}"
+            ));
+        }
+        let poll = self
+            .consumers
+            .poll(&args.consumer, args.limit)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(poll).map_err(|error| error.to_string())
+    }
+
+    fn ack_consumer_events(&self, arguments: Value) -> Result<Value, String> {
+        let args: AckConsumerArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        if args.up_to_sequence < 0 {
+            return Err("`up_to_sequence` must be greater than or equal to zero".into());
+        }
+        let ack = self
+            .consumers
+            .ack(&args.consumer, args.up_to_sequence)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(ack).map_err(|error| error.to_string())
+    }
 }
 
 fn parse_cursor(cursor: &str) -> Result<i64, String> {
@@ -472,6 +571,28 @@ struct AckEventsArgs {
     event_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConsumerArgs {
+    consumer: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PollConsumerArgs {
+    consumer: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckConsumerArgs {
+    consumer: String,
+    #[serde(alias = "upToSequence")]
+    up_to_sequence: i64,
+}
+
 /// Render an event for diagnostics.
 #[allow(dead_code)]
 pub fn summarize(event: &Event) -> String {
@@ -495,6 +616,9 @@ mod tests {
                 "get_t3_approvals",
                 "get_github_status",
                 "ack_events",
+                "probe_consumer",
+                "poll_consumer_events",
+                "ack_consumer_events",
             ]
         );
         assert_eq!(get("list_events").unwrap().name, "list_events");
