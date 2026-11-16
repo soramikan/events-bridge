@@ -620,6 +620,9 @@ async fn initialize_advertises_events_and_lists_the_catalog() {
             "get_t3_approvals",
             "get_github_status",
             "ack_events",
+            "probe_consumer",
+            "poll_consumer_events",
+            "ack_consumer_events",
         ]
     );
 
@@ -2193,4 +2196,405 @@ async fn legacy_minimal_payload_still_validates_and_delivers() {
     assert_eq!(body["data"]["error"], "boom");
     assert!(body["data"].get("severity").is_none());
     assert!(body["data"].get("title").is_none());
+}
+
+fn failed_event(id: &str) -> NewEvent {
+    NewEvent {
+        id: Some(id.into()),
+        source: None,
+        kind: "t3.run.failed".into(),
+        payload: json!({
+            "environment_id": "linux-main",
+            "project_id": "lnako",
+            "thread_id": "thread-42",
+            "run_id": "run-102",
+            "summary": "failed",
+            "error": "boom"
+        }),
+        occurred_at: None,
+    }
+}
+
+#[tokio::test]
+async fn consumer_http_endpoints_require_auth_and_support_probe_poll_ack() {
+    let temp = TempDir::new().unwrap();
+    let variable = format!(
+        "EVENTS_BRIDGE_TEST_CONSUMER_TOKEN_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    // Synthesize the bearer token at runtime; no secret literal is committed.
+    let token = format!("token-{}", uuid::Uuid::new_v4());
+    unsafe { std::env::set_var(&variable, &token) };
+
+    let mut config = Config::for_tests(temporary_database(&temp));
+    config.auth.token_env = Some(variable.clone());
+    let hub = RunningHub::start_with_config(config, CallbackPolicy::for_tests(), false).await;
+    hub.hub
+        .ingest_event(failed_event("evt_consumer_http"))
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let probe_url = format!("{}/consumers/muse/probe", hub.base_url);
+    let poll_url = format!("{}/consumers/muse/poll?limit=1", hub.base_url);
+    let ack_url = format!("{}/consumers/muse/ack", hub.base_url);
+
+    let unauthorized = http.get(&probe_url).send().await.unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauthorized
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer")
+    );
+    assert_eq!(
+        http.get(&poll_url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http.post(&ack_url)
+            .json(&json!({"upToSequence": 1}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Non-allowlisted Host and non-local Origin must be rejected even with a valid token.
+    let bad_host = http
+        .get(&probe_url)
+        .header(header::HOST, "evil.example:8787")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_host.status(), StatusCode::FORBIDDEN);
+    let bad_origin = http
+        .post(&ack_url)
+        .header(header::ORIGIN, "https://evil.example")
+        .bearer_auth(&token)
+        .json(&json!({"upToSequence": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+    let (status, probe) = response_json(
+        http.get(&probe_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{probe}");
+    assert_eq!(probe["consumer"], "muse");
+    assert_eq!(probe["cursorSequence"], 0);
+    assert_eq!(probe["latestSequence"], 1);
+    assert_eq!(probe["unreadCount"], 1);
+    assert_eq!(probe["hasUpdates"], true);
+
+    let (status, poll) = response_json(
+        http.get(&poll_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{poll}");
+    assert_eq!(poll["consumer"], "muse");
+    assert_eq!(poll["cursorSequence"], 0);
+    assert_eq!(poll["nextCursorSequence"], 1);
+    assert_eq!(poll["hasMore"], false);
+    assert_eq!(poll["truncated"], false);
+    assert_eq!(poll["digests"].as_array().unwrap().len(), 0);
+    assert_eq!(poll["events"].as_array().unwrap().len(), 1);
+    assert_eq!(poll["events"][0]["eventId"], "evt_consumer_http");
+    assert_eq!(poll["events"][0]["disposition"], "immediate");
+
+    let (status, ack) = response_json(
+        http.post(&ack_url)
+            .bearer_auth(&token)
+            .json(&json!({"upToSequence": 1}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ack}");
+    assert_eq!(ack["consumer"], "muse");
+    assert_eq!(ack["previousCursorSequence"], 0);
+    assert_eq!(ack["cursorSequence"], 1);
+    assert_eq!(ack["advanced"], true);
+
+    // The `cursor` alias is accepted and a repeated ack is a monotonic no-op.
+    let (status, ack) = response_json(
+        http.post(&ack_url)
+            .bearer_auth(&token)
+            .json(&json!({"cursor": 1}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ack}");
+    assert_eq!(ack["advanced"], false);
+    assert_eq!(ack["cursorSequence"], 1);
+
+    let (status, probe) = response_json(
+        http.get(&probe_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{probe}");
+    assert_eq!(probe["unreadCount"], 0);
+    assert_eq!(probe["hasUpdates"], false);
+
+    let (status, error) = response_json(
+        http.get(format!("{}/consumers/missing/probe", hub.base_url))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown consumer")
+    );
+
+    unsafe { std::env::remove_var(&variable) };
+}
+
+#[tokio::test]
+async fn consumer_mcp_tools_round_trip_without_touching_ack_events() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+    hub.hub
+        .ingest_event(failed_event("evt_consumer_failed"))
+        .unwrap();
+    hub.hub
+        .ingest_event(completed_event("evt_consumer_completed"))
+        .unwrap();
+
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let probe = client
+        .tool_call("probe_consumer", json!({"consumer": "Muse"}))
+        .await;
+    assert_eq!(probe["isError"], false, "{probe}");
+    assert_eq!(probe["structuredContent"]["consumer"], "muse");
+    assert_eq!(probe["structuredContent"]["latestSequence"], 2);
+    assert_eq!(probe["structuredContent"]["cursorSequence"], 0);
+    assert_eq!(probe["structuredContent"]["unreadCount"], 2);
+    assert_eq!(probe["structuredContent"]["hasUpdates"], true);
+
+    let poll = client
+        .tool_call(
+            "poll_consumer_events",
+            json!({"consumer": "muse", "limit": 1}),
+        )
+        .await;
+    assert_eq!(poll["isError"], false, "{poll}");
+    assert_eq!(poll["structuredContent"]["cursorSequence"], 0);
+    assert_eq!(poll["structuredContent"]["nextCursorSequence"], 1);
+    assert_eq!(poll["structuredContent"]["hasMore"], true);
+    assert_eq!(
+        poll["structuredContent"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let all = client
+        .tool_call("poll_consumer_events", json!({"consumer": "muse"}))
+        .await;
+    assert_eq!(all["isError"], false, "{all}");
+    let events = all["structuredContent"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["name"], "t3.run.failed");
+    assert_eq!(events[0]["disposition"], "immediate");
+    assert_eq!(all["structuredContent"]["nextCursorSequence"], 2);
+    assert_eq!(all["structuredContent"]["hasMore"], false);
+    assert_eq!(all["structuredContent"]["truncated"], false);
+    let digests = all["structuredContent"]["digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0]["count"], 1);
+    assert_eq!(digests[0]["maxSequence"], 2);
+    assert_eq!(digests[0]["eventIds"], json!(["evt_consumer_completed"]));
+    assert_eq!(digests[0]["eventIdsTruncated"], false);
+    assert_eq!(digests[0]["countsByKind"]["t3.run.completed"], 1);
+    assert!(digests[0]["windowStart"].as_str().unwrap().ends_with('Z'));
+    assert!(digests[0]["windowEnd"].as_str().unwrap().ends_with('Z'));
+
+    // Polling did not advance the cursor.
+    assert_eq!(all["structuredContent"]["cursorSequence"], 0);
+
+    // `ack_events` remains the user-facing acknowledgement tool and does not
+    // move the consumer cursor.
+    let user_ack = client
+        .tool_call("ack_events", json!({"event_ids": ["evt_consumer_failed"]}))
+        .await;
+    assert_eq!(user_ack["isError"], false, "{user_ack}");
+    assert_eq!(
+        user_ack["structuredContent"]["acknowledged"],
+        json!(["evt_consumer_failed"])
+    );
+    let probe = client
+        .tool_call("probe_consumer", json!({"consumer": "muse"}))
+        .await;
+    assert_eq!(probe["structuredContent"]["cursorSequence"], 0);
+    assert_eq!(probe["structuredContent"]["unreadCount"], 2);
+
+    let ack = client
+        .tool_call(
+            "ack_consumer_events",
+            json!({"consumer": "muse", "upToSequence": 2}),
+        )
+        .await;
+    assert_eq!(ack["isError"], false, "{ack}");
+    assert_eq!(ack["structuredContent"]["previousCursorSequence"], 0);
+    assert_eq!(ack["structuredContent"]["cursorSequence"], 2);
+    assert_eq!(ack["structuredContent"]["advanced"], true);
+
+    let probe = client
+        .tool_call("probe_consumer", json!({"consumer": "muse"}))
+        .await;
+    assert_eq!(probe["structuredContent"]["unreadCount"], 0);
+
+    let missing = client
+        .tool_call("probe_consumer", json!({"consumer": "missing"}))
+        .await;
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert!(
+        missing["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown consumer")
+    );
+
+    let invalid_limit = client
+        .tool_call(
+            "poll_consumer_events",
+            json!({"consumer": "muse", "limit": 0}),
+        )
+        .await;
+    assert_eq!(invalid_limit["isError"], true, "{invalid_limit}");
+
+    let missing_ack = client
+        .tool_call(
+            "ack_consumer_events",
+            json!({"consumer": "muse", "upToSequence": 99}),
+        )
+        .await;
+    assert_eq!(missing_ack["isError"], true, "{missing_ack}");
+}
+
+#[tokio::test]
+async fn consumer_mcp_poll_summarizes_digest_backlog_without_dropping_immediate_events() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+
+    // Three digest events share the 01:00-01:10 UTC window. The immediate event
+    // comes last, so a limit of one would previously have hidden the backlog.
+    for (index, occurred_at) in [
+        "2026-11-16T01:00:00.000Z",
+        "2026-11-16T01:05:00.000Z",
+        "2026-11-16T01:09:59.000Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        hub.hub
+            .ingest_event(NewEvent {
+                id: Some(format!("evt_digest_{index}")),
+                source: None,
+                kind: "t3.run.completed".into(),
+                payload: t3_completed_payload(),
+                occurred_at: Some((*occurred_at).into()),
+            })
+            .unwrap();
+    }
+    hub.hub
+        .ingest_event(NewEvent {
+            id: Some("evt_immediate".into()),
+            source: None,
+            kind: "t3.run.failed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": "run-102",
+                "summary": "failed",
+                "error": "boom"
+            }),
+            occurred_at: Some("2026-11-16T01:06:00.000Z".into()),
+        })
+        .unwrap();
+
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let poll = client
+        .tool_call(
+            "poll_consumer_events",
+            json!({"consumer": "muse", "limit": 1}),
+        )
+        .await;
+    assert_eq!(poll["isError"], false, "{poll}");
+    let content = &poll["structuredContent"];
+
+    let events = content["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["eventId"], "evt_immediate");
+    assert_eq!(events[0]["disposition"], "immediate");
+
+    let digests = content["digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0]["count"], 3);
+    assert_eq!(digests[0]["countsByKind"]["t3.run.completed"], 3);
+    assert_eq!(digests[0]["maxSequence"], 3);
+    assert_eq!(digests[0]["windowStart"], "2026-11-16T01:00:00Z");
+    assert_eq!(digests[0]["windowEnd"], "2026-11-16T01:10:00Z");
+    assert_eq!(
+        digests[0]["eventIds"],
+        json!(["evt_digest_0", "evt_digest_1", "evt_digest_2"])
+    );
+
+    assert_eq!(content["truncated"], true);
+    assert_eq!(content["hasMore"], false);
+    assert_eq!(content["nextCursorSequence"], 4);
+
+    let ack = client
+        .tool_call(
+            "ack_consumer_events",
+            json!({"consumer": "muse", "upToSequence": 4}),
+        )
+        .await;
+    assert_eq!(ack["isError"], false, "{ack}");
+
+    let probe = client
+        .tool_call("probe_consumer", json!({"consumer": "muse"}))
+        .await;
+    assert_eq!(probe["structuredContent"]["unreadCount"], 0);
 }

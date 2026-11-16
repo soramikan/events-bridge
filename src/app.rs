@@ -8,10 +8,12 @@ use secrecy::SecretString;
 use crate::{
     auth::Auth,
     config::Config,
+    consumers::ConsumerService,
     delivery::verification::CallbackPolicy,
     event::{EventBus, IngestService},
     mcp::subscriptions::SubscriptionManager,
     mcp::tools::ToolService,
+    oauth::OAuthService,
     store::Repository,
 };
 
@@ -27,10 +29,14 @@ pub struct AppState {
     pub ingest: IngestService,
     /// `events/*` implementation.
     pub subscriptions: Arc<SubscriptionManager>,
+    /// Server-side polling consumers.
+    pub consumers: Arc<ConsumerService>,
     /// Pull tools.
     pub tools: Arc<ToolService>,
     /// Inbound authentication.
     pub auth: Auth,
+    /// OAuth 2.1 authorization server, when enabled.
+    pub oauth: Option<Arc<OAuthService>>,
     /// Optional token for `POST /internal/events`.
     pub internal_token: Option<SecretString>,
     /// GitHub webhook HMAC secret, read when the webhook endpoint is enabled.
@@ -56,8 +62,10 @@ impl AppState {
             config.subscriptions.clone(),
             policy,
         ));
-        let tools = Arc::new(ToolService::new(repo.clone()));
-        let auth = Auth::from_config(&config.auth)?;
+        let consumers = Arc::new(ConsumerService::from_config(repo.clone(), &config));
+        let tools = Arc::new(ToolService::with_consumers(repo.clone(), consumers.clone()));
+        let oauth = OAuthService::from_config(&config.oauth, repo.clone())?.map(Arc::new);
+        let auth = Auth::from_config(&config.auth)?.with_oauth(oauth.clone());
 
         let internal_token = if config.server.enable_internal_ingest {
             match &config.server.internal_token_env {
@@ -100,8 +108,10 @@ impl AppState {
             bus,
             ingest,
             subscriptions,
+            consumers,
             tools,
             auth,
+            oauth,
             internal_token,
             github_webhook_secret,
             github_token,

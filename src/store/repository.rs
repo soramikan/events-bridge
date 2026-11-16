@@ -24,7 +24,7 @@ use crate::util::{format_rfc3339, now_rfc3339, parse_rfc3339};
 /// Default lease before an abandoned `in_progress` delivery is reclaimed.
 pub const DEFAULT_DELIVERY_LEASE: Duration = Duration::from_secs(300);
 
-const EVENT_COLUMNS: &str = "id, sequence, source, kind, payload, occurred_at";
+pub(crate) const EVENT_COLUMNS: &str = "id, sequence, source, kind, payload, occurred_at";
 
 const SUBSCRIPTION_COLUMNS: &str = "id, principal, event_name, arguments, filter_hash, callback_url, \
      secret, delivery_mode, verified, active, created_at, updated_at, refresh_before, \
@@ -986,7 +986,7 @@ fn load_subscription(conn: &Connection, id: &str) -> rusqlite::Result<Option<Sub
         .optional()
 }
 
-fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
+pub(crate) fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
     let payload: String = row.get(4)?;
     Ok(Event {
         id: row.get(0)?,
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn migrations_create_every_table() {
         let repo = repository();
-        assert_eq!(repo.schema_version().unwrap(), 4);
+        assert_eq!(repo.schema_version().unwrap(), 6);
         let conn = repo.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -1068,6 +1068,7 @@ mod tests {
         for expected in [
             "acks",
             "collector_checkpoints",
+            "consumers",
             "delivery_attempts",
             "deliveries",
             "edge_nonces",
@@ -1078,6 +1079,9 @@ mod tests {
             "github_deliveries",
             "github_pending_checks",
             "github_pull_requests",
+            "oauth_access_tokens",
+            "oauth_authorization_codes",
+            "oauth_refresh_tokens",
             "source_cursors",
             "subscriptions",
             "t3_approvals",
