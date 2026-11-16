@@ -21,6 +21,7 @@ pub use oauth::{
     AccessTokenRecord, AuthorizationCodeRecord, ConsumeCodeOutcome, NewAccessToken,
     NewAuthorizationCode, NewRefreshToken, OAuthStore, RefreshTokenRecord, RotateRefreshOutcome,
 };
+pub(crate) use repository::arguments_match;
 pub use repository::{
     AttemptOutcome, DueDelivery, EdgeNonceStatus, Event, EventQuery, IngestOutcome, NewEvent,
     NewSubscription, Repository, Subscription,

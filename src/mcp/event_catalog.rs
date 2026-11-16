@@ -49,7 +49,7 @@ impl EventDefinition {
         json!({
             "name": self.name,
             "description": self.description,
-            "delivery": ["webhook"],
+            "delivery": ["webhook", "poll"],
             "inputSchema": self.input_schema,
             "payloadSchema": self.payload_schema,
         })
@@ -368,7 +368,7 @@ mod tests {
             ]
         );
         for event in EVENTS.iter() {
-            assert_eq!(event.descriptor()["delivery"], json!(["webhook"]));
+            assert_eq!(event.descriptor()["delivery"], json!(["webhook", "poll"]));
             assert!(event.input_schema.is_object());
             assert!(event.payload_schema.is_object());
         }

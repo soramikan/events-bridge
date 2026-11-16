@@ -41,7 +41,8 @@ impl ServerHandler for EventsHandler {
             ))
             .with_instructions(
                 "T3 Code and GitHub events. Use tools/list for pull tools and \
-                 the events/* extension for signed webhook subscriptions.",
+                 the events/* extension for signed webhook subscriptions and \
+                 cursor-based polling.",
             )
     }
 
