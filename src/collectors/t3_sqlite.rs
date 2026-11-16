@@ -769,6 +769,71 @@ impl T3Source {
             .flatten();
         Ok(value.filter(|value| !value.is_empty()))
     }
+
+    /// Resolve a project's title from the projection table, then the event log.
+    pub fn project_title(&self, project_id: &str) -> Result<Option<String>> {
+        let projected = self
+            .conn
+            .query_row(
+                "SELECT title FROM projection_projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        if projected.is_some() {
+            return Ok(projected);
+        }
+        let value = self
+            .conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.title') \
+                 FROM orchestration_events \
+                 WHERE event_type IN ('project.created', 'project.metadata-updated') \
+                   AND json_valid(payload_json) \
+                   AND json_extract(payload_json, '$.projectId') = ?1 \
+                 ORDER BY sequence DESC LIMIT 1",
+                params![project_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(value.filter(|value| !value.trim().is_empty()))
+    }
+
+    /// Resolve a thread's title from the projection table, then the event log.
+    pub fn thread_title(&self, thread_id: &str) -> Result<Option<String>> {
+        let projected = self
+            .conn
+            .query_row(
+                "SELECT title FROM orchestration_v2_projection_threads \
+                 WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        if projected.is_some() {
+            return Ok(projected);
+        }
+        let value = self
+            .conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.title') \
+                 FROM orchestration_events \
+                 WHERE event_type IN ('thread.created', 'thread.metadata-updated') \
+                   AND json_valid(payload_json) \
+                   AND json_extract(payload_json, '$.id') = ?1 \
+                 ORDER BY sequence DESC LIMIT 1",
+                params![thread_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(value.filter(|value| !value.trim().is_empty()))
+    }
 }
 
 fn failure_for_run_conn(conn: &Connection, run_id: &str) -> Result<Option<String>> {

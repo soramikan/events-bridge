@@ -229,13 +229,7 @@ impl<'a> T3Reducer<'a> {
         let ordinal = integer(payload, "ordinal")
             .or_else(|| previous.as_ref().map(|run| run.ordinal))
             .unwrap_or(0);
-        let thread_title = if thread_id.is_empty() {
-            None
-        } else {
-            self.repo
-                .get_t3_thread(self.environment_id, &thread_id)?
-                .map(|thread| thread.title)
-        };
+        let thread_title = self.resolved_thread_title(&thread_id);
         let summary = run_summary(&status, ordinal, thread_title.as_deref());
         let error = if status == "failed" {
             Some(
@@ -588,8 +582,14 @@ impl<'a> T3Reducer<'a> {
             .get_t3_project(self.environment_id, project_id)
             .ok()
             .flatten()
-            .map(|project| single_line(&project.title))
-            .filter(|title| !title.is_empty())
+            .and_then(|project| bound_display_name(&project.title))
+            .or_else(|| {
+                self.source
+                    .project_title(project_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|title| bound_display_name(&title))
+            })
     }
 
     fn resolved_thread_title(&self, thread_id: &str) -> Option<String> {
@@ -600,8 +600,14 @@ impl<'a> T3Reducer<'a> {
             .get_t3_thread(self.environment_id, thread_id)
             .ok()
             .flatten()
-            .map(|thread| single_line(&thread.title))
-            .filter(|title| !title.is_empty())
+            .and_then(|thread| bound_display_name(&thread.title))
+            .or_else(|| {
+                self.source
+                    .thread_title(thread_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|title| bound_display_name(&title))
+            })
     }
 
     fn run_project(&self, run_id: &str) -> Result<Option<String>> {
@@ -827,8 +833,20 @@ fn slug(value: &str, limit: usize) -> String {
     if slug.is_empty() { "x".into() } else { slug }
 }
 
+const WEBHOOK_DISPLAY_NAME_JSON_BYTES: usize = 1024;
 const WEBHOOK_SUMMARY_JSON_BYTES: usize = 4 * 1024;
 const WEBHOOK_ERROR_JSON_BYTES: usize = 16 * 1024;
+
+fn bound_display_name(value: &str) -> Option<String> {
+    let normalized = single_line(value);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(bound_json_text(
+        &normalized,
+        WEBHOOK_DISPLAY_NAME_JSON_BYTES,
+    ))
+}
 
 fn bound_json_text(value: &str, max_json_bytes: usize) -> String {
     if serde_json::to_string(value)
@@ -878,6 +896,7 @@ fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MAX_WEBHOOK_BODY_BYTES;
 
     #[test]
     fn event_ids_are_deterministic_and_bounded() {
@@ -915,5 +934,42 @@ mod tests {
         let summary = run_summary("completed", 3, Some(&"x".repeat(1_000)));
         assert!(summary.chars().count() <= 300);
         assert!(summary.contains("Run #3 completed"));
+    }
+
+    #[test]
+    fn display_names_are_json_byte_bounded_for_multibyte_inputs() {
+        let giant_project = "プロジェクト🚀".repeat(50_000);
+        let bounded = bound_display_name(&giant_project).expect("non-empty display name");
+        let encoded_len = serde_json::to_string(&bounded).unwrap().len();
+        assert!(encoded_len <= WEBHOOK_DISPLAY_NAME_JSON_BYTES);
+        assert!(bounded.ends_with("..."));
+
+        let giant_error = "失敗詳細🔥".repeat(50_000);
+        let bounded_error = bound_json_text(&giant_error, WEBHOOK_ERROR_JSON_BYTES);
+        let envelope = json!({
+            "eventId": "evt_t3_env_run_abcdef1234_failed",
+            "name": "t3.run.failed",
+            "timestamp": "2026-11-16T01:00:00.000Z",
+            "data": {
+                "environment_id": "env-1",
+                "project_id": "p1",
+                "thread_id": "t1",
+                "run_id": "r1",
+                "summary": bound_json_text(&giant_project, WEBHOOK_SUMMARY_JSON_BYTES),
+                "error": bounded_error,
+                "project_name": &bounded,
+                "thread_title": &bounded,
+                "title": run_event_title(&bounded, 1, "failed", Some(&bounded)),
+                "severity": "high",
+                "requires_action": true,
+                "error_excerpt": bounded_excerpt(&bounded_error, DEFAULT_ERROR_EXCERPT_MAX_CHARS),
+            },
+            "cursor": Value::Null,
+        });
+        let wire_bytes = serde_json::to_vec(&envelope).unwrap().len();
+        assert!(
+            wire_bytes <= MAX_WEBHOOK_BODY_BYTES,
+            "envelope exceeded {MAX_WEBHOOK_BODY_BYTES}: {wire_bytes}"
+        );
     }
 }

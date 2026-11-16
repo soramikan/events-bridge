@@ -1038,3 +1038,206 @@ fn enriched_payload_fields_resolve_names_and_bound_error_excerpts() {
     assert_eq!(payload["severity"], "high");
     assert_eq!(payload["requires_action"], true);
 }
+
+#[test]
+fn enrichment_falls_back_to_t3_source_when_bridge_titles_are_missing_or_empty() {
+    let mut fixture = Fixture::new();
+    fixture.seed_project_thread();
+    // Also add a project/thread whose titles live only in `orchestration_events`
+    // (absent from projection tables and bridge materialized rows).
+    fixture.insert_event(
+        "project.created",
+        "p-log",
+        json!({
+            "projectId": "p-log",
+            "title": "Log-only project",
+            "workspaceRoot": "/repo/log-only",
+            "createdAt": "2026-11-16T01:05:00.000Z",
+            "updatedAt": "2026-11-16T01:05:00.000Z"
+        }),
+    );
+    fixture.insert_event(
+        "thread.created",
+        "t-log",
+        json!({
+            "id": "t-log",
+            "projectId": "p-log",
+            "title": "Log-only thread",
+            "branch": "main",
+            "createdAt": "2026-11-16T01:05:01.000Z",
+            "updatedAt": "2026-11-16T01:05:01.000Z"
+        }),
+    );
+
+    let dir = TempDir::new().unwrap();
+    let bridge_db = dir.path().join("bridge.db");
+    let repo = Arc::new(Repository::open(&bridge_db).unwrap());
+    let collector = T3Collector::new(
+        T3CollectorSettings::for_tests(fixture.path(), ENV),
+        repo.clone(),
+        EventBus::new(),
+    )
+    .unwrap();
+
+    // Clear the bridge-side materialized titles to exercise the `T3Source`
+    // projection fallback (`p1`/`t1`) and event-log fallback (`p-log`/`t-log`).
+    let bridge_conn = Connection::open(&bridge_db).unwrap();
+    bridge_conn
+        .execute(
+            "UPDATE t3_projects SET title = '' WHERE project_id = 'p1'",
+            [],
+        )
+        .unwrap();
+    bridge_conn
+        .execute("DELETE FROM t3_threads WHERE thread_id = 't1'", [])
+        .unwrap();
+
+    fixture.insert_event(
+        "run.updated",
+        "t1",
+        json!({
+            "id": "run-proj-fallback", "threadId": "t1", "ordinal": 3, "status": "completed",
+            "requestedAt": "2026-11-16T06:00:00.000Z",
+            "completedAt": "2026-11-16T06:01:00.000Z"
+        }),
+    );
+    fixture.insert_event(
+        "run.updated",
+        "t-log",
+        json!({
+            "id": "run-log-fallback", "threadId": "t-log", "ordinal": 1, "status": "completed",
+            "requestedAt": "2026-11-16T06:02:00.000Z",
+            "completedAt": "2026-11-16T06:03:00.000Z"
+        }),
+    );
+    fixture.insert_event(
+        "runtime-request.updated",
+        "t1",
+        json!({
+            "id": "approval-fallback", "threadId": "t1", "runId": "run-proj-fallback",
+            "kind": "command", "status": "pending",
+            "createdAt": "2026-11-16T06:04:00.000Z",
+            "summary": "Check fallback"
+        }),
+    );
+
+    collector.collect_once().unwrap();
+
+    let completed = repo
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.run.completed".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(completed.len(), 2);
+    assert_eq!(completed[0].payload["project_name"], "Demo project");
+    assert_eq!(completed[0].payload["thread_title"], "Demo thread");
+    assert_eq!(
+        completed[0].payload["title"],
+        "[Demo project] Run #3 completed: Demo thread"
+    );
+    assert_eq!(completed[1].payload["project_name"], "Log-only project");
+    assert_eq!(completed[1].payload["thread_title"], "Log-only thread");
+    assert_eq!(
+        completed[1].payload["title"],
+        "[Log-only project] Run #1 completed: Log-only thread"
+    );
+
+    let approvals = repo
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.approval.required".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].payload["project_name"], "Demo project");
+    assert_eq!(approvals[0].payload["thread_title"], "Demo thread");
+}
+
+#[test]
+fn oversized_multibyte_project_and_thread_titles_stay_under_webhook_limit() {
+    let mut fixture = Fixture::new();
+    let giant_project = "プロジェクト🚀\n".repeat(40_000);
+    let giant_thread = "スレッド🔥\t".repeat(40_000);
+    let giant_error = "致命的エラー💥\n".repeat(40_000);
+
+    fixture.insert_event(
+        "project.created",
+        "p-giant",
+        json!({
+            "projectId": "p-giant",
+            "title": giant_project,
+            "workspaceRoot": "/repo/giant",
+            "createdAt": "2026-11-16T01:00:00.000Z",
+            "updatedAt": "2026-11-16T01:00:00.000Z"
+        }),
+    );
+    fixture.insert_event(
+        "thread.created",
+        "t-giant",
+        json!({
+            "id": "t-giant",
+            "projectId": "p-giant",
+            "title": giant_thread,
+            "branch": "main",
+            "createdAt": "2026-11-16T01:00:01.000Z",
+            "updatedAt": "2026-11-16T01:00:01.000Z"
+        }),
+    );
+
+    let dir = TempDir::new().unwrap();
+    let repo = Arc::new(bridge_repo(&dir));
+    let collector = T3Collector::new(
+        T3CollectorSettings::for_tests(fixture.path(), ENV),
+        repo.clone(),
+        EventBus::new(),
+    )
+    .unwrap();
+
+    fixture.insert_event(
+        "run.updated",
+        "t-giant",
+        json!({
+            "id": "run-giant",
+            "threadId": "t-giant",
+            "ordinal": 1,
+            "status": "failed",
+            "requestedAt": "2026-11-16T05:00:00.000Z",
+            "completedAt": "2026-11-16T05:01:00.000Z",
+            "error": giant_error
+        }),
+    );
+    collector.collect_once().unwrap();
+
+    let failed = repo
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.run.failed".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    let event = &failed[0];
+    let project_name = event.payload["project_name"].as_str().unwrap();
+    let thread_title = event.payload["thread_title"].as_str().unwrap();
+    assert!(serde_json::to_string(project_name).unwrap().len() <= 1024);
+    assert!(serde_json::to_string(thread_title).unwrap().len() <= 1024);
+    assert!(project_name.ends_with("..."));
+    assert!(thread_title.ends_with("..."));
+
+    let wire = serde_json::to_vec(
+        &events_bridge::event::EventEnvelope {
+            event,
+            cursor: None,
+        }
+        .to_json(),
+    )
+    .unwrap();
+    assert!(
+        wire.len() <= events_bridge::config::MAX_WEBHOOK_BODY_BYTES,
+        "wire size {} exceeded limit",
+        wire.len()
+    );
+}
