@@ -2134,3 +2134,63 @@ async fn body_size_limit_is_enforced_at_the_256_kib_boundary() {
         "failed"
     );
 }
+
+#[tokio::test]
+async fn legacy_minimal_payload_still_validates_and_delivers() {
+    let temp = TempDir::new().unwrap();
+    let receiver = MockReceiver::start(Behavior::Success).await;
+    let hub = RunningHub::start(temporary_database(&temp), CallbackPolicy::for_tests(), true).await;
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let response = subscribe(
+        &mut client,
+        "/hook",
+        "t3.run.failed",
+        json!({"environment_id": "linux-main"}),
+        &receiver,
+    )
+    .await;
+    let subscription = rpc_result(response);
+    assert!(subscription["id"].as_str().unwrap().starts_with("sub_"));
+
+    // Deliberately omit every optional enrichment field.
+    let payload = json!({
+        "environment_id": "linux-main",
+        "project_id": "lnako",
+        "thread_id": "thread-42",
+        "run_id": "run-legacy",
+        "summary": "failed",
+        "error": "boom"
+    });
+    events_bridge::mcp::event_catalog::validate_payload("t3.run.failed", &payload)
+        .expect("legacy payload validates");
+    let outcome = hub
+        .hub
+        .ingest_event(NewEvent {
+            id: Some("evt_legacy_failed".into()),
+            source: None,
+            kind: "t3.run.failed".into(),
+            payload,
+            occurred_at: Some("2026-11-16T01:00:00Z".into()),
+        })
+        .unwrap();
+    assert_eq!(outcome.deliveries_created, 1);
+
+    let records = receiver.shared_state();
+    wait_until("legacy event delivery", || {
+        records.records.lock().unwrap().iter().any(Record::is_event)
+    })
+    .await;
+    let event = receiver
+        .event_records()
+        .into_iter()
+        .find(Record::is_event)
+        .expect("event delivery");
+    assert!(event.signature_valid);
+    let body = event.json();
+    assert_eq!(body["eventId"], "evt_legacy_failed");
+    assert_eq!(body["data"]["error"], "boom");
+    assert!(body["data"].get("severity").is_none());
+    assert!(body["data"].get("title").is_none());
+}

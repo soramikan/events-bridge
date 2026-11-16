@@ -27,6 +27,8 @@ const MAX_ASSEMBLED_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
 const THREAD_COLUMNS: &str =
     "environment_id, thread_id, project_id, title, branch, deleted_at, updated_at";
+const PROJECT_COLUMNS: &str =
+    "environment_id, project_id, title, workspace_root, deleted_at, updated_at";
 const RUN_COLUMNS: &str = "environment_id, run_id, thread_id, project_id, ordinal, \
      provider_instance_id, status, last_turn_status, checkpoint_id, error, summary, \
      requested_at, started_at, completed_at, updated_at";
@@ -822,6 +824,22 @@ impl Repository {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Fetch a materialized project.
+    pub fn get_t3_project(
+        &self,
+        environment_id: &str,
+        project_id: &str,
+    ) -> Result<Option<T3Project>> {
+        let sql = format!(
+            "SELECT {PROJECT_COLUMNS} FROM t3_projects \
+             WHERE environment_id = ?1 AND project_id = ?2"
+        );
+        Ok(self
+            .lock_connection()
+            .query_row(&sql, params![environment_id, project_id], map_project)
+            .optional()?)
+    }
+
     /// Fetch a materialized thread.
     pub fn get_t3_thread(&self, environment_id: &str, thread_id: &str) -> Result<Option<T3Thread>> {
         let sql = format!(
@@ -1186,6 +1204,17 @@ fn set_cursor(tx: &rusqlite::Transaction<'_>, environment_id: &str, sequence: i6
         params![T3_COLLECTOR, environment_id, cursor, now],
     )?;
     Ok(())
+}
+
+fn map_project(row: &Row<'_>) -> rusqlite::Result<T3Project> {
+    Ok(T3Project {
+        environment_id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        workspace_root: row.get(3)?,
+        deleted_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
 }
 
 fn map_thread(row: &Row<'_>) -> rusqlite::Result<T3Thread> {

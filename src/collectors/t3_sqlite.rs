@@ -45,6 +45,8 @@ pub struct T3CollectorSettings {
     pub watch_wal: bool,
     /// Upstream events per query.
     pub batch_size: usize,
+    /// Maximum characters kept in `error_excerpt` payloads.
+    pub error_excerpt_max_chars: usize,
 }
 
 impl T3CollectorSettings {
@@ -53,7 +55,7 @@ impl T3CollectorSettings {
         let t3 = &config.collectors.t3;
         let state_db_path = resolve_state_db_path(t3)?;
         let environment_id = resolve_environment_id(t3, &state_db_path)?;
-        Self::from_parts(t3, state_db_path, environment_id)
+        Self::from_parts(t3, &config.payload, state_db_path, environment_id)
     }
 
     /// Resolve settings, falling back to the OS host name when no environment
@@ -101,11 +103,12 @@ impl T3CollectorSettings {
                 hostname
             }
         };
-        Self::from_parts(t3, state_db_path, environment_id)
+        Self::from_parts(t3, &config.payload, state_db_path, environment_id)
     }
 
     fn from_parts(
         t3: &crate::config::T3CollectorConfig,
+        payload: &crate::config::PayloadConfig,
         state_db_path: PathBuf,
         environment_id: String,
     ) -> Result<Self> {
@@ -123,6 +126,7 @@ impl T3CollectorSettings {
             poll_interval: Duration::from_millis(t3.poll_interval_ms.max(1)),
             watch_wal: t3.watch_wal,
             batch_size: t3.batch_size.max(1),
+            error_excerpt_max_chars: payload.error_excerpt_max_chars.max(1),
         })
     }
 
@@ -136,6 +140,7 @@ impl T3CollectorSettings {
             poll_interval: Duration::from_millis(250),
             watch_wal: false,
             batch_size: 100,
+            error_excerpt_max_chars: super::t3_state::DEFAULT_ERROR_EXCERPT_MAX_CHARS,
         }
     }
 
@@ -340,7 +345,8 @@ impl T3Collector {
                     &self.repo,
                     source,
                     self.settings.web_base_url.as_ref(),
-                );
+                )
+                .with_error_excerpt_max_chars(self.settings.error_excerpt_max_chars);
                 let outcome = match reducer.process(&event) {
                     Ok(outcome) => outcome,
                     Err(error) => {

@@ -63,6 +63,15 @@ poll_interval_ms = 5000
 [logging]
 level = "info,events_bridge=debug"
 
+# Derived event payload shaping (Phase B6).
+#
+# Collectors add optional convenience fields (`title`, `project_name`,
+# `thread_title`, `severity`, `requires_action`, `error_excerpt`) without
+# making them required, so payloads that omit them remain valid.
+# [payload]
+# Maximum characters kept in `error_excerpt` (must be > 0).
+# error_excerpt_max_chars = 500
+
 # T3 Code Collector (Phase 2).
 #
 # The collector opens T3 Code's state database read-only. It needs no token:

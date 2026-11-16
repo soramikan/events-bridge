@@ -916,3 +916,125 @@ fn oversized_approval_summary_is_bounded_for_webhook_delivery() {
     assert_eq!(approvals.len(), 1);
     assert!(approvals[0].summary.as_deref().unwrap().ends_with("tail"));
 }
+
+#[test]
+fn enriched_payload_fields_resolve_names_and_bound_error_excerpts() {
+    let mut fixture = Fixture::new();
+    fixture.seed_project_thread();
+    let dir = TempDir::new().unwrap();
+    let repo = Arc::new(bridge_repo(&dir));
+    let mut settings = T3CollectorSettings::for_tests(fixture.path(), ENV);
+    settings.error_excerpt_max_chars = 20;
+    let collector = T3Collector::new(settings, repo.clone(), EventBus::new()).unwrap();
+
+    fixture.insert_event(
+        "run.created",
+        "t1",
+        json!({
+            "id": "run-ok", "threadId": "t1", "ordinal": 1, "status": "running",
+            "requestedAt": "2026-11-16T05:00:00.000Z"
+        }),
+    );
+    fixture.insert_event(
+        "run.updated",
+        "t1",
+        json!({
+            "id": "run-ok", "threadId": "t1", "ordinal": 1, "status": "completed",
+            "requestedAt": "2026-11-16T05:00:00.000Z",
+            "completedAt": "2026-11-16T05:01:00.000Z"
+        }),
+    );
+    let long_error = format!(
+        "Provider error\nno API key for the selected provider route\n{}",
+        "detail ".repeat(20)
+    );
+    fixture.insert_event(
+        "run.created",
+        "t1",
+        json!({
+            "id": "run-bad", "threadId": "t1", "ordinal": 2, "status": "running",
+            "requestedAt": "2026-11-16T05:02:00.000Z"
+        }),
+    );
+    fixture.insert_event(
+        "run.updated",
+        "t1",
+        json!({
+            "id": "run-bad", "threadId": "t1", "ordinal": 2, "status": "failed",
+            "requestedAt": "2026-11-16T05:02:00.000Z",
+            "completedAt": "2026-11-16T05:03:00.000Z",
+            "error": long_error
+        }),
+    );
+    fixture.insert_event(
+        "runtime-request.updated",
+        "t1",
+        json!({
+            "id": "approval-enriched", "threadId": "t1", "runId": "run-bad",
+            "kind": "command", "status": "pending",
+            "createdAt": "2026-11-16T05:04:00.000Z",
+            "summary": "Run a command\nwith approval"
+        }),
+    );
+
+    collector.collect_once().unwrap();
+
+    let completed = repo
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.run.completed".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    let payload = &completed[0].payload;
+    assert_eq!(
+        payload["title"],
+        "[Demo project] Run #1 completed: Demo thread"
+    );
+    assert_eq!(payload["project_name"], "Demo project");
+    assert_eq!(payload["thread_title"], "Demo thread");
+    assert_eq!(payload["severity"], "normal");
+    assert_eq!(payload["requires_action"], false);
+    assert!(payload.get("error_excerpt").is_none());
+
+    let failed = repo
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.run.failed".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    let payload = &failed[0].payload;
+    assert_eq!(
+        payload["title"],
+        "[Demo project] Run #2 failed: Demo thread"
+    );
+    assert_eq!(payload["project_name"], "Demo project");
+    assert_eq!(payload["thread_title"], "Demo thread");
+    assert_eq!(payload["severity"], "high");
+    assert_eq!(payload["requires_action"], true);
+    let excerpt = payload["error_excerpt"].as_str().unwrap();
+    assert!(excerpt.chars().count() <= 20, "{excerpt:?}");
+    assert!(excerpt.ends_with("..."), "{excerpt:?}");
+    assert!(!excerpt.contains('\n'), "{excerpt:?}");
+
+    let approvals = repo
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.approval.required".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(approvals.len(), 1);
+    let payload = &approvals[0].payload;
+    assert_eq!(
+        payload["title"],
+        "[Demo project] Approval required: Run a command with approval"
+    );
+    assert_eq!(payload["project_name"], "Demo project");
+    assert_eq!(payload["thread_title"], "Demo thread");
+    assert_eq!(payload["severity"], "high");
+    assert_eq!(payload["requires_action"], true);
+}
