@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn migrations_create_every_table() {
         let repo = repository();
-        assert_eq!(repo.schema_version().unwrap(), 5);
+        assert_eq!(repo.schema_version().unwrap(), 6);
         let conn = repo.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -1079,6 +1079,9 @@ mod tests {
             "github_deliveries",
             "github_pending_checks",
             "github_pull_requests",
+            "oauth_access_tokens",
+            "oauth_authorization_codes",
+            "oauth_refresh_tokens",
             "source_cursors",
             "subscriptions",
             "t3_approvals",

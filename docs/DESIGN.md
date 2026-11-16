@@ -326,6 +326,9 @@ HTTP /mcp
 | `collector_checkpoints` | GitHub ETag、T3 Code の取得位置 |
 | `acks` | オプションのユーザー確認履歴 |
 | `consumers` | ポーリング consumer の名前・カーソル・最終 poll/ack 時刻 |
+| `oauth_authorization_codes` | 認可コードの SHA-256 hash、client、scopes、PKCE challenge、TTL、使用時刻 |
+| `oauth_access_tokens` | アクセストークンの SHA-256 hash、client、scopes、family、TTL、失効時刻 |
+| `oauth_refresh_tokens` | リフレッシュトークンの SHA-256 hash、family、ローテーション元、TTL、使用・失効時刻 |
 
 `deliveries` は購読単位で `UNIQUE(subscription_id, event_id)` を持たせる。
 
@@ -356,9 +359,123 @@ OpenAI の Secure MCP Tunnel は、プライベートネットワーク内の HT
 
 代替は Cloudflare Tunnel（公開 HTTPS + OAuth 2.1 を適切に構成）。
 
-HTTP 公開する場合、単純な固定 Bearer トークンを ChatGPT に手入力して渡す設計は避ける。ユーザー認証には OAuth 2.1 が推奨される。推奨スコープは例えば `events.read`、`events.subscribe`、`events.ack`。
-
 Tailscale や Cloudflare Mesh は Edge Collector と Hub の内部通信には適しているが、それだけで ChatGPT クラウドからプライベートアドレスへ直接接続できるわけではない。
+
+### OAuth 2.1 認可サーバー（Phase C2）
+
+HTTP 公開時に固定 Bearer トークンを ChatGPT へ手入力する構成は避ける。Phase C2 では Hub 自身が OAuth 2.1 の認可サーバー兼リソースサーバーとして動作する。認可コードフローは **PKCE S256 必須**で、`code_challenge_method=plain` や PKCE なしの要求は認可しない。
+
+#### ディスカバリ
+
+| エンドポイント | 仕様 | 内容 |
+| --- | --- | --- |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 | `issuer`、認可・トークン・失効エンドポイント、対応 grant、`S256`、スコープ、クライアント認証方式 |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 | `resource`、`authorization_servers`、`scopes_supported`、`bearer_methods_supported` |
+
+`issuer` は `[oauth].issuer` の値（末尾 `/` を正規化）を使う。401 の `WWW-Authenticate` は OAuth 有効時に次の形で保護リソースメタデータを案内する。
+
+```text
+WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource"
+```
+
+#### 認可と同意
+
+`GET /oauth/authorize` は次を検証して同意画面を返す。
+
+- `response_type=code`
+- 登録済み `client_id`
+- 登録値と**完全一致**する `redirect_uri`
+- `code_challenge_method=S256` と 43 文字の base64url S256 challenge
+- クライアントに許可された `scope` の部分集合
+- 任意の `state` / `resource`
+
+`client_id` が不明、または `redirect_uri` が未登録の場合は**リダイレクトせず 400**を返す。オープンリダイレクトにしないための境界である。
+
+同意画面は次の防御を持つ。
+
+- `HttpOnly; SameSite=Lax; Path=/oauth/authorize` の CSRF cookie と hidden field の double-submit
+- `[oauth].admin_secret_env` が指す管理者承認 secret（定時間比較）
+- `Cache-Control: no-store`、`X-Frame-Options: DENY`、`Content-Security-Policy`
+- 動的な client id・principal・redirect URI・state・scope はすべて HTML escape
+
+承認時は CSPRNG 256 bit の認可コードを発行し、`303 See Other` で `redirect_uri` へ `code` と `state` を返す。拒否時は同じく 303 で `error=access_denied` を返す。コードの TTL は `authorization_code_ttl_secs`（既定 300 秒）。
+
+#### トークン
+
+`POST /oauth/token` は `application/x-www-form-urlencoded` のみを受け付け、成功・失敗とも `Cache-Control: no-store` と `Pragma: no-cache` を返す。
+
+`grant_type=authorization_code`:
+
+- confidential client は Basic 認証または form の `client_secret`、public client は secret なし
+- `redirect_uri` は認可要求時と完全一致
+- `code_verifier` は `[A-Za-z0-9\-._~]{43,128}`
+- SHA-256(`code_verifier`) の base64url を定時間比較
+- コード消費は `used_at IS NULL` を条件にした単一 UPDATE で原子的に行う
+- 消費済みコードの再利用では、そのコードに紐づくトークン family 全体を失効させて 400 `invalid_grant`
+
+`grant_type=refresh_token`:
+
+- クライアント所有権を確認
+- リフレッシュトークンを原子的にローテーションし、`rotated_from_hash` を記録
+- ローテーション済み・失効済みトークンの再利用では family 全体を失効させて 400 `invalid_grant`
+- `scope` によるダウンスコープを許可し、元の grant を超える要求は `invalid_scope`
+
+#### 失効
+
+`POST /oauth/revoke`（RFC 7009）はクライアントを認証し、トークン所有権を確認して失効させる。リフレッシュトークンの失効は family 全体（アクセストークンを含む）に及ぶ。他クライアント所有のトークンや未知のトークンは存在を漏らさず HTTP 200 `{}` を返す。レスポンスは `Cache-Control: no-store`。
+
+#### 保存する情報
+
+`migrations/006_oauth.sql` は次のテーブルを作る。
+
+- `oauth_authorization_codes`
+- `oauth_access_tokens`
+- `oauth_refresh_tokens`
+
+SQLite に保存するのは認可コード・アクセストークン・リフレッシュトークンの **SHA-256 hex digest** のみである。`code_hash` / `token_hash` を主キーとし、raw secret は保存しない。`used_at`、`revoked_at`、`expires_at`、`rotated_from_hash`、`family_id` で再生・ローテーション・family 失効を判定する。
+
+#### スコープとエンドポイント対応
+
+| スコープ | HTTP | MCP |
+| --- | --- | --- |
+| `events.read` | `GET /consumers/{name}/probe`、`GET /consumers/{name}/poll` | `events/list`、`events/poll`（実装時）、`list_events`、`get_event`、`get_t3_run`、`get_t3_approvals`、`get_github_status`、`probe_consumer`、`poll_consumer_events` |
+| `events.subscribe` | — | `events/subscribe`、`events/unsubscribe` |
+| `events.ack` | `POST /consumers/{name}/ack` | `ack_events`、`ack_consumer_events` |
+
+`POST /mcp` では単一 JSON-RPC と batch array の両方について、rmcp へ転送する前に `tools/call` のツール名と `events/*` のメソッド名を検査する。不足時は 403 と次のヘッダを返す。
+
+```text
+WWW-Authenticate: Bearer error="insufficient_scope", scope="events.ack"
+```
+
+認証済み OAuth principal は HTTP request extension で rmcp の `RequestContext` に渡され、`ack_events` などの所有権判定に使う。stdio では従来どおり `[auth].principal` にフォールバックする。
+
+#### 静的 Bearer との共存
+
+`[auth].token_env` の静的トークンは引き続き利用できる。静的トークンは全スコープ（`events.read`、`events.subscribe`、`events.ack`）を持つ。OAuth と静的トークンは同時に有効化できる。
+
+`oauth.enabled = true` かつ `auth.token_env` が未設定の場合、`/mcp` と `/consumers/*` は**必ず OAuth Bearer を要求**し、未認証アクセスへフォールバックしない。OAuth も静的トークンも無効な場合だけ、従来の loopback / ローカル principal 動作になる。
+
+`GET /healthz`、`/.well-known/oauth-*`、`/oauth/*`、`/webhooks/github`、`/internal/edge/t3` はそれぞれの既存の扱いを維持する。`/oauth/*` と `/.well-known/*` にも Host allowlist 検証を適用し、`POST /oauth/authorize` は `Origin` がある場合に同一 origin / allowlist を要求する。
+
+#### 事前登録クライアントを選ぶ理由
+
+Phase C2 は Dynamic Client Registration（DCR）を公開しない。クライアントは `[[oauth.clients]]` に事前登録する。
+
+- 管理者承認 secret と組み合わせて、誰が consent を承認できるかを運用側で固定できる
+- redirect URI の allowlist を設定ファイルでレビューできる
+- 公開 DCR が持つ client registration の abuse・掃除・信頼境界の問題を避けられる
+- principal を client ごとに固定でき、ack の所有権を安定させられる
+
+#### 静的 Bearer から OAuth 2.1 への移行
+
+1. `[oauth]` を有効化し、`issuer`（公開 HTTPS URL）と `admin_secret_env` を設定する。
+2. `[[oauth.clients]]` に MCP クライアントを登録する。confidential client は `client_secret_env`、public client は省略する。`redirect_uris` は完全一致で登録する。
+3. クライアントの `scopes` を最小権限で設定する。読み取りだけなら `events.read`、承認操作が必要なら `events.ack` を追加する。
+4. `auth.token_env` を残したまま OAuth を併用し、クライアントを OAuth フローへ切り替える。この間、静的トークンは全スコープで動作する。
+5. すべてのクライアントが OAuth に移行したら `auth.token_env` を削除し、Hub を再起動する。以後 `/mcp` と `/consumers/*` は OAuth 必須になる。
+6. `client_secret_env` と `admin_secret_env` の実値は環境変数または secret manager に置き、設定ファイルやリポジトリへ書かない。
+7. DB にはハッシュだけが残る。既存の静的トークン文字列を DB へ移す必要はない。
 
 ## 8. dots の通知とステータス表示の扱い
 

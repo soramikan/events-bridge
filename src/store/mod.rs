@@ -3,6 +3,7 @@
 pub mod consumers;
 pub mod github;
 pub mod migrations;
+pub mod oauth;
 pub mod repository;
 pub mod t3;
 
@@ -15,6 +16,10 @@ pub use github::{
     GitHubPendingCheck, GitHubPendingCheckResolution, GitHubPendingCheckUpdate, GitHubPollChanges,
     GitHubPollCommit, GitHubPollContinuation, GitHubPullRequest, GitHubStatus, GitHubStatusQuery,
     GitHubWebhookChanges, pulls_scope, runs_scope,
+};
+pub use oauth::{
+    AccessTokenRecord, AuthorizationCodeRecord, ConsumeCodeOutcome, NewAccessToken,
+    NewAuthorizationCode, NewRefreshToken, OAuthStore, RefreshTokenRecord, RotateRefreshOutcome,
 };
 pub use repository::{
     AttemptOutcome, DueDelivery, EdgeNonceStatus, Event, EventQuery, IngestOutcome, NewEvent,
