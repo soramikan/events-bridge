@@ -2366,11 +2366,21 @@ async fn consumer_mcp_tools_round_trip_without_touching_ack_events() {
         .await;
     assert_eq!(all["isError"], false, "{all}");
     let events = all["structuredContent"]["events"].as_array().unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert_eq!(events[0]["name"], "t3.run.failed");
     assert_eq!(events[0]["disposition"], "immediate");
-    assert_eq!(events[1]["name"], "t3.run.completed");
-    assert_eq!(events[1]["disposition"], "digest");
+    assert_eq!(all["structuredContent"]["nextCursorSequence"], 2);
+    assert_eq!(all["structuredContent"]["hasMore"], false);
+    assert_eq!(all["structuredContent"]["truncated"], false);
+    let digests = all["structuredContent"]["digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0]["count"], 1);
+    assert_eq!(digests[0]["maxSequence"], 2);
+    assert_eq!(digests[0]["eventIds"], json!(["evt_consumer_completed"]));
+    assert_eq!(digests[0]["eventIdsTruncated"], false);
+    assert_eq!(digests[0]["countsByKind"]["t3.run.completed"], 1);
+    assert!(digests[0]["windowStart"].as_str().unwrap().ends_with('Z'));
+    assert!(digests[0]["windowEnd"].as_str().unwrap().ends_with('Z'));
 
     // Polling did not advance the cursor.
     assert_eq!(all["structuredContent"]["cursorSequence"], 0);
@@ -2433,4 +2443,98 @@ async fn consumer_mcp_tools_round_trip_without_touching_ack_events() {
         )
         .await;
     assert_eq!(missing_ack["isError"], true, "{missing_ack}");
+}
+
+#[tokio::test]
+async fn consumer_mcp_poll_summarizes_digest_backlog_without_dropping_immediate_events() {
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(
+        temporary_database(&temp),
+        CallbackPolicy::for_tests(),
+        false,
+    )
+    .await;
+
+    // Three digest events share the 01:00-01:10 UTC window. The immediate event
+    // comes last, so a limit of one would previously have hidden the backlog.
+    for (index, occurred_at) in [
+        "2026-11-16T01:00:00.000Z",
+        "2026-11-16T01:05:00.000Z",
+        "2026-11-16T01:09:59.000Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        hub.hub
+            .ingest_event(NewEvent {
+                id: Some(format!("evt_digest_{index}")),
+                source: None,
+                kind: "t3.run.completed".into(),
+                payload: t3_completed_payload(),
+                occurred_at: Some((*occurred_at).into()),
+            })
+            .unwrap();
+    }
+    hub.hub
+        .ingest_event(NewEvent {
+            id: Some("evt_immediate".into()),
+            source: None,
+            kind: "t3.run.failed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": "run-102",
+                "summary": "failed",
+                "error": "boom"
+            }),
+            occurred_at: Some("2026-11-16T01:06:00.000Z".into()),
+        })
+        .unwrap();
+
+    let mut client = hub.client();
+    client.initialize().await;
+
+    let poll = client
+        .tool_call(
+            "poll_consumer_events",
+            json!({"consumer": "muse", "limit": 1}),
+        )
+        .await;
+    assert_eq!(poll["isError"], false, "{poll}");
+    let content = &poll["structuredContent"];
+
+    let events = content["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["eventId"], "evt_immediate");
+    assert_eq!(events[0]["disposition"], "immediate");
+
+    let digests = content["digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0]["count"], 3);
+    assert_eq!(digests[0]["countsByKind"]["t3.run.completed"], 3);
+    assert_eq!(digests[0]["maxSequence"], 3);
+    assert_eq!(digests[0]["windowStart"], "2026-11-16T01:00:00Z");
+    assert_eq!(digests[0]["windowEnd"], "2026-11-16T01:10:00Z");
+    assert_eq!(
+        digests[0]["eventIds"],
+        json!(["evt_digest_0", "evt_digest_1", "evt_digest_2"])
+    );
+
+    assert_eq!(content["truncated"], true);
+    assert_eq!(content["hasMore"], false);
+    assert_eq!(content["nextCursorSequence"], 4);
+
+    let ack = client
+        .tool_call(
+            "ack_consumer_events",
+            json!({"consumer": "muse", "upToSequence": 4}),
+        )
+        .await;
+    assert_eq!(ack["isError"], false, "{ack}");
+
+    let probe = client
+        .tool_call("probe_consumer", json!({"consumer": "muse"}))
+        .await;
+    assert_eq!(probe["structuredContent"]["unreadCount"], 0);
 }

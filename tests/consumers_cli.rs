@@ -104,17 +104,22 @@ fn cli_probe_poll_and_ack_emit_stdout_json() {
     assert_eq!(poll["nextCursorSequence"], 2);
     assert_eq!(poll["hasMore"], false);
     assert_eq!(poll["truncated"], false);
-    assert_eq!(poll["digests"], json!([]));
     let events = poll["events"].as_array().unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert_eq!(events[0]["eventId"], "evt_cli_failed");
     assert_eq!(events[0]["disposition"], "immediate");
-    assert_eq!(events[1]["eventId"], "evt_cli_review");
-    assert_eq!(events[1]["disposition"], "digest");
+    let digests = poll["digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0]["count"], 1);
+    assert_eq!(digests[0]["maxSequence"], 2);
+    assert_eq!(digests[0]["countsByKind"]["github.review.requested"], 1);
+    assert_eq!(digests[0]["eventIds"], json!(["evt_cli_review"]));
+    assert_eq!(digests[0]["eventIdsTruncated"], false);
 
     // Polling is at-least-once: a second poll without an ack repeats events.
     let repeated = stdout_json(&run(&["poll", "--consumer", "muse", "--db", db]));
     assert_eq!(repeated["events"], poll["events"]);
+    assert_eq!(repeated["digests"], poll["digests"]);
     assert_eq!(repeated["cursorSequence"], 0);
 
     let limited = stdout_json(&run(&[
@@ -127,6 +132,7 @@ fn cli_probe_poll_and_ack_emit_stdout_json() {
         "1",
     ]));
     assert_eq!(limited["events"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["digests"], json!([]));
     assert_eq!(limited["hasMore"], true);
     assert_eq!(limited["nextCursorSequence"], 1);
 
@@ -260,4 +266,102 @@ fn cli_rejects_conflicting_poll_flags() {
         "{}",
         String::from_utf8_lossy(&ack_with_limit.stderr)
     );
+}
+
+fn seed_digest_backlog(path: &Path) {
+    let repo = Repository::open(path).expect("open seed database");
+    for index in 0..5 {
+        repo.ingest_event(NewEvent {
+            id: Some(format!("evt_digest_{index}")),
+            source: None,
+            kind: "t3.run.completed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": format!("run-{index}"),
+                "summary": "done"
+            }),
+            occurred_at: Some(format!("2026-11-16T01:0{index}:00.000Z")),
+        })
+        .unwrap();
+    }
+    repo.ingest_event(NewEvent {
+        id: Some("evt_immediate".into()),
+        source: None,
+        kind: "t3.run.failed".into(),
+        payload: json!({
+            "environment_id": "linux-main",
+            "project_id": "lnako",
+            "thread_id": "thread-42",
+            "run_id": "run-immediate",
+            "summary": "failed",
+            "error": "boom"
+        }),
+        occurred_at: Some("2026-11-16T01:06:00.000Z".into()),
+    })
+    .unwrap();
+}
+
+#[test]
+fn cli_summarizes_digest_backlog_and_never_drops_immediate_events() {
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("events.db");
+    seed_digest_backlog(&db);
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[database]\npath = {db:?}\n\
+             [consumers.muse]\nmax_events_per_poll = 1\n\
+             digest_window_secs = 600\nmax_digest_event_ids = 2\n",
+            db = db.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+
+    let poll = stdout_json(&run(&["poll", "--consumer", "muse", "--config", config]));
+    assert_eq!(poll["nextCursorSequence"], 6);
+    assert_eq!(poll["hasMore"], false);
+    assert_eq!(poll["truncated"], true);
+
+    let events = poll["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["eventId"], "evt_immediate");
+    assert_eq!(events[0]["disposition"], "immediate");
+
+    let digests = poll["digests"].as_array().unwrap();
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0]["count"], 5);
+    assert_eq!(digests[0]["countsByKind"]["t3.run.completed"], 5);
+    assert_eq!(digests[0]["maxSequence"], 5);
+    assert_eq!(
+        digests[0]["eventIds"],
+        json!(["evt_digest_0", "evt_digest_1"])
+    );
+    assert_eq!(digests[0]["eventIdsTruncated"], true);
+
+    let ack = stdout_json(&run(&[
+        "poll",
+        "--consumer",
+        "muse",
+        "--config",
+        config,
+        "--ack",
+        "6",
+    ]));
+    assert_eq!(ack["previousCursorSequence"], 0);
+    assert_eq!(ack["cursorSequence"], 6);
+
+    let probe = stdout_json(&run(&[
+        "poll",
+        "--consumer",
+        "muse",
+        "--config",
+        config,
+        "--probe",
+    ]));
+    assert_eq!(probe["unreadCount"], 0);
+    assert_eq!(probe["hasUpdates"], false);
 }

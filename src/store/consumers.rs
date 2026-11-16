@@ -102,15 +102,24 @@ fn load_consumer(conn: &Connection, name: &str) -> rusqlite::Result<Option<Consu
     conn.query_row(&sql, params![name], map_consumer).optional()
 }
 
-/// Build the shared `sequence > cursor` event restriction.
+/// Build the shared `cursor < sequence <= through` event restriction.
+///
+/// `through_sequence` is inclusive and omitted when the caller wants every
+/// unread event. Digest aggregation uses it to summarize only the events a
+/// cursor acknowledgement will actually cover.
 fn consumer_event_sql(
     projection: &str,
     after_sequence: i64,
+    through_sequence: Option<i64>,
     kinds: &[String],
     filters: &ConsumerEventFilter<'_>,
 ) -> (String, Vec<SqlValue>) {
     let mut sql = format!("SELECT {projection} FROM events WHERE sequence > ?");
     let mut args = vec![SqlValue::Integer(after_sequence)];
+    if let Some(through_sequence) = through_sequence {
+        sql.push_str(" AND sequence <= ?");
+        args.push(SqlValue::Integer(through_sequence));
+    }
 
     let placeholders = vec!["?"; kinds.len()].join(", ");
     sql.push_str(&format!(" AND kind IN ({placeholders})"));
@@ -147,7 +156,7 @@ fn read_probe_snapshot(
     let unread_count = if kinds.is_empty() {
         0
     } else {
-        let (sql, args) = consumer_event_sql("COUNT(*)", cursor_sequence, kinds, filters);
+        let (sql, args) = consumer_event_sql("COUNT(*)", cursor_sequence, None, kinds, filters);
         let mut stmt = tx.prepare(&sql)?;
         stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?
     };
@@ -214,10 +223,25 @@ impl Repository {
         kinds: &[String],
         filters: &ConsumerEventFilter<'_>,
     ) -> Result<i64> {
+        self.count_consumer_events_in_range(after_sequence, None, kinds, filters)
+    }
+
+    /// Count events in `(after_sequence, through_sequence]` whose name is in
+    /// `kinds` and whose payload matches every non-empty filter.
+    ///
+    /// A `None` upper bound means "all unread events".
+    pub fn count_consumer_events_in_range(
+        &self,
+        after_sequence: i64,
+        through_sequence: Option<i64>,
+        kinds: &[String],
+        filters: &ConsumerEventFilter<'_>,
+    ) -> Result<i64> {
         if kinds.is_empty() {
             return Ok(0);
         }
-        let (sql, args) = consumer_event_sql("COUNT(*)", after_sequence, kinds, filters);
+        let (sql, args) =
+            consumer_event_sql("COUNT(*)", after_sequence, through_sequence, kinds, filters);
         let conn = self.lock_connection();
         let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_row(rusqlite::params_from_iter(args.iter()), |row| row.get(0))?)
@@ -270,10 +294,31 @@ impl Repository {
         filters: &ConsumerEventFilter<'_>,
         limit: usize,
     ) -> Result<Vec<Event>> {
+        self.list_consumer_events_in_range(after_sequence, None, kinds, filters, limit)
+    }
+
+    /// Select events in `(after_sequence, through_sequence]` in ascending
+    /// sequence order.
+    ///
+    /// A `None` upper bound means "all unread events".
+    pub fn list_consumer_events_in_range(
+        &self,
+        after_sequence: i64,
+        through_sequence: Option<i64>,
+        kinds: &[String],
+        filters: &ConsumerEventFilter<'_>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
         if kinds.is_empty() {
             return Ok(Vec::new());
         }
-        let (mut sql, mut args) = consumer_event_sql(EVENT_COLUMNS, after_sequence, kinds, filters);
+        let (mut sql, mut args) = consumer_event_sql(
+            EVENT_COLUMNS,
+            after_sequence,
+            through_sequence,
+            kinds,
+            filters,
+        );
         sql.push_str(" ORDER BY sequence ASC LIMIT ?");
         args.push(SqlValue::Integer(limit.max(1) as i64));
 
@@ -341,5 +386,109 @@ impl Repository {
             cursor_sequence,
             advanced,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::NewEvent;
+    use serde_json::json;
+
+    fn repository() -> Repository {
+        Repository::open_in_memory().unwrap()
+    }
+
+    fn ingest(repo: &Repository, id: &str, kind: &str) {
+        repo.ingest_event(NewEvent {
+            id: Some(id.into()),
+            source: None,
+            kind: kind.into(),
+            payload: json!({"environment_id": "linux-main"}),
+            occurred_at: Some("2026-11-16T01:00:00.000Z".into()),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_queries_honor_the_inclusive_upper_bound_and_ordering() {
+        let repo = repository();
+        for (id, kind) in [
+            ("evt_1", "t3.run.failed"),
+            ("evt_2", "t3.run.completed"),
+            ("evt_3", "t3.run.completed"),
+        ] {
+            ingest(&repo, id, kind);
+        }
+        let kinds = vec!["t3.run.completed".to_string()];
+        let filters = ConsumerEventFilter::default();
+
+        let all = repo
+            .list_consumer_events_in_range(0, None, &kinds, &filters, 10)
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["evt_2", "evt_3"]
+        );
+
+        let bounded = repo
+            .list_consumer_events_in_range(0, Some(2), &kinds, &filters, 10)
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].id, "evt_2");
+
+        let after = repo
+            .list_consumer_events_in_range(1, Some(3), &kinds, &filters, 10)
+            .unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["evt_2", "evt_3"]
+        );
+    }
+
+    #[test]
+    fn range_counts_are_bounded_and_kind_scoped() {
+        let repo = repository();
+        for (id, kind) in [
+            ("evt_1", "t3.run.failed"),
+            ("evt_2", "t3.run.completed"),
+            ("evt_3", "t3.run.completed"),
+        ] {
+            ingest(&repo, id, kind);
+        }
+        let filters = ConsumerEventFilter::default();
+        let immediate = vec!["t3.run.failed".to_string()];
+        let digest = vec!["t3.run.completed".to_string()];
+
+        assert_eq!(
+            repo.count_consumer_events_in_range(0, None, &digest, &filters)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            repo.count_consumer_events_in_range(0, Some(2), &digest, &filters)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            repo.count_consumer_events_in_range(0, None, &immediate, &filters)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            repo.count_consumer_events_in_range(3, None, &immediate, &filters)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.count_consumer_events_in_range(0, None, &[], &filters)
+                .unwrap(),
+            0
+        );
     }
 }

@@ -387,7 +387,7 @@ dots への監視指示の例:
 
 実機検証では Webhook の HTTP `2xx` だけでなく、実際の dots タスクが起動し、指定された内容がユーザーに提示されるまで確認する。
 
-## 10. Muse ポーリングコンシューマー（Phase A: A1/A2/A3）
+## 10. Muse ポーリングコンシューマー（Phase A / A2）
 
 ChatGPT の MCP Events 購読は「クライアントが URL と秘密鍵を登録し、サーバーが署名付き Webhook を push する」方式である。これに対して Muse などの常駐クライアントは、SSH 越しの CLI や cron/hook から**サーバー側カーソルを poll/ack する pull 方式**の方が扱いやすい。Phase A ではこの pull 経路を `consumers` として追加する。
 
@@ -427,8 +427,8 @@ CREATE TABLE consumers (
 
 `[consumers.<name>]` でイベント名ごとの扱いを定義する。
 
-- `immediate`: 即時通知対象。`probe` の unread に数え、`poll` で返す。
-- `digest`: 集約対象。Phase A では `poll.events` に `"disposition": "digest"` として返し、`digests` は空配列を返す（A2 で集約を実装）。
+- `immediate`: 即時通知対象。`probe` の unread に数え、`poll.events` に 1 件ずつ返す。
+- `digest`: 集約対象。`poll.digests` に時間ウィンドウ単位の要約として返す（A4）。
 - `off`: `probe`・`poll` の両方から除外する。
 
 未指定イベントの扱いは `default_disposition`（既定 `off`）。`filters` は `environment_ids` / `project_ids` / `repositories` の allowlist で、空配列は制限なしを意味する。イベント payload に対応するキーがない場合は不一致として除外する。
@@ -480,6 +480,43 @@ POST /consumers/{name}/ack   {"upToSequence": 123}
 ### 10.5 2段階チェック
 
 高頻度の hook/cron では、まず `probe` だけを呼ぶ。`hasUpdates` / `unreadCount` が 0 なら本文取得も ack も行わない。更新がある場合だけ `poll` し、処理完了後に返却された `nextCursorSequence` で `ack` する。poll と ack の間にプロセスが落ちても、カーソルは進んでいないためイベントは再返却される（at-least-once）。
+
+### 10.6 digest 集約（A4）
+
+`digest` disposition のイベントは `poll.events` に混ぜず、`poll.digests` に時間ウィンドウ単位で集約する。
+
+- ウィンドウは `occurred_at` を `chrono::DateTime::parse_from_rfc3339` で解釈し、`digest_window_secs`（既定 `600` 秒）で floor する。
+  `window_start_epoch = timestamp - timestamp.rem_euclid(window_secs)`、`windowEnd = windowStart + window_secs`。
+- `windowStart` / `windowEnd` は RFC 3339 UTC（例 `2026-11-16T01:00:00Z`）で、半開区間 `[windowStart, windowEnd)` を表す。
+- `digests` は `windowStart` の昇順。1 エントリは次の形。
+
+```json
+{
+  "windowStart": "2026-11-16T01:00:00Z",
+  "windowEnd": "2026-11-16T01:10:00Z",
+  "count": 3,
+  "countsByKind": { "t3.run.completed": 2, "github.review.requested": 1 },
+  "eventIds": ["evt_...", "evt_...", "evt_..."],
+  "eventIdsTruncated": false,
+  "maxSequence": 42
+}
+```
+
+- `count` はウィンドウ内の digest イベント総数、`countsByKind` はイベント種別ごとの件数、`maxSequence` はウィンドウ内の最大 sequence。
+- `eventIds` は昇順 sequence の先頭から `max_digest_event_ids`（既定 `50`）件まで。`count` がそれを超える場合は `eventIdsTruncated: true`。
+- `nextCursorSequence` は `events` と `digests` の両方がカバーする最大 sequence。したがって `ack(nextCursorSequence)` は immediate と集約済み digest の両方を前進させる。
+
+### 10.7 catchup 制御（A5）
+
+`limit_override` があればそれを、なければ `max_events_per_poll` を使い、どちらも `1..=MAX_CONSUMER_POLL_LIMIT`（200）に clamp する。
+
+- **immediate は決して落とさない。** まず immediate イベントを `limit + 1` 件読み、`limit` 件まで返す。digest の backlog が大きくても immediate が後回しにされることはない。
+- immediate が `limit` 件に達したページでは、それ以降の digest は返さず `hasMore: true` とする。ただし、最後に返した immediate 以下の sequence にある digest は ack で飛ばさないよう、その範囲だけ要約に含める。
+- immediate が `limit` 件未満なら未読 immediate は全件含まれる。残り予算 `limit - immediate_count` に対して未読 digest を調べる。
+  - 未読 digest が残り予算以下: 全件をウィンドウ集約し、`truncated: false`、`hasMore: false`。
+  - 未読 digest が残り予算を超える: immediate を全件保持したまま digest を最大 `MAX_DIGEST_CATCHUP_EVENTS`（10,000）件まで走査して要約し、`truncated: true`。
+- digest の走査上限を超えた場合は `hasMore: true` とし、`nextCursorSequence` は返却済みの要約の最大 sequence に留める。未返却イベントを飛ばすことはない。
+- `truncated` は「limit 以外の理由で詳細を要約に落とした」ことを示し、`hasMore` は「未返却イベントが残っている」ことを示す。
 
 ## 最終推奨構成
 
