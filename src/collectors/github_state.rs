@@ -55,6 +55,12 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 /// Maximum serialized event payload size. The delivery ceiling is 256 KiB.
 const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 
+/// Default bound for `error_excerpt`, matching `[payload]` configuration.
+pub const DEFAULT_ERROR_EXCERPT_MAX_CHARS: usize = 500;
+
+/// Maximum characters in a one-line event `title`.
+const MAX_TITLE_CHARS: usize = 200;
+
 /// Whether a conclusion is a CI failure.
 pub fn is_failure_conclusion(conclusion: Option<&str>) -> bool {
     conclusion.is_some_and(|conclusion| FAILURE_CONCLUSIONS.contains(&conclusion))
@@ -70,13 +76,44 @@ pub fn normalize_webhook(
     delivery_id: &str,
     received_at: &str,
 ) -> Result<GitHubWebhookChanges> {
+    normalize_webhook_with_excerpt_max_chars(
+        conn,
+        event_type,
+        payload,
+        delivery_id,
+        received_at,
+        DEFAULT_ERROR_EXCERPT_MAX_CHARS,
+    )
+}
+
+/// Normalize one webhook delivery with a caller-selected excerpt bound.
+pub fn normalize_webhook_with_excerpt_max_chars(
+    conn: &Connection,
+    event_type: &str,
+    payload: &Value,
+    delivery_id: &str,
+    received_at: &str,
+    error_excerpt_max_chars: usize,
+) -> Result<GitHubWebhookChanges> {
     let Some(repository) = repository_full_name(payload) else {
         return Ok(GitHubWebhookChanges::default());
     };
     match event_type {
         "ping" => Ok(GitHubWebhookChanges::default()),
-        "workflow_run" => normalize_workflow_run(conn, payload, &repository, received_at),
-        "check_run" => normalize_check_run(conn, payload, &repository, received_at),
+        "workflow_run" => normalize_workflow_run(
+            conn,
+            payload,
+            &repository,
+            received_at,
+            error_excerpt_max_chars,
+        ),
+        "check_run" => normalize_check_run(
+            conn,
+            payload,
+            &repository,
+            received_at,
+            error_excerpt_max_chars,
+        ),
         "pull_request" => {
             normalize_pull_request(conn, payload, &repository, delivery_id, received_at)
         }
@@ -95,6 +132,7 @@ fn normalize_workflow_run(
     payload: &Value,
     repository: &str,
     received_at: &str,
+    error_excerpt_max_chars: usize,
 ) -> Result<GitHubWebhookChanges> {
     let Some(run) = payload.get("workflow_run") else {
         return Ok(GitHubWebhookChanges::default());
@@ -141,7 +179,7 @@ fn normalize_workflow_run(
             None => false,
         };
         if !failure_emitted && !suite_already {
-            events.push(workflow_failed_event(
+            events.push(workflow_failed_event_with_excerpt_max_chars(
                 repository,
                 &workflow_name,
                 &canonical_run_id,
@@ -150,6 +188,7 @@ fn normalize_workflow_run(
                 head_branch.as_deref(),
                 &url,
                 &updated_at,
+                error_excerpt_max_chars,
             ));
         }
         // Whether it came from the canonical row or a check_run fallback, this
@@ -199,6 +238,7 @@ fn normalize_check_run(
     payload: &Value,
     repository: &str,
     received_at: &str,
+    error_excerpt_max_chars: usize,
 ) -> Result<GitHubWebhookChanges> {
     let Some(run) = payload.get("check_run") else {
         return Ok(GitHubWebhookChanges::default());
@@ -315,7 +355,7 @@ fn normalize_check_run(
     let mut events = Vec::new();
     if completed_failure && !stale && !failure_emitted {
         failure_emitted = true;
-        events.push(workflow_failed_event(
+        events.push(workflow_failed_event_with_excerpt_max_chars(
             repository,
             &workflow_name,
             &canonical_run_id,
@@ -324,6 +364,7 @@ fn normalize_check_run(
             head_branch.as_deref(),
             &url,
             &updated_at,
+            error_excerpt_max_chars,
         ));
     }
     let mut pending_checks = GitHubPendingCheckUpdate {
@@ -741,6 +782,32 @@ pub fn workflow_failed_event(
     url: &str,
     occurred_at: &str,
 ) -> NewEvent {
+    workflow_failed_event_with_excerpt_max_chars(
+        repository,
+        workflow,
+        run_id,
+        run_attempt,
+        conclusion,
+        branch,
+        url,
+        occurred_at,
+        DEFAULT_ERROR_EXCERPT_MAX_CHARS,
+    )
+}
+
+/// Build a `github.workflow.failed` event with a bounded `error_excerpt`.
+#[allow(clippy::too_many_arguments)]
+pub fn workflow_failed_event_with_excerpt_max_chars(
+    repository: &str,
+    workflow: &str,
+    run_id: &str,
+    run_attempt: i64,
+    conclusion: &str,
+    branch: Option<&str>,
+    url: &str,
+    occurred_at: &str,
+    error_excerpt_max_chars: usize,
+) -> NewEvent {
     let workflow = bounded_display(workflow);
     let workflow = if workflow.is_empty() {
         "workflow".to_string()
@@ -770,6 +837,20 @@ pub fn workflow_failed_event(
     summary.push_str(&format!(" (attempt {run_attempt})"));
     payload.insert("summary".into(), json!(bound_summary(&summary)));
     payload.insert("url".into(), json!(url));
+    payload.insert(
+        "title".into(),
+        json!(workflow_failed_title(
+            repository,
+            &workflow,
+            branch.as_deref()
+        )),
+    );
+    payload.insert("severity".into(), json!("high"));
+    payload.insert("requires_action".into(), json!(true));
+    payload.insert(
+        "error_excerpt".into(),
+        json!(bounded_excerpt(&summary, error_excerpt_max_chars)),
+    );
 
     bounded_event(NewEvent {
         id: Some(event_id(
@@ -813,6 +894,8 @@ pub fn pr_merged_event(pull: &GitHubPullRequest) -> NewEvent {
     }
     payload.insert("summary".into(), json!(bound_summary(&summary)));
     payload.insert("url".into(), json!(url));
+    payload.insert("severity".into(), json!("normal"));
+    payload.insert("requires_action".into(), json!(false));
 
     bounded_event(NewEvent {
         id: Some(event_id(
@@ -861,6 +944,8 @@ pub fn review_requested_event(
     }
     payload.insert("summary".into(), json!(bound_summary(&summary)));
     payload.insert("url".into(), json!(url));
+    payload.insert("severity".into(), json!("normal"));
+    payload.insert("requires_action".into(), json!(true));
 
     bounded_event(NewEvent {
         id: Some(event_id(
@@ -947,6 +1032,48 @@ fn bounded_event(event: NewEvent) -> NewEvent {
         }
     }
     event
+}
+
+fn workflow_failed_title(repository: &str, workflow: &str, branch: Option<&str>) -> String {
+    let mut title = format!("[{}] CI failed: {workflow}", single_line(repository));
+    if let Some(branch) = branch.map(single_line).filter(|branch| !branch.is_empty()) {
+        title.push_str(&format!(" ({branch})"));
+    }
+    truncate(&single_line(&title), MAX_TITLE_CHARS)
+}
+
+/// Collapse newlines and control whitespace into single spaces.
+fn single_line(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(ch);
+        }
+    }
+    normalized
+}
+
+/// Normalize an excerpt to one line and bound it to `max_chars` characters.
+fn bounded_excerpt(value: &str, max_chars: usize) -> String {
+    let normalized = single_line(value);
+    let max_chars = max_chars.max(1);
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    if max_chars >= 4 {
+        let mut excerpt: String = normalized.chars().take(max_chars - 3).collect();
+        excerpt.push_str("...");
+        excerpt
+    } else {
+        normalized.chars().take(max_chars).collect()
+    }
 }
 
 fn bound_json_text(value: &str, max_json_bytes: usize) -> String {
@@ -1134,5 +1261,85 @@ mod tests {
         assert_eq!(reviewer_key("team", "platform"), "team:platform");
         assert_eq!(reviewer_name("user:platform"), "platform");
         assert_eq!(reviewer_name("team:platform"), "platform");
+    }
+}
+
+#[cfg(test)]
+mod enrichment_tests {
+    use super::*;
+    use crate::mcp::event_catalog;
+
+    fn pull_request() -> GitHubPullRequest {
+        GitHubPullRequest {
+            repository: "o/r".into(),
+            pull_number: 7,
+            title: "Fix parser".into(),
+            state: "closed".into(),
+            author: Some("alice".into()),
+            head_branch: Some("fix-parser".into()),
+            head_sha: Some("abc123".into()),
+            base_branch: Some("main".into()),
+            draft: false,
+            merged: true,
+            merged_by: Some("bob".into()),
+            merged_at: Some("2026-11-16T01:00:00.000Z".into()),
+            requested_reviewers: Vec::new(),
+            last_review_state: None,
+            last_activity_at: None,
+            url: "https://github.com/o/r/pull/7".into(),
+            merged_emitted: false,
+            updated_at: "2026-11-16T01:00:00.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn workflow_failure_payloads_are_enriched_and_bounded() {
+        let event = workflow_failed_event(
+            "o/r",
+            "build",
+            "42",
+            2,
+            "failure",
+            Some("main"),
+            "https://github.com/o/r/actions/runs/42",
+            "2026-11-16T01:00:00.000Z",
+        );
+        assert_eq!(event.payload["title"], "[o/r] CI failed: build (main)");
+        assert_eq!(event.payload["severity"], "high");
+        assert_eq!(event.payload["requires_action"], true);
+        assert!(event.payload["error_excerpt"].as_str().is_some());
+        event_catalog::validate_payload("github.workflow.failed", &event.payload).unwrap();
+
+        let bounded = workflow_failed_event_with_excerpt_max_chars(
+            "o/r",
+            "build",
+            "42",
+            2,
+            "failure",
+            Some("main"),
+            "https://github.com/o/r/actions/runs/42",
+            "2026-11-16T01:00:00.000Z",
+            12,
+        );
+        let excerpt = bounded.payload["error_excerpt"].as_str().unwrap();
+        assert!(excerpt.chars().count() <= 12, "{excerpt:?}");
+        assert!(excerpt.ends_with("..."), "{excerpt:?}");
+    }
+
+    #[test]
+    fn review_and_merge_payloads_keep_titles_and_set_action_flags() {
+        let pull = pull_request();
+        let review = review_requested_event(&pull, Some("carol"), "marker");
+        assert_eq!(review.payload["title"], "Fix parser");
+        assert_eq!(review.payload["severity"], "normal");
+        assert_eq!(review.payload["requires_action"], true);
+        assert!(review.payload.get("error_excerpt").is_none());
+        event_catalog::validate_payload("github.review.requested", &review.payload).unwrap();
+
+        let merged = pr_merged_event(&pull);
+        assert_eq!(merged.payload["title"], "Fix parser");
+        assert_eq!(merged.payload["severity"], "normal");
+        assert_eq!(merged.payload["requires_action"], false);
+        event_catalog::validate_payload("github.pr.merged", &merged.payload).unwrap();
     }
 }

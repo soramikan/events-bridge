@@ -2898,7 +2898,7 @@ async fn stdio_surface_serves_tools_and_events() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 9);
     for expected in [
         "list_events",
         "get_event",
@@ -2906,6 +2906,9 @@ async fn stdio_surface_serves_tools_and_events() {
         "get_t3_approvals",
         "get_github_status",
         "ack_events",
+        "probe_consumer",
+        "poll_consumer_events",
+        "ack_consumer_events",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
@@ -3527,5 +3530,84 @@ async fn edge_nonce_replay_is_rejected_on_the_skew_boundary_second() {
         "unexpected rejection reason: {replay_body}"
     );
 
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn edge_enriches_events_via_t3_source_title_fallback() {
+    init_env();
+    let temp = TempDir::new().unwrap();
+    let mut fixture = Fixture::new();
+    fixture.seed_project_thread();
+
+    let hub = RunningHub::start(hub_config(temp.path().join("hub.db")), false).await;
+    let edge_db = temp.path().join("edge.db");
+    let edge = RunningEdge::start(edge_config(
+        edge_db.clone(),
+        fixture.path(),
+        "env-edge-fallback",
+        &hub.base_url,
+    ));
+
+    wait_until("edge initial snapshot synced to hub", || {
+        hub.hub
+            .repository()
+            .get_t3_project("env-edge-fallback", "p1")
+            .unwrap()
+            .is_some()
+    })
+    .await;
+
+    // Clear Edge's local materialized titles so Edge's T3Reducer must fall
+    // back to the upstream T3 SQLite projections when deriving the event.
+    {
+        let edge_conn = Connection::open(&edge_db).unwrap();
+        edge_conn
+            .execute(
+                "UPDATE t3_projects SET title = '' WHERE environment_id = 'env-edge-fallback' AND project_id = 'p1'",
+                [],
+            )
+            .unwrap();
+        edge_conn
+            .execute(
+                "DELETE FROM t3_threads WHERE environment_id = 'env-edge-fallback' AND thread_id = 't1'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fixture.emit_completed_run("run-edge-fallback", 9);
+
+    wait_until("hub receives enriched completed event", || {
+        !hub.hub
+            .repository()
+            .list_events(&events_bridge::store::EventQuery {
+                kind: Some("t3.run.completed".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+
+    let events = hub
+        .hub
+        .repository()
+        .list_events(&events_bridge::store::EventQuery {
+            kind: Some("t3.run.completed".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["project_name"], "Demo project");
+    assert_eq!(events[0].payload["thread_title"], "Demo thread");
+    assert_eq!(
+        events[0].payload["title"],
+        "[Demo project] Run #9 completed: Demo thread"
+    );
+
+    edge.stop().await;
     hub.stop().await;
 }

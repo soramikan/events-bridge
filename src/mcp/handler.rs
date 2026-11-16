@@ -17,7 +17,7 @@ use rmcp::{
     service::RequestContext,
 };
 
-use crate::{app::AppState, mcp::tools};
+use crate::{app::AppState, auth::AuthenticatedPrincipal, mcp::tools};
 
 /// MCP handler backed by the shared application state.
 #[derive(Clone)]
@@ -61,26 +61,39 @@ impl ServerHandler for EventsHandler {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        self.state
-            .tools
-            .call(&self.state.config.auth.principal, request)
-            .await
+        let principal = self.principal(&context);
+        self.state.tools.call(&principal.principal, request).await
     }
 
     async fn on_custom_request(
         &self,
         request: CustomRequest,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
-        let principal = self.state.config.auth.principal.clone();
+        let principal = self.principal(&context);
         let result = self
             .state
             .subscriptions
-            .handle(&request.method, request.params, &principal)
+            .handle(&request.method, request.params, &principal.principal)
             .await
             .map_err(McpError::from)?;
         Ok(CustomResult::new(result))
+    }
+}
+
+impl EventsHandler {
+    /// Resolve the authenticated HTTP identity injected into rmcp request
+    /// extensions. stdio has no HTTP parts and falls back to the configured
+    /// principal.
+    fn principal(&self, context: &RequestContext<RoleServer>) -> AuthenticatedPrincipal {
+        context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<AuthenticatedPrincipal>().cloned())
+            .unwrap_or_else(|| {
+                AuthenticatedPrincipal::full(self.state.config.auth.principal.clone())
+            })
     }
 }

@@ -13,6 +13,8 @@ use rmcp::model::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::config::Config;
+use crate::consumers::{ConsumerService, MAX_CONSUMER_POLL_LIMIT};
 use crate::mcp::event_catalog;
 use crate::store::{Event, EventQuery, GitHubStatusQuery, Repository, T3ApprovalQuery};
 use crate::util::{format_rfc3339, parse_rfc3339};
@@ -56,6 +58,7 @@ pub fn definitions() -> Vec<Tool> {
                         "kind": {"type": "string", "description": "Exact event name, e.g. t3.run.failed."},
                         "severity": {"type": "string", "enum": ["high", "normal"]},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                        "after": {"type": "integer", "minimum": 0, "description": "Return events with sequence strictly greater than this value."},
                         "cursor": {"type": "string", "description": "Opaque cursor from a previous response."}
                     },
                     "additionalProperties": false
@@ -141,6 +144,47 @@ pub fn definitions() -> Vec<Tool> {
                 }),
                 false,
             ),
+            tool(
+                "probe_consumer",
+                "Check whether a named polling consumer has unread events without fetching or consuming them.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "consumer": {"type": "string", "description": "Consumer name, e.g. muse."}
+                    },
+                    "required": ["consumer"],
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
+                "poll_consumer_events",
+                "Fetch unacknowledged events for a named polling consumer. Immediate events are returned individually, digest events are aggregated into time-window summaries, and polling does not advance the consumer cursor.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "consumer": {"type": "string", "description": "Consumer name, e.g. muse."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+                    },
+                    "required": ["consumer"],
+                    "additionalProperties": false
+                }),
+                true,
+            ),
+            tool(
+                "ack_consumer_events",
+                "Advance a named polling consumer cursor after events were processed. This is separate from ack_events.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "consumer": {"type": "string", "description": "Consumer name, e.g. muse."},
+                        "up_to_sequence": {"type": "integer", "minimum": 0}
+                    },
+                    "required": ["consumer", "up_to_sequence"],
+                    "additionalProperties": false
+                }),
+                false,
+            ),
         ]
     });
     TOOLS.clone()
@@ -155,12 +199,25 @@ pub fn get(name: &str) -> Option<Tool> {
 #[derive(Clone)]
 pub struct ToolService {
     repo: Arc<Repository>,
+    consumers: Arc<ConsumerService>,
 }
 
 impl ToolService {
-    /// Create a tool service.
+    /// Create a tool service with built-in consumer profiles.
+    ///
+    /// Hub construction uses [`Self::with_consumers`] so configured profiles
+    /// are visible to the consumer tools.
     pub fn new(repo: Arc<Repository>) -> Self {
-        Self { repo }
+        let consumers = Arc::new(ConsumerService::new(
+            repo.clone(),
+            Config::default().consumers,
+        ));
+        Self { repo, consumers }
+    }
+
+    /// Create a tool service sharing the hub's consumer service.
+    pub fn with_consumers(repo: Arc<Repository>, consumers: Arc<ConsumerService>) -> Self {
+        Self { repo, consumers }
     }
 
     /// Dispatch a `tools/call`.
@@ -181,6 +238,9 @@ impl ToolService {
             "get_t3_approvals" => self.get_t3_approvals(arguments),
             "get_github_status" => self.get_github_status(arguments),
             "ack_events" => self.ack_events(principal, arguments),
+            "probe_consumer" => self.probe_consumer(arguments),
+            "poll_consumer_events" => self.poll_consumer_events(arguments),
+            "ack_consumer_events" => self.ack_consumer_events(arguments),
             other => Err(format!("unknown tool `{other}`")),
         };
 
@@ -228,9 +288,18 @@ impl ToolService {
             Some(other) => return Err(format!("unknown severity `{other}`")),
         };
 
-        let after_sequence = match args.cursor.as_deref() {
-            None => None,
-            Some(cursor) => Some(parse_cursor(cursor)?),
+        let after_sequence = match (args.after, args.cursor.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err("specify either `after` or `cursor`, not both".into());
+            }
+            (Some(after), None) => {
+                if after < 0 {
+                    return Err(format!("`after` must be at least 0, got {after}"));
+                }
+                Some(after)
+            }
+            (None, Some(cursor)) => Some(parse_cursor(cursor)?),
+            (None, None) => None,
         };
 
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -393,6 +462,46 @@ impl ToolService {
             "note": "This records user acknowledgement only; webhook delivery state is unchanged.",
         }))
     }
+
+    fn probe_consumer(&self, arguments: Value) -> Result<Value, String> {
+        let args: ConsumerArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        let probe = self
+            .consumers
+            .probe(&args.consumer)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(probe).map_err(|error| error.to_string())
+    }
+
+    fn poll_consumer_events(&self, arguments: Value) -> Result<Value, String> {
+        let args: PollConsumerArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        if let Some(limit) = args.limit
+            && !(1..=MAX_CONSUMER_POLL_LIMIT).contains(&limit)
+        {
+            return Err(format!(
+                "`limit` must be between 1 and {MAX_CONSUMER_POLL_LIMIT}, got {limit}"
+            ));
+        }
+        let poll = self
+            .consumers
+            .poll(&args.consumer, args.limit)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(poll).map_err(|error| error.to_string())
+    }
+
+    fn ack_consumer_events(&self, arguments: Value) -> Result<Value, String> {
+        let args: AckConsumerArgs = serde_json::from_value(arguments)
+            .map_err(|error| format!("invalid arguments: {error}"))?;
+        if args.up_to_sequence < 0 {
+            return Err("`up_to_sequence` must be greater than or equal to zero".into());
+        }
+        let ack = self
+            .consumers
+            .ack(&args.consumer, args.up_to_sequence)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(ack).map_err(|error| error.to_string())
+    }
 }
 
 fn parse_cursor(cursor: &str) -> Result<i64, String> {
@@ -418,6 +527,8 @@ struct ListEventsArgs {
     severity: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    after: Option<i64>,
     #[serde(default)]
     cursor: Option<String>,
 }
@@ -473,6 +584,28 @@ struct AckEventsArgs {
     event_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConsumerArgs {
+    consumer: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PollConsumerArgs {
+    consumer: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckConsumerArgs {
+    consumer: String,
+    #[serde(alias = "upToSequence")]
+    up_to_sequence: i64,
+}
+
 /// Render an event for diagnostics.
 #[allow(dead_code)]
 pub fn summarize(event: &Event) -> String {
@@ -496,6 +629,9 @@ mod tests {
                 "get_t3_approvals",
                 "get_github_status",
                 "ack_events",
+                "probe_consumer",
+                "poll_consumer_events",
+                "ack_consumer_events",
             ]
         );
         assert_eq!(get("list_events").unwrap().name, "list_events");
@@ -542,5 +678,138 @@ mod tests {
         };
         let value = fetched.into_typed::<Value>().unwrap();
         assert_eq!(value["event"]["id"], "evt_tool");
+    }
+
+    async fn call_list(service: &ToolService, arguments: Value) -> CallToolResponse {
+        service
+            .call(
+                "local",
+                CallToolRequestParams::new("list_events")
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn tool_text(response: &CallToolResponse) -> String {
+        let CallToolResponse::Complete(result) = response else {
+            panic!("expected a complete tool response");
+        };
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn seeded_service() -> ToolService {
+        let repo = Arc::new(Repository::open_in_memory().unwrap());
+        repo.ingest_event(crate::store::NewEvent {
+            id: Some("evt_failed".into()),
+            source: None,
+            kind: "t3.run.failed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": "run-1",
+                "summary": "failed",
+                "error": "boom"
+            }),
+            occurred_at: Some("2026-11-16T01:00:00Z".into()),
+        })
+        .unwrap();
+        repo.ingest_event(crate::store::NewEvent {
+            id: Some("evt_merged".into()),
+            source: None,
+            kind: "github.pr.merged".into(),
+            payload: json!({
+                "repository": "o/r",
+                "pull_number": 7,
+                "title": "Fix parser",
+                "url": "https://github.com/o/r/pull/7"
+            }),
+            occurred_at: Some("2026-11-16T01:00:01Z".into()),
+        })
+        .unwrap();
+        repo.ingest_event(crate::store::NewEvent {
+            id: Some("evt_completed".into()),
+            source: None,
+            kind: "t3.run.completed".into(),
+            payload: json!({
+                "environment_id": "linux-main",
+                "project_id": "lnako",
+                "thread_id": "thread-42",
+                "run_id": "run-2",
+                "summary": "done"
+            }),
+            occurred_at: Some("2026-11-16T01:00:02Z".into()),
+        })
+        .unwrap();
+        ToolService::new(repo)
+    }
+
+    #[tokio::test]
+    async fn after_fetches_differentially_and_combines_with_filters() {
+        let service = seeded_service();
+
+        let page = call_list(&service, json!({"after": 1, "limit": 1})).await;
+        let CallToolResponse::Complete(result) = page else {
+            panic!("expected a complete tool response");
+        };
+        assert_eq!(result.is_error, Some(false));
+        let value = result.into_typed::<Value>().unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["sequence"], 2);
+        assert_eq!(value["nextCursor"], "seq_2");
+
+        let by_source = call_list(&service, json!({"after": 1, "source": "github"})).await;
+        let CallToolResponse::Complete(by_source) = by_source else {
+            panic!("expected a complete tool response");
+        };
+        let value = by_source.into_typed::<Value>().unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], "evt_merged");
+
+        let by_severity = call_list(&service, json!({"after": 1, "severity": "normal"})).await;
+        let CallToolResponse::Complete(by_severity) = by_severity else {
+            panic!("expected a complete tool response");
+        };
+        let value = by_severity.into_typed::<Value>().unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["id"], "evt_merged");
+        assert_eq!(events[1]["id"], "evt_completed");
+    }
+
+    #[tokio::test]
+    async fn after_rejects_cursor_together_and_negative_values() {
+        let service = seeded_service();
+
+        let both = call_list(&service, json!({"after": 1, "cursor": "seq_1"})).await;
+        let CallToolResponse::Complete(result) = &both else {
+            panic!("expected a complete tool response");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            tool_text(&both).contains("not both"),
+            "{}",
+            tool_text(&both)
+        );
+
+        let negative = call_list(&service, json!({"after": -1})).await;
+        let CallToolResponse::Complete(result) = &negative else {
+            panic!("expected a complete tool response");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            tool_text(&negative).contains("after"),
+            "{}",
+            tool_text(&negative)
+        );
     }
 }

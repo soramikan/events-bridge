@@ -25,6 +25,12 @@ use crate::{
     util::{format_rfc3339, now_rfc3339, parse_rfc3339},
 };
 
+/// Default bound for `error_excerpt`, matching `[payload]` configuration.
+pub const DEFAULT_ERROR_EXCERPT_MAX_CHARS: usize = 500;
+
+/// Maximum characters in a one-line event `title`.
+const MAX_TITLE_CHARS: usize = 200;
+
 /// One event read from T3 Code's `orchestration_events` log.
 #[derive(Debug, Clone)]
 pub struct T3SourceEvent {
@@ -50,6 +56,7 @@ pub struct T3Reducer<'a> {
     repo: &'a Repository,
     source: &'a T3Source,
     web_base_url: Option<&'a Url>,
+    error_excerpt_max_chars: usize,
 }
 
 impl<'a> T3Reducer<'a> {
@@ -65,7 +72,17 @@ impl<'a> T3Reducer<'a> {
             repo,
             source,
             web_base_url,
+            error_excerpt_max_chars: DEFAULT_ERROR_EXCERPT_MAX_CHARS,
         }
+    }
+
+    /// Override the maximum number of characters kept in `error_excerpt`.
+    ///
+    /// The default matches [`crate::config::PayloadConfig`] so callers that use
+    /// [`Self::new`] keep the historical 500-character behavior.
+    pub fn with_error_excerpt_max_chars(mut self, max_chars: usize) -> Self {
+        self.error_excerpt_max_chars = max_chars.max(1);
+        self
     }
 
     /// Apply one upstream event atomically.
@@ -212,13 +229,7 @@ impl<'a> T3Reducer<'a> {
         let ordinal = integer(payload, "ordinal")
             .or_else(|| previous.as_ref().map(|run| run.ordinal))
             .unwrap_or(0);
-        let thread_title = if thread_id.is_empty() {
-            None
-        } else {
-            self.repo
-                .get_t3_thread(self.environment_id, &thread_id)?
-                .map(|thread| thread.title)
-        };
+        let thread_title = self.resolved_thread_title(&thread_id);
         let summary = run_summary(&status, ordinal, thread_title.as_deref());
         let error = if status == "failed" {
             Some(
@@ -423,6 +434,25 @@ impl<'a> T3Reducer<'a> {
         if let Some(url) = self.thread_url(&run.thread_id) {
             payload.insert("url".into(), json!(url));
         }
+        let project_name = self.resolved_project_name(&run.project_id);
+        let thread_title = self.resolved_thread_title(&run.thread_id);
+        if let Some(project_name) = &project_name {
+            payload.insert("project_name".into(), json!(project_name));
+        }
+        if let Some(thread_title) = &thread_title {
+            payload.insert("thread_title".into(), json!(thread_title));
+        }
+        payload.insert(
+            "title".into(),
+            json!(run_event_title(
+                project_name.as_deref().unwrap_or(run.project_id.as_str()),
+                run.ordinal,
+                "completed",
+                thread_title.as_deref(),
+            )),
+        );
+        payload.insert("severity".into(), json!("normal"));
+        payload.insert("requires_action".into(), json!(false));
         NewEvent {
             id: Some(event_id(self.environment_id, &run.run_id, "completed")),
             source: Some("t3".into()),
@@ -453,6 +483,29 @@ impl<'a> T3Reducer<'a> {
         if let Some(url) = self.thread_url(&run.thread_id) {
             payload.insert("url".into(), json!(url));
         }
+        let project_name = self.resolved_project_name(&run.project_id);
+        let thread_title = self.resolved_thread_title(&run.thread_id);
+        if let Some(project_name) = &project_name {
+            payload.insert("project_name".into(), json!(project_name));
+        }
+        if let Some(thread_title) = &thread_title {
+            payload.insert("thread_title".into(), json!(thread_title));
+        }
+        payload.insert(
+            "title".into(),
+            json!(run_event_title(
+                project_name.as_deref().unwrap_or(run.project_id.as_str()),
+                run.ordinal,
+                "failed",
+                thread_title.as_deref(),
+            )),
+        );
+        payload.insert("severity".into(), json!("high"));
+        payload.insert("requires_action".into(), json!(true));
+        payload.insert(
+            "error_excerpt".into(),
+            json!(bounded_excerpt(&error, self.error_excerpt_max_chars)),
+        );
         NewEvent {
             id: Some(event_id(self.environment_id, &run.run_id, "failed")),
             source: Some("t3".into()),
@@ -491,6 +544,23 @@ impl<'a> T3Reducer<'a> {
         if let Some(url) = self.thread_url(&approval.thread_id) {
             payload.insert("url".into(), json!(url));
         }
+        let project_name = self.resolved_project_name(&project_id);
+        let thread_title = self.resolved_thread_title(&approval.thread_id);
+        if let Some(project_name) = &project_name {
+            payload.insert("project_name".into(), json!(project_name));
+        }
+        if let Some(thread_title) = &thread_title {
+            payload.insert("thread_title".into(), json!(thread_title));
+        }
+        payload.insert(
+            "title".into(),
+            json!(approval_title(
+                project_name.as_deref().unwrap_or(project_id.as_str()),
+                &summary,
+            )),
+        );
+        payload.insert("severity".into(), json!("high"));
+        payload.insert("requires_action".into(), json!(true));
         NewEvent {
             id: Some(event_id(
                 self.environment_id,
@@ -502,6 +572,42 @@ impl<'a> T3Reducer<'a> {
             payload: Value::Object(payload),
             occurred_at: Some(occurred_at.to_string()),
         }
+    }
+
+    fn resolved_project_name(&self, project_id: &str) -> Option<String> {
+        if project_id.is_empty() {
+            return None;
+        }
+        self.repo
+            .get_t3_project(self.environment_id, project_id)
+            .ok()
+            .flatten()
+            .and_then(|project| bound_display_name(&project.title))
+            .or_else(|| {
+                self.source
+                    .project_title(project_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|title| bound_display_name(&title))
+            })
+    }
+
+    fn resolved_thread_title(&self, thread_id: &str) -> Option<String> {
+        if thread_id.is_empty() {
+            return None;
+        }
+        self.repo
+            .get_t3_thread(self.environment_id, thread_id)
+            .ok()
+            .flatten()
+            .and_then(|thread| bound_display_name(&thread.title))
+            .or_else(|| {
+                self.source
+                    .thread_title(thread_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|title| bound_display_name(&title))
+            })
     }
 
     fn run_project(&self, run_id: &str) -> Result<Option<String>> {
@@ -538,6 +644,89 @@ pub fn run_summary(status: &str, ordinal: i64, thread_title: Option<&str>) -> St
         summary.push('"');
     }
     truncate(&summary, 300)
+}
+
+/// Build the one-line title for a T3 run event.
+///
+/// Empty segments are omitted, so a run without a resolved project or thread
+/// title still produces a stable, readable title.
+pub fn run_event_title(
+    project_label: &str,
+    ordinal: i64,
+    status: &str,
+    thread_title: Option<&str>,
+) -> String {
+    let mut title = String::new();
+    let project_label = single_line(project_label);
+    if !project_label.is_empty() {
+        title.push('[');
+        title.push_str(&project_label);
+        title.push_str("] ");
+    }
+    title.push_str(&format!("Run #{ordinal} {status}"));
+    if let Some(thread_title) = thread_title
+        .map(single_line)
+        .filter(|title| !title.is_empty())
+    {
+        title.push_str(": ");
+        title.push_str(&thread_title);
+    }
+    truncate(&single_line(&title), MAX_TITLE_CHARS)
+}
+
+/// Build the one-line title for an approval event.
+pub fn approval_title(project_label: &str, summary: &str) -> String {
+    let project_label = single_line(project_label);
+    let summary = single_line(summary);
+    let mut title = String::new();
+    if !project_label.is_empty() {
+        title.push('[');
+        title.push_str(&project_label);
+        title.push_str("] ");
+    }
+    title.push_str("Approval required");
+    if !summary.is_empty() {
+        title.push_str(": ");
+        title.push_str(&summary);
+    }
+    truncate(&title, MAX_TITLE_CHARS)
+}
+
+/// Collapse newlines and control whitespace into single spaces.
+pub fn single_line(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(ch);
+        }
+    }
+    normalized
+}
+
+/// Normalize an excerpt to one line and bound it to `max_chars` characters.
+///
+/// A `...` suffix is appended when truncation happens and the bound can hold
+/// it, keeping the returned string at or below `max_chars` characters.
+pub fn bounded_excerpt(value: &str, max_chars: usize) -> String {
+    let normalized = single_line(value);
+    let max_chars = max_chars.max(1);
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    if max_chars >= 4 {
+        let mut excerpt: String = normalized.chars().take(max_chars - 3).collect();
+        excerpt.push_str("...");
+        excerpt
+    } else {
+        normalized.chars().take(max_chars).collect()
+    }
 }
 
 /// Deterministic bridge event id for an upstream aggregate.
@@ -644,8 +833,20 @@ fn slug(value: &str, limit: usize) -> String {
     if slug.is_empty() { "x".into() } else { slug }
 }
 
+const WEBHOOK_DISPLAY_NAME_JSON_BYTES: usize = 1024;
 const WEBHOOK_SUMMARY_JSON_BYTES: usize = 4 * 1024;
 const WEBHOOK_ERROR_JSON_BYTES: usize = 16 * 1024;
+
+fn bound_display_name(value: &str) -> Option<String> {
+    let normalized = single_line(value);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(bound_json_text(
+        &normalized,
+        WEBHOOK_DISPLAY_NAME_JSON_BYTES,
+    ))
+}
 
 fn bound_json_text(value: &str, max_json_bytes: usize) -> String {
     if serde_json::to_string(value)
@@ -695,6 +896,7 @@ fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MAX_WEBHOOK_BODY_BYTES;
 
     #[test]
     fn event_ids_are_deterministic_and_bounded() {
@@ -732,5 +934,42 @@ mod tests {
         let summary = run_summary("completed", 3, Some(&"x".repeat(1_000)));
         assert!(summary.chars().count() <= 300);
         assert!(summary.contains("Run #3 completed"));
+    }
+
+    #[test]
+    fn display_names_are_json_byte_bounded_for_multibyte_inputs() {
+        let giant_project = "プロジェクト🚀".repeat(50_000);
+        let bounded = bound_display_name(&giant_project).expect("non-empty display name");
+        let encoded_len = serde_json::to_string(&bounded).unwrap().len();
+        assert!(encoded_len <= WEBHOOK_DISPLAY_NAME_JSON_BYTES);
+        assert!(bounded.ends_with("..."));
+
+        let giant_error = "失敗詳細🔥".repeat(50_000);
+        let bounded_error = bound_json_text(&giant_error, WEBHOOK_ERROR_JSON_BYTES);
+        let envelope = json!({
+            "eventId": "evt_t3_env_run_abcdef1234_failed",
+            "name": "t3.run.failed",
+            "timestamp": "2026-11-16T01:00:00.000Z",
+            "data": {
+                "environment_id": "env-1",
+                "project_id": "p1",
+                "thread_id": "t1",
+                "run_id": "r1",
+                "summary": bound_json_text(&giant_project, WEBHOOK_SUMMARY_JSON_BYTES),
+                "error": bounded_error,
+                "project_name": &bounded,
+                "thread_title": &bounded,
+                "title": run_event_title(&bounded, 1, "failed", Some(&bounded)),
+                "severity": "high",
+                "requires_action": true,
+                "error_excerpt": bounded_excerpt(&bounded_error, DEFAULT_ERROR_EXCERPT_MAX_CHARS),
+            },
+            "cursor": Value::Null,
+        });
+        let wire_bytes = serde_json::to_vec(&envelope).unwrap().len();
+        assert!(
+            wire_bytes <= MAX_WEBHOOK_BODY_BYTES,
+            "envelope exceeded {MAX_WEBHOOK_BODY_BYTES}: {wire_bytes}"
+        );
     }
 }
