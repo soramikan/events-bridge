@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
             if probe && ack.is_some() {
                 bail!("--probe and --ack cannot be used together");
             }
-            if probe && limit.is_some() {
+            if (probe || ack.is_some()) && limit.is_some() {
                 bail!("--limit is only valid for polls");
             }
             if let Some(sequence) = ack {

@@ -52,10 +52,23 @@ fn seed(path: &Path) {
 }
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(binary())
-        .args(args)
-        .output()
-        .expect("run events-bridge")
+    let mut cmd = Command::new(binary());
+    cmd.env_remove("EVENTS_BRIDGE_CONFIG");
+    let _temp = if args.contains(&"--config") {
+        None
+    } else {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("empty.toml");
+        std::fs::write(&config, "").unwrap();
+        cmd.arg(args[0]);
+        cmd.arg("--config").arg(&config);
+        cmd.args(&args[1..]);
+        Some(dir)
+    };
+    if _temp.is_none() {
+        cmd.args(args);
+    }
+    cmd.output().expect("run events-bridge")
 }
 
 fn stdout_json(output: &std::process::Output) -> Value {
@@ -228,5 +241,23 @@ fn cli_rejects_conflicting_poll_flags() {
         String::from_utf8_lossy(&output.stderr).contains("cannot be used together"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ack_with_limit = run(&[
+        "poll",
+        "--consumer",
+        "muse",
+        "--db",
+        db.to_str().unwrap(),
+        "--ack",
+        "1",
+        "--limit",
+        "5",
+    ]);
+    assert!(!ack_with_limit.status.success());
+    assert!(
+        String::from_utf8_lossy(&ack_with_limit.stderr).contains("--limit is only valid for polls"),
+        "{}",
+        String::from_utf8_lossy(&ack_with_limit.stderr)
     );
 }

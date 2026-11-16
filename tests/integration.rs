@@ -2375,6 +2375,22 @@ async fn consumer_mcp_tools_round_trip_without_touching_ack_events() {
     // Polling did not advance the cursor.
     assert_eq!(all["structuredContent"]["cursorSequence"], 0);
 
+    // `ack_events` remains the user-facing acknowledgement tool and does not
+    // move the consumer cursor.
+    let user_ack = client
+        .tool_call("ack_events", json!({"event_ids": ["evt_consumer_failed"]}))
+        .await;
+    assert_eq!(user_ack["isError"], false, "{user_ack}");
+    assert_eq!(
+        user_ack["structuredContent"]["acknowledged"],
+        json!(["evt_consumer_failed"])
+    );
+    let probe = client
+        .tool_call("probe_consumer", json!({"consumer": "muse"}))
+        .await;
+    assert_eq!(probe["structuredContent"]["cursorSequence"], 0);
+    assert_eq!(probe["structuredContent"]["unreadCount"], 2);
+
     let ack = client
         .tool_call(
             "ack_consumer_events",
@@ -2389,22 +2405,6 @@ async fn consumer_mcp_tools_round_trip_without_touching_ack_events() {
     let probe = client
         .tool_call("probe_consumer", json!({"consumer": "muse"}))
         .await;
-    assert_eq!(probe["structuredContent"]["unreadCount"], 0);
-
-    // `ack_events` remains the user-facing acknowledgement tool and does not
-    // move the consumer cursor.
-    let user_ack = client
-        .tool_call("ack_events", json!({"event_ids": ["evt_consumer_failed"]}))
-        .await;
-    assert_eq!(user_ack["isError"], false, "{user_ack}");
-    assert_eq!(
-        user_ack["structuredContent"]["acknowledged"],
-        json!(["evt_consumer_failed"])
-    );
-    let probe = client
-        .tool_call("probe_consumer", json!({"consumer": "muse"}))
-        .await;
-    assert_eq!(probe["structuredContent"]["cursorSequence"], 2);
     assert_eq!(probe["structuredContent"]["unreadCount"], 0);
 
     let missing = client
