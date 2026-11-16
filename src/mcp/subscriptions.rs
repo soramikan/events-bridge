@@ -146,6 +146,7 @@ fn poll_event(event: &Event) -> Value {
 /// Build the SEP-3415 `events/poll` result.
 fn poll_result(events: Vec<Value>, cursor: i64, truncated: bool, has_more: bool) -> Value {
     json!({
+        "resultType": "complete",
         "events": events,
         "cursor": format!("seq_{cursor}"),
         "truncated": truncated,
@@ -243,6 +244,14 @@ impl SubscriptionManager {
     /// of the requested type with `sequence > N`, filtered by the same
     /// predicate as webhook subscriptions.
     fn poll(&self, params: Option<Value>) -> Result<Value, RpcError> {
+        self.poll_with_watermark_hook(params, |_| {})
+    }
+
+    fn poll_with_watermark_hook(
+        &self,
+        params: Option<Value>,
+        after_watermark: impl FnOnce(i64),
+    ) -> Result<Value, RpcError> {
         let params: PollParams = serde_json::from_value(params.unwrap_or_else(|| json!({})))
             .map_err(|error| RpcError::invalid_params(error.to_string()))?;
 
@@ -269,12 +278,14 @@ impl SubscriptionManager {
             None => DEFAULT_POLL_MAX_EVENTS,
         };
 
-        // Sample the watermark before scanning so events inserted while this
-        // request is running have a sequence above the returned cursor.
+        // Sample the watermark before scanning and bound every batch to
+        // `sequence <= latest` so events ingested mid-poll are left for the
+        // next poll instead of returning past `latest` with a stale cursor.
         let latest = self
             .repo
             .latest_event_sequence()
             .map_err(|error| RpcError::internal(error.to_string()))?;
+        after_watermark(latest);
 
         let Some(cursor) = params.cursor.as_deref() else {
             // SEP-3415: null/omitted cursor means "start from now".
@@ -290,13 +301,14 @@ impl SubscriptionManager {
             // current watermark.
             return Ok(poll_result(Vec::new(), latest, true, false));
         }
+        if anchor == latest {
+            return Ok(poll_result(Vec::new(), latest, false, false));
+        }
 
-        // A `maxAgeMs` of 0 means "no age filter". Very large values are
-        // clamped so the subtraction cannot overflow.
+        // SEP-3415 defines a supplied `maxAgeMs` as `now - maxAgeMs` (so `0`
+        // bounds replay at `now`); omitting `maxAgeMs` disables age filtering.
+        // Very large values are clamped so the subtraction cannot overflow.
         let cutoff = params.max_age_ms.and_then(|max_age_ms| {
-            if max_age_ms == 0 {
-                return None;
-            }
             let milliseconds = i64::try_from(max_age_ms).unwrap_or(i64::MAX);
             Utc::now()
                 .checked_sub_signed(ChronoDuration::milliseconds(milliseconds))
@@ -315,6 +327,7 @@ impl SubscriptionManager {
                 .list_events(&EventQuery {
                     kind: Some(params.name.clone()),
                     after_sequence: Some(after),
+                    max_sequence: Some(latest),
                     limit: POLL_SCAN_BATCH,
                     ..EventQuery::default()
                 })
@@ -349,7 +362,7 @@ impl SubscriptionManager {
                 break;
             };
             after = last.sequence;
-            if batch_len < POLL_SCAN_BATCH as usize {
+            if batch_len < POLL_SCAN_BATCH as usize || after >= latest {
                 break;
             }
         }
@@ -358,7 +371,7 @@ impl SubscriptionManager {
             // `has_more` implies at least one returned event.
             last_returned.unwrap_or(latest)
         } else {
-            // No deliverable match remains after this page: advance the
+            // No deliverable match remains up to `latest`: advance the
             // watermark so empty and non-matching polls do not rescan.
             latest
         };
@@ -729,6 +742,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(result["resultType"], "complete");
         assert_eq!(result["events"], json!([]));
         assert_eq!(result["cursor"], "seq_1");
         assert_eq!(result["truncated"], false);
@@ -1050,7 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_max_age_zero_disables_the_filter() {
+    async fn poll_max_age_zero_bounds_replay_at_now() {
         let (manager, repo) = poll_manager();
         let start = poll(
             &manager,
@@ -1068,7 +1082,10 @@ mod tests {
             completed_payload("linux-main", "lnako"),
             Some("2020-01-01T00:00:00.000Z"),
         );
-        let result = poll(
+
+        // `maxAgeMs: 0` applies a `now - 0` cutoff: older matching events are
+        // skipped and `truncated: true` is reported.
+        let bounded = poll(
             &manager,
             json!({
                 "name": "t3.run.completed",
@@ -1079,7 +1096,81 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["events"].as_array().unwrap().len(), 1);
-        assert_eq!(result["truncated"], false);
+        assert_eq!(bounded["resultType"], "complete");
+        assert_eq!(bounded["events"], json!([]));
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["cursor"], "seq_1");
+
+        // Omitting `maxAgeMs` replays arbitrarily old history without truncation.
+        let unbounded = poll(
+            &manager,
+            json!({
+                "name": "t3.run.completed",
+                "arguments": {"environment_id": "linux-main"},
+                "cursor": start["cursor"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unbounded["events"].as_array().unwrap().len(), 1);
+        assert_eq!(unbounded["events"][0]["eventId"], "evt_old");
+        assert_eq!(unbounded["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn poll_bounds_scan_to_sampled_watermark_under_concurrent_ingestion() {
+        let (manager, repo) = poll_manager();
+        ingest(
+            &repo,
+            "evt_1",
+            "t3.run.completed",
+            completed_payload("linux-main", "lnako"),
+            None,
+        );
+
+        // Simulate concurrent ingestion arriving after `latest = 1` is sampled
+        // and before batch scanning begins.
+        let first = manager
+            .poll_with_watermark_hook(
+                Some(json!({
+                    "name": "t3.run.completed",
+                    "arguments": {"environment_id": "linux-main"},
+                    "cursor": "seq_0"
+                })),
+                |latest| {
+                    assert_eq!(latest, 1);
+                    ingest(
+                        &repo,
+                        "evt_2",
+                        "t3.run.completed",
+                        completed_payload("linux-main", "lnako"),
+                        None,
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(first["resultType"], "complete");
+        let events = first["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{first}");
+        assert_eq!(events[0]["eventId"], "evt_1");
+        assert_eq!(first["cursor"], "seq_1");
+        assert_eq!(first["hasMore"], false);
+
+        // Next poll delivers evt_2 exactly once without duplicating evt_1.
+        let second = poll(
+            &manager,
+            json!({
+                "name": "t3.run.completed",
+                "arguments": {"environment_id": "linux-main"},
+                "cursor": first["cursor"]
+            }),
+        )
+        .await
+        .unwrap();
+        let events = second["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{second}");
+        assert_eq!(events[0]["eventId"], "evt_2");
+        assert_eq!(second["cursor"], "seq_2");
+        assert_eq!(second["hasMore"], false);
     }
 }

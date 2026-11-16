@@ -243,6 +243,7 @@ impl ToolService {
                 kind: args.kind,
                 kinds,
                 after_sequence,
+                max_sequence: None,
                 limit: limit as i64,
             })
             .map_err(|error| error.to_string())?;

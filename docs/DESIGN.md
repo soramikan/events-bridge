@@ -214,7 +214,7 @@ ChatGPT の `2xx` は **Webhook の受信確認**であり、dots が処理を�
 | `name` | 必須 | `events/list` が公開するイベント名。未知の名前は `-32023 NotFound`（`data.kind = "event"`）。 |
 | `arguments` | 任意 | `inputSchema` に対する購読フィルター。省略時は `{}`。検証失敗は `-32602 InvalidParams`。 |
 | `cursor` | 任意 | `"seq_<N>"` 形式の不透明カーソル。`null` / 省略は「現在時刻から開始」。 |
-| `maxAgeMs` | 任意 | 0 より大きい場合、`now - maxAgeMs` より古いイベントをスキップし、スキップが発生したら `truncated: true` を返す。`0` は無効。 |
+| `maxAgeMs` | 任意 | 指定時は `now - maxAgeMs` より古い一致イベントをスキップし、スキップが発生したら `truncated: true` を返す（`0` は現在時刻境界）。省略時は年齢制限なし。 |
 | `maxEvents` | 任意 | 1 レスポンスあたりの最大件数。既定 50、上限 200 にクランプ。`0` は `-32602`。 |
 | `_meta` | 任意 | MCP 2.0 のリクエストメタデータ。JSON オブジェクト以外は `-32602`。 |
 
@@ -225,6 +225,7 @@ ChatGPT の `2xx` は **Webhook の受信確認**であり、dots が処理を�
   "jsonrpc": "2.0",
   "id": 3,
   "result": {
+    "resultType": "complete",
     "events": [
       {
         "eventId": "evt_...",

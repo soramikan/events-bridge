@@ -2747,6 +2747,7 @@ async fn stdio_surface_supports_events_poll() {
     )
     .await;
     let start: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(start["result"]["resultType"], "complete");
     assert_eq!(start["result"]["events"], json!([]));
     assert_eq!(start["result"]["cursor"], "seq_2");
     assert_eq!(start["result"]["nextPollMs"], 5000);
@@ -2766,6 +2767,7 @@ async fn stdio_surface_supports_events_poll() {
     )
     .await;
     let polled: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(polled["result"]["resultType"], "complete");
     let events = polled["result"]["events"].as_array().unwrap();
     assert_eq!(events.len(), 2, "{polled}");
     assert_eq!(events[0]["eventId"], "evt_stdio_poll_0");

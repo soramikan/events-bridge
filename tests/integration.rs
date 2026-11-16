@@ -672,6 +672,7 @@ async fn events_poll_starts_from_now_and_filters_by_arguments() {
             )
             .await,
     );
+    assert_eq!(start["resultType"], "complete");
     assert_eq!(start["events"], json!([]));
     assert_eq!(start["cursor"], "seq_0");
     assert_eq!(start["truncated"], false);

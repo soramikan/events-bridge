@@ -196,6 +196,8 @@ pub struct EventQuery {
     pub kinds: Option<Vec<String>>,
     /// Return events with `sequence > after_sequence`.
     pub after_sequence: Option<i64>,
+    /// Return events with `sequence <= max_sequence`.
+    pub max_sequence: Option<i64>,
     /// Maximum number of events (already clamped by the caller).
     pub limit: i64,
 }
@@ -413,6 +415,10 @@ impl Repository {
         if let Some(after) = query.after_sequence {
             sql.push_str(" AND sequence > ?");
             args.push(SqlValue::Integer(after));
+        }
+        if let Some(max) = query.max_sequence {
+            sql.push_str(" AND sequence <= ?");
+            args.push(SqlValue::Integer(max));
         }
         sql.push_str(" ORDER BY sequence ASC LIMIT ?");
         args.push(SqlValue::Integer(query.limit.max(1)));
