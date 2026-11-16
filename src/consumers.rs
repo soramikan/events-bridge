@@ -4,19 +4,35 @@
 //! translates it into a durable cursor query, and renders the JSON shapes
 //! shared by the CLI, HTTP endpoints and MCP tools.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
+use anyhow::Context;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
     config::{Config, ConsumerProfileConfig, EventDisposition, resolve_consumer_profile},
     mcp::event_catalog,
-    store::{ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, Repository},
+    store::{
+        ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, ConsumerPollSnapshotQuery,
+        Event, Repository,
+    },
 };
 
 /// Largest page a consumer poll will return, matching the MCP pull tools.
 pub const MAX_CONSUMER_POLL_LIMIT: usize = 200;
+
+/// Upper bound on digest events inspected during one catchup poll.
+///
+/// A digest summary only needs counts and a bounded id sample, so a large
+/// backlog can be summarized without loading every row into memory. When the
+/// backlog exceeds this cap the poll reports `hasMore` and the next poll picks
+/// up where the summary stopped.
+pub const MAX_DIGEST_CATCHUP_EVENTS: usize = 10_000;
 
 /// Why a consumer operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +112,31 @@ pub struct ConsumerEventItem {
     pub data: Value,
 }
 
+/// One aggregated digest window.
+///
+/// `digest`-disposition events are grouped by the time window that contains
+/// their `occurredAt` value. The window is a half-open interval
+/// `[windowStart, windowEnd)` whose start is floored to a multiple of the
+/// profile's `digest_window_secs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumerDigestItem {
+    /// Inclusive RFC 3339 UTC window start.
+    pub window_start: String,
+    /// Exclusive RFC 3339 UTC window end.
+    pub window_end: String,
+    /// Total digest events in the window.
+    pub count: usize,
+    /// Digest event counts keyed by event kind.
+    pub counts_by_kind: BTreeMap<String, usize>,
+    /// Ascending event ids, capped at `max_digest_event_ids`.
+    pub event_ids: Vec<String>,
+    /// Whether `count` exceeds the number of ids in `event_ids`.
+    pub event_ids_truncated: bool,
+    /// Highest event sequence in the window.
+    pub max_sequence: i64,
+}
+
 /// Poll response.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,21 +145,22 @@ pub struct ConsumerPoll {
     pub consumer: String,
     /// Cursor used for this poll (unchanged by polling).
     pub cursor_sequence: i64,
-    /// Highest sequence included in this response, or the cursor when empty.
+    /// Highest sequence covered by this response, or the cursor when empty.
+    ///
+    /// This includes sequences summarized in `digests`, so an acknowledgement
+    /// at this value advances past both `events` and `digests`.
     pub next_cursor_sequence: i64,
     /// Highest stored event sequence.
     pub latest_sequence: i64,
     /// Whether more matching events remain beyond this page.
     pub has_more: bool,
-    /// Whether the response was truncated for a reason other than `limit`.
-    ///
-    /// Phase A always returns `false`; the field exists so clients can rely on
-    /// it when digest-aware paging lands.
+    /// Whether unread digest events exceeded the poll budget and were returned
+    /// as aggregated summaries instead of individual events.
     pub truncated: bool,
-    /// Matching events in ascending sequence order.
+    /// Unaggregated `immediate` events in ascending sequence order.
     pub events: Vec<ConsumerEventItem>,
-    /// Reserved for Phase A2 digest summaries.
-    pub digests: Vec<Value>,
+    /// Aggregated `digest` events grouped by time window, oldest window first.
+    pub digests: Vec<ConsumerDigestItem>,
 }
 
 /// Acknowledgement response.
@@ -186,14 +228,48 @@ impl ConsumerService {
     ///
     /// At-least-once semantics: every call returns unacknowledged events, so a
     /// crash between poll and ack re-delivers rather than loses events.
+    ///
+    /// `immediate` events are always returned individually and are never
+    /// displaced by a `digest` backlog. `digest` events are aggregated by time
+    /// window and are only summarized (never dropped) when the unread digest
+    /// backlog exceeds the remaining poll budget; the summary still covers
+    /// every inspected digest event so `nextCursorSequence` never skips one.
     pub fn poll(
         &self,
         name: &str,
         limit_override: Option<usize>,
     ) -> Result<ConsumerPoll, ConsumerError> {
+        self.poll_with_snapshot(name, limit_override, |consumer, query| {
+            self.repo.poll_consumer_snapshot(consumer, query)
+        })
+    }
+
+    #[cfg(test)]
+    fn poll_with_snapshot_hook(
+        &self,
+        name: &str,
+        limit_override: Option<usize>,
+        after_immediate_read: impl FnOnce(),
+    ) -> Result<ConsumerPoll, ConsumerError> {
+        self.poll_with_snapshot(name, limit_override, |consumer, query| {
+            self.repo
+                .poll_consumer_snapshot_with_hook(consumer, query, after_immediate_read)
+        })
+    }
+
+    fn poll_with_snapshot(
+        &self,
+        name: &str,
+        limit_override: Option<usize>,
+        read_snapshot: impl FnOnce(
+            &str,
+            &ConsumerPollSnapshotQuery<'_>,
+        ) -> anyhow::Result<crate::store::ConsumerPollSnapshot>,
+    ) -> Result<ConsumerPoll, ConsumerError> {
         let (consumer, profile) = self.resolve(name)?;
-        let row = self.repo.ensure_consumer(&consumer)?;
-        let kinds = enabled_kinds(&profile);
+        let immediate_kinds = enabled_kinds_for(&profile, EventDisposition::Immediate);
+        let digest_kinds = enabled_kinds_for(&profile, EventDisposition::Digest);
+        let all_kinds = enabled_kinds(&profile);
         let filters = event_filter(&profile);
 
         let limit = match limit_override {
@@ -203,51 +279,42 @@ impl ConsumerService {
                 .clamp(1, MAX_CONSUMER_POLL_LIMIT),
         };
 
-        let mut events = self.repo.list_consumer_events(
-            row.cursor_sequence,
-            &kinds,
-            &filters,
-            limit.saturating_add(1),
-        )?;
-        let has_more = events.len() > limit;
-        events.truncate(limit);
+        let query = ConsumerPollSnapshotQuery {
+            limit,
+            digest_catchup_limit: MAX_DIGEST_CATCHUP_EVENTS,
+            immediate_kinds: &immediate_kinds,
+            digest_kinds: &digest_kinds,
+            all_kinds: &all_kinds,
+            filters: &filters,
+        };
+        let snapshot = read_snapshot(&consumer, &query)?;
 
-        let next_cursor_sequence = events
-            .last()
-            .map(|event| event.sequence)
-            .unwrap_or(row.cursor_sequence);
-        self.repo.mark_consumer_polled(&consumer)?;
-        let latest_sequence = self.repo.latest_event_sequence()?;
+        let digests = aggregate_digests(&snapshot.digest_events, &profile)?;
+        let next_cursor_sequence = snapshot.next_cursor_ceiling.unwrap_or_else(|| {
+            snapshot
+                .immediate_events
+                .iter()
+                .map(|event| event.sequence)
+                .chain(snapshot.digest_events.iter().map(|event| event.sequence))
+                .max()
+                .unwrap_or(snapshot.cursor_sequence)
+        });
 
-        let events = events
+        let events = snapshot
+            .immediate_events
             .into_iter()
-            .map(|event| {
-                let disposition = profile
-                    .events
-                    .get(&event.kind)
-                    .copied()
-                    .unwrap_or(profile.default_disposition);
-                ConsumerEventItem {
-                    event_id: event.id,
-                    sequence: event.sequence,
-                    name: event.kind,
-                    source: event.source,
-                    disposition: disposition_name(disposition).to_string(),
-                    occurred_at: event.occurred_at,
-                    data: event.payload,
-                }
-            })
+            .map(|event| render_event(&profile, event))
             .collect();
 
         Ok(ConsumerPoll {
             consumer,
-            cursor_sequence: row.cursor_sequence,
+            cursor_sequence: snapshot.cursor_sequence,
             next_cursor_sequence,
-            latest_sequence,
-            has_more,
-            truncated: false,
+            latest_sequence: snapshot.latest_sequence,
+            has_more: snapshot.has_more,
+            truncated: snapshot.truncated,
             events,
-            digests: Vec::new(),
+            digests,
         })
     }
 
@@ -286,7 +353,7 @@ fn disposition_for(profile: &ConsumerProfileConfig, name: &str) -> EventDisposit
 /// The catalog gives the default-enabled set; explicit profile keys extend it
 /// so a profile can opt into an event name that is not in the current catalog.
 fn enabled_kinds(profile: &ConsumerProfileConfig) -> Vec<String> {
-    let mut kinds = std::collections::BTreeSet::new();
+    let mut kinds = BTreeSet::new();
     for (name, disposition) in &profile.events {
         if *disposition != EventDisposition::Off {
             kinds.insert(name.clone());
@@ -295,6 +362,24 @@ fn enabled_kinds(profile: &ConsumerProfileConfig) -> Vec<String> {
     if profile.default_disposition != EventDisposition::Off {
         for definition in event_catalog::EVENTS.iter() {
             if disposition_for(profile, definition.name) != EventDisposition::Off {
+                kinds.insert(definition.name.to_string());
+            }
+        }
+    }
+    kinds.into_iter().collect()
+}
+
+/// Names the consumer wants delivered with exactly `wanted` disposition.
+fn enabled_kinds_for(profile: &ConsumerProfileConfig, wanted: EventDisposition) -> Vec<String> {
+    let mut kinds = BTreeSet::new();
+    for (name, disposition) in &profile.events {
+        if *disposition == wanted {
+            kinds.insert(name.clone());
+        }
+    }
+    if profile.default_disposition != EventDisposition::Off {
+        for definition in event_catalog::EVENTS.iter() {
+            if disposition_for(profile, definition.name) == wanted {
                 kinds.insert(definition.name.to_string());
             }
         }
@@ -318,6 +403,101 @@ fn disposition_name(disposition: EventDisposition) -> &'static str {
     }
 }
 
+/// Render one immediate event for the poll response.
+fn render_event(profile: &ConsumerProfileConfig, event: Event) -> ConsumerEventItem {
+    let disposition = disposition_for(profile, &event.kind);
+    ConsumerEventItem {
+        event_id: event.id,
+        sequence: event.sequence,
+        name: event.kind,
+        source: event.source,
+        disposition: disposition_name(disposition).to_string(),
+        occurred_at: event.occurred_at,
+        data: event.payload,
+    }
+}
+
+/// Accumulator for one digest time window while grouping rows.
+struct DigestAccumulator {
+    window_start: i64,
+    window_end: i64,
+    count: usize,
+    counts_by_kind: BTreeMap<String, usize>,
+    event_ids: Vec<String>,
+    max_sequence: i64,
+}
+
+/// Group digest events by `digest_window_secs` and render summaries.
+///
+/// Events are supplied in ascending sequence order, so the retained id sample
+/// is also ascending. Windows are emitted oldest first.
+fn aggregate_digests(
+    events: &[Event],
+    profile: &ConsumerProfileConfig,
+) -> anyhow::Result<Vec<ConsumerDigestItem>> {
+    let window_secs = i64::try_from(profile.digest_window_secs)
+        .ok()
+        .filter(|secs| *secs > 0)
+        .unwrap_or(600);
+    let max_event_ids = profile.max_digest_event_ids;
+    let mut windows: BTreeMap<i64, DigestAccumulator> = BTreeMap::new();
+
+    for event in events {
+        let occurred_at = DateTime::parse_from_rfc3339(&event.occurred_at).with_context(|| {
+            format!(
+                "event `{}` has an invalid occurred_at `{}`",
+                event.id, event.occurred_at
+            )
+        })?;
+        let timestamp = occurred_at.timestamp();
+        let window_start = timestamp - timestamp.rem_euclid(window_secs);
+        let window_end = window_start + window_secs;
+        let accumulator = windows
+            .entry(window_start)
+            .or_insert_with(|| DigestAccumulator {
+                window_start,
+                window_end,
+                count: 0,
+                counts_by_kind: BTreeMap::new(),
+                event_ids: Vec::new(),
+                max_sequence: event.sequence,
+            });
+
+        accumulator.count += 1;
+        *accumulator
+            .counts_by_kind
+            .entry(event.kind.clone())
+            .or_insert(0) += 1;
+        if accumulator.event_ids.len() < max_event_ids {
+            accumulator.event_ids.push(event.id.clone());
+        }
+        accumulator.max_sequence = accumulator.max_sequence.max(event.sequence);
+    }
+
+    windows
+        .into_values()
+        .map(|accumulator| {
+            Ok(ConsumerDigestItem {
+                window_start: format_window_timestamp(accumulator.window_start)?,
+                window_end: format_window_timestamp(accumulator.window_end)?,
+                count: accumulator.count,
+                event_ids_truncated: accumulator.count > accumulator.event_ids.len(),
+                counts_by_kind: accumulator.counts_by_kind,
+                event_ids: accumulator.event_ids,
+                max_sequence: accumulator.max_sequence,
+            })
+        })
+        .collect()
+}
+
+/// Format an epoch second as a canonical RFC 3339 UTC timestamp.
+fn format_window_timestamp(epoch_seconds: i64) -> anyhow::Result<String> {
+    let timestamp = DateTime::<Utc>::from_timestamp(epoch_seconds, 0).ok_or_else(|| {
+        anyhow::anyhow!("digest window timestamp {epoch_seconds} is out of range")
+    })?;
+    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,12 +511,16 @@ mod tests {
     }
 
     fn ingest(repo: &Repository, id: &str, kind: &str, payload: Value) {
+        ingest_at(repo, id, kind, "2026-11-16T01:00:00.000Z", payload);
+    }
+
+    fn ingest_at(repo: &Repository, id: &str, kind: &str, occurred_at: &str, payload: Value) {
         repo.ingest_event(NewEvent {
             id: Some(id.into()),
             source: None,
             kind: kind.into(),
             payload,
-            occurred_at: Some("2026-11-16T01:00:00.000Z".into()),
+            occurred_at: Some(occurred_at.into()),
         })
         .unwrap();
     }
@@ -419,13 +603,18 @@ mod tests {
             .iter()
             .map(|event| (event.name.as_str(), event.disposition.as_str()))
             .collect();
+        assert_eq!(dispositions, vec![("t3.run.failed", "immediate")]);
+        assert_eq!(poll.digests.len(), 1);
+        assert_eq!(poll.digests[0].count, 1);
         assert_eq!(
-            dispositions,
-            vec![
-                ("t3.run.failed", "immediate"),
-                ("github.review.requested", "digest"),
-            ]
+            poll.digests[0]
+                .counts_by_kind
+                .get("github.review.requested"),
+            Some(&1)
         );
+        assert_eq!(poll.next_cursor_sequence, 2);
+        assert!(!poll.has_more);
+        assert!(!poll.truncated);
     }
 
     #[test]
@@ -552,8 +741,13 @@ mod tests {
             }),
         );
 
-        assert_eq!(service.poll("alpha", None).unwrap().events.len(), 1);
-        assert_eq!(service.poll("beta", None).unwrap().events.len(), 1);
+        let alpha_poll = service.poll("alpha", None).unwrap();
+        assert_eq!(alpha_poll.events.len(), 1);
+        assert!(alpha_poll.digests.is_empty());
+        let beta_poll = service.poll("beta", None).unwrap();
+        assert!(beta_poll.events.is_empty());
+        assert_eq!(beta_poll.digests.len(), 1);
+        assert_eq!(beta_poll.digests[0].count, 1);
 
         service.ack("alpha", 2).unwrap();
         assert_eq!(service.probe("alpha").unwrap().unread_count, 0);
@@ -704,6 +898,267 @@ mod tests {
         assert_eq!(poll.cursor_sequence, 0);
     }
 
+    fn failed_payload(run_id: &str) -> Value {
+        json!({
+            "environment_id": "linux-main",
+            "project_id": "lnako",
+            "thread_id": "thread-1",
+            "run_id": run_id,
+            "summary": "failed",
+            "error": "boom"
+        })
+    }
+
+    fn completed_payload(run_id: &str) -> Value {
+        json!({
+            "environment_id": "linux-main",
+            "project_id": "lnako",
+            "thread_id": "thread-1",
+            "run_id": run_id,
+            "summary": "done"
+        })
+    }
+
+    fn review_payload() -> Value {
+        json!({
+            "repository": "soramikan/events-bridge",
+            "pull_number": 7,
+            "title": "Review me",
+            "url": "https://github.com/soramikan/events-bridge/pull/7"
+        })
+    }
+
+    fn service_with_profile(profile: ConsumerProfileConfig) -> (ConsumerService, Arc<Repository>) {
+        let repo = Arc::new(Repository::open_in_memory().unwrap());
+        let mut profiles = BTreeMap::new();
+        profiles.insert("muse".into(), profile);
+        let service = ConsumerService::new(repo.clone(), profiles);
+        (service, repo)
+    }
+
+    #[test]
+    fn digest_windows_group_by_configured_boundary() {
+        let (service, repo) = service();
+        ingest_at(
+            &repo,
+            "evt_d1",
+            "t3.run.completed",
+            "2026-11-16T01:00:00.000Z",
+            completed_payload("run-1"),
+        );
+        ingest_at(
+            &repo,
+            "evt_d2",
+            "github.review.requested",
+            "2026-11-16T01:05:00.000Z",
+            review_payload(),
+        );
+        ingest_at(
+            &repo,
+            "evt_d3",
+            "t3.run.completed",
+            "2026-11-16T01:09:59.999Z",
+            completed_payload("run-2"),
+        );
+        ingest_at(
+            &repo,
+            "evt_d4",
+            "t3.run.completed",
+            "2026-11-16T01:10:00.000Z",
+            completed_payload("run-3"),
+        );
+        ingest_at(
+            &repo,
+            "evt_d5",
+            "github.pr.merged",
+            "2026-11-16T02:00:00.000Z",
+            json!({
+                "repository": "soramikan/events-bridge",
+                "pull_number": 8,
+                "title": "Merged",
+                "url": "https://github.com/soramikan/events-bridge/pull/8"
+            }),
+        );
+
+        let poll = service.poll("muse", None).unwrap();
+        assert!(poll.events.is_empty());
+        assert_eq!(poll.digests.len(), 3);
+
+        let first = &poll.digests[0];
+        assert_eq!(first.window_start, "2026-11-16T01:00:00Z");
+        assert_eq!(first.window_end, "2026-11-16T01:10:00Z");
+        assert_eq!(first.count, 3);
+        assert_eq!(first.event_ids, vec!["evt_d1", "evt_d2", "evt_d3"]);
+        assert!(!first.event_ids_truncated);
+        assert_eq!(first.max_sequence, 3);
+        assert_eq!(first.counts_by_kind.get("t3.run.completed"), Some(&2));
+        assert_eq!(
+            first.counts_by_kind.get("github.review.requested"),
+            Some(&1)
+        );
+
+        assert_eq!(poll.digests[1].window_start, "2026-11-16T01:10:00Z");
+        assert_eq!(poll.digests[1].window_end, "2026-11-16T01:20:00Z");
+        assert_eq!(poll.digests[1].count, 1);
+        assert_eq!(poll.digests[1].max_sequence, 4);
+
+        assert_eq!(poll.digests[2].window_start, "2026-11-16T02:00:00Z");
+        assert_eq!(poll.digests[2].window_end, "2026-11-16T02:10:00Z");
+        assert_eq!(poll.digests[2].count, 1);
+        assert_eq!(poll.digests[2].max_sequence, 5);
+
+        // Cursor advances past every sequence covered by the digest summaries.
+        assert_eq!(poll.next_cursor_sequence, 5);
+        assert!(!poll.has_more);
+        assert!(!poll.truncated);
+    }
+
+    #[test]
+    fn digest_event_ids_are_capped_and_flag_truncation() {
+        let profile = ConsumerProfileConfig {
+            max_digest_event_ids: 2,
+            ..ConsumerProfileConfig::muse_default()
+        };
+        let (service, repo) = service_with_profile(profile);
+        for index in 1..=3 {
+            ingest_at(
+                &repo,
+                &format!("evt_d{index}"),
+                "t3.run.completed",
+                "2026-11-16T01:00:00.000Z",
+                completed_payload(&format!("run-{index}")),
+            );
+        }
+
+        let poll = service.poll("muse", None).unwrap();
+        assert_eq!(poll.digests.len(), 1);
+        let digest = &poll.digests[0];
+        assert_eq!(digest.count, 3);
+        assert_eq!(digest.event_ids, vec!["evt_d1", "evt_d2"]);
+        assert!(digest.event_ids_truncated);
+        assert_eq!(digest.max_sequence, 3);
+    }
+
+    #[test]
+    fn immediate_events_survive_a_larger_digest_backlog() {
+        let profile = ConsumerProfileConfig {
+            max_events_per_poll: 2,
+            ..ConsumerProfileConfig::muse_default()
+        };
+        let (service, repo) = service_with_profile(profile);
+        ingest(
+            &repo,
+            "evt_immediate",
+            "t3.run.failed",
+            failed_payload("run-immediate"),
+        );
+        for index in 0..5 {
+            ingest(
+                &repo,
+                &format!("evt_digest_{index}"),
+                "t3.run.completed",
+                completed_payload(&format!("run-{index}")),
+            );
+        }
+
+        let poll = service.poll("muse", None).unwrap();
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(poll.events[0].event_id, "evt_immediate");
+        assert_eq!(poll.events[0].disposition, "immediate");
+        assert_eq!(poll.digests.len(), 1);
+        assert_eq!(poll.digests[0].count, 5);
+        assert_eq!(
+            poll.digests[0].counts_by_kind.get("t3.run.completed"),
+            Some(&5)
+        );
+        assert!(poll.truncated);
+        assert!(!poll.has_more);
+        assert_eq!(poll.next_cursor_sequence, 6);
+
+        // One acknowledgement covers the immediate event and every summarized
+        // digest event.
+        service.ack("muse", poll.next_cursor_sequence).unwrap();
+        assert_eq!(service.probe("muse").unwrap().unread_count, 0);
+    }
+
+    #[test]
+    fn immediate_event_after_digest_backlog_is_never_dropped() {
+        let (service, repo) = service();
+        for index in 0..5 {
+            ingest(
+                &repo,
+                &format!("evt_digest_{index}"),
+                "github.review.requested",
+                review_payload(),
+            );
+        }
+        ingest(
+            &repo,
+            "evt_immediate",
+            "t3.run.failed",
+            failed_payload("run-immediate"),
+        );
+
+        let poll = service.poll("muse", Some(1)).unwrap();
+        assert_eq!(poll.events.len(), 1);
+        assert_eq!(poll.events[0].event_id, "evt_immediate");
+        assert_eq!(poll.digests.len(), 1);
+        assert_eq!(poll.digests[0].count, 5);
+        assert!(poll.truncated);
+        assert!(!poll.has_more);
+        assert_eq!(poll.next_cursor_sequence, 6);
+
+        // The digest events precede the immediate event, so acking the
+        // immediate sequence must still cover them.
+        service.ack("muse", poll.next_cursor_sequence).unwrap();
+        assert_eq!(service.probe("muse").unwrap().unread_count, 0);
+    }
+
+    #[test]
+    fn poll_limit_pages_immediate_events_without_skipping_digests() {
+        let (service, repo) = service();
+        for index in 0..3 {
+            ingest(
+                &repo,
+                &format!("evt_{index}"),
+                "t3.run.failed",
+                failed_payload(&format!("run-{index}")),
+            );
+        }
+        ingest(
+            &repo,
+            "evt_digest",
+            "t3.run.completed",
+            completed_payload("run-digest"),
+        );
+
+        let first = service.poll("muse", Some(2)).unwrap();
+        assert_eq!(first.events.len(), 2);
+        assert!(first.digests.is_empty());
+        assert!(first.has_more);
+        assert!(!first.truncated);
+        assert_eq!(first.next_cursor_sequence, 2);
+
+        service.ack("muse", first.next_cursor_sequence).unwrap();
+
+        let second = service.poll("muse", Some(2)).unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event_id, "evt_2");
+        assert_eq!(second.digests.len(), 1);
+        assert_eq!(second.digests[0].count, 1);
+        assert!(!second.has_more);
+        assert!(!second.truncated);
+        assert_eq!(second.next_cursor_sequence, 4);
+
+        service.ack("muse", second.next_cursor_sequence).unwrap();
+        let empty = service.poll("muse", Some(2)).unwrap();
+        assert!(empty.events.is_empty());
+        assert!(empty.digests.is_empty());
+        assert_eq!(empty.next_cursor_sequence, 4);
+        assert!(!empty.has_more);
+        assert!(!empty.truncated);
+    }
+
     #[test]
     fn unknown_consumers_are_rejected_clearly() {
         let (service, _) = service();
@@ -780,5 +1235,61 @@ mod tests {
             final_probe.unread_count,
             final_probe.latest_sequence - final_probe.cursor_sequence
         );
+    }
+
+    #[test]
+    fn poll_shares_one_snapshot_so_concurrent_ingest_never_skips_immediate_events() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let writer_repo = Arc::new(Repository::open(temp.path()).unwrap());
+        let reader_repo = Arc::new(Repository::open(temp.path()).unwrap());
+        let service = ConsumerService::new(reader_repo, Config::default().consumers);
+
+        // Initialize the durable consumer row at cursor 0 so poll uses a
+        // read-only WAL snapshot while the concurrent writer commits.
+        assert_eq!(service.probe("muse").unwrap().cursor_sequence, 0);
+        ingest(
+            &writer_repo,
+            "evt_digest_1",
+            "t3.run.completed",
+            completed_payload("run-1"),
+        );
+
+        let first = service
+            .poll_with_snapshot_hook("muse", Some(2), || {
+                ingest(
+                    &writer_repo,
+                    "evt_immediate_2",
+                    "t3.run.failed",
+                    failed_payload("run-2"),
+                );
+                ingest(
+                    &writer_repo,
+                    "evt_digest_3",
+                    "t3.run.completed",
+                    completed_payload("run-3"),
+                );
+            })
+            .unwrap();
+
+        // Snapshot sees only sequence 1: cursor does not jump to 3 past
+        // immediate sequence 2.
+        assert!(first.events.is_empty());
+        assert_eq!(first.digests.len(), 1);
+        assert_eq!(first.digests[0].count, 1);
+        assert_eq!(first.digests[0].max_sequence, 1);
+        assert_eq!(first.next_cursor_sequence, 1);
+        assert_eq!(first.latest_sequence, 1);
+        assert!(!first.has_more);
+
+        service.ack("muse", first.next_cursor_sequence).unwrap();
+
+        let second = service.poll("muse", Some(2)).unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event_id, "evt_immediate_2");
+        assert_eq!(second.digests.len(), 1);
+        assert_eq!(second.digests[0].count, 1);
+        assert_eq!(second.digests[0].max_sequence, 3);
+        assert_eq!(second.next_cursor_sequence, 3);
+        assert!(!second.has_more);
     }
 }

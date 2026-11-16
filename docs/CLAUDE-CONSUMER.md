@@ -97,6 +97,9 @@ $ events-bridge poll --consumer muse --probe
 
 ### poll（本文取得、カーソルは進めない）
 
+`immediate` イベントは `events` に 1 件ずつ、`digest` イベントは `digests` に
+時間ウィンドウ単位の要約として返る。`digest` イベントが `events` に重複して現れることはない。
+
 ```console
 $ events-bridge poll --consumer muse --limit 50
 {
@@ -117,12 +120,45 @@ $ events-bridge poll --consumer muse --limit 50
       "data": { "...": "..." }
     }
   ],
-  "digests": []
+  "digests": [
+    {
+      "windowStart": "2026-11-16T01:00:00Z",
+      "windowEnd": "2026-11-16T01:10:00Z",
+      "count": 3,
+      "countsByKind": { "t3.run.completed": 2, "github.review.requested": 1 },
+      "eventIds": ["evt_...", "evt_...", "evt_..."],
+      "eventIdsTruncated": false,
+      "maxSequence": 42
+    }
+  ]
 }
 ```
 
-`--limit` は 1..=200 にクランプされる。`nextCursorSequence` は返却された最大 sequence、
-0 件なら現在の `cursorSequence`。
+`--limit` は 1..=200 にクランプされる。`nextCursorSequence` は `events` と `digests` の
+両方がカバーする最大 sequence。0 件なら現在の `cursorSequence`。
+
+#### digest の集約（A4）
+
+- `digest_window_secs`（既定 `600`）で `occurredAt` を floor した時間ウィンドウにまとめる。
+  `windowStart` / `windowEnd` は RFC 3339 UTC で、半開区間 `[windowStart, windowEnd)`。
+- `count` はウィンドウ内の digest 件数、`countsByKind` は種別ごとの件数、`maxSequence` は
+  ウィンドウ内の最大 sequence。
+- `eventIds` は昇順に `max_digest_event_ids`（既定 `50`）件まで。`count` がそれを超えると
+  `eventIdsTruncated: true` になる。
+- `digests` は `windowStart` の昇順。
+
+#### catchup 制御（A5）
+
+- `immediate` は決して落とさない。digest の backlog が `max_events_per_poll` を超えても、
+  immediate が先に返る。
+- immediate が `limit` 件に達したページでは、それ以降の digest を返さず `hasMore: true`。
+  最後に返した immediate 以下の sequence にある digest は ack で飛ばさないよう要約に含める。
+- immediate が `limit` 件未満で、未読 digest が残り予算以下なら全件を集約して
+  `truncated: false` / `hasMore: false`。
+- 未読 digest が残り予算を超えると、immediate を全件保持したまま digest を最大 10,000 件まで
+  走査して要約し、`truncated: true`。digest の走査上限を超えた場合は `hasMore: true`。
+- `hasMore` は未返却イベントが残っていること、`truncated` は詳細を要約に落としたことを示す。
+  どちらも `nextCursorSequence` より後ろのイベントを飛ばす理由にはならない。
 
 ### ack（カーソルを前進）
 
@@ -206,6 +242,11 @@ cron の例（5 分ごと。多重起動を避けるため `flock` を使う）:
 - **ack は処理成功後だけ**。処理途中で落ちた場合、次回の poll で同じイベントが返る
   （at-least-once）。イベント ID で重複処理を排除する。
 - `poll` はカーソルを進めない。`--limit` で分割しても、ack するまで先頭から返る。
+- `digests` も処理対象。`nextCursorSequence` で ack すると `events` と `digests` の両方が
+  まとめて前進するため、`digests` を無視したまま ack しない。
+- `truncated: true` は「digest backlog が大きく要約した」ことを示す。`eventIdsTruncated` が
+  true の場合は `count` / `countsByKind` を見て通知内容を決める。必要なら `probe` ではなく
+  未読のうちに別の consumer や `list_events` で詳細を確認する。
 - `probe` と `poll` は同じプロファイルを使う。`off` のイベントはどちらにも現れない。
 - `ack_events`（MCP のユーザー確認ツール）は consumer カーソルとは無関係。
   誤って `ack_events` を呼んでも consumer の未読状態は変わらない。

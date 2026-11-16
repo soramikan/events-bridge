@@ -158,7 +158,7 @@ pub fn definitions() -> Vec<Tool> {
             ),
             tool(
                 "poll_consumer_events",
-                "Fetch unacknowledged events for a named polling consumer. Polling does not advance the consumer cursor.",
+                "Fetch unacknowledged events for a named polling consumer. Immediate events are returned individually, digest events are aggregated into time-window summaries, and polling does not advance the consumer cursor.",
                 json!({
                     "type": "object",
                     "properties": {
