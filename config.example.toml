@@ -43,6 +43,33 @@ path = "/var/lib/events-bridge/events.db"
 # token_env = "EVENTS_BRIDGE_TOKEN"
 principal = "chatgpt"
 
+# OAuth 2.1 authorization server (Phase C2).
+#
+# Pre-register clients here; dynamic client registration is deliberately not
+# exposed. Every client uses mandatory PKCE S256. Confidential clients name
+# their secret through an environment variable so no secret is stored in this
+# file. Public clients omit `client_secret_env`.
+#
+# When enabled, the consent page also asks for the administrator approval
+# secret read from `admin_secret_env`. The static `[auth].token_env` bearer can
+# coexist and always grants every scope; when it is omitted, `/mcp` and
+# `/consumers/*` require an OAuth access token.
+# [oauth]
+# enabled = true
+# issuer = "https://bridge.example.com"
+# admin_secret_env = "EVENTS_BRIDGE_OAUTH_ADMIN_SECRET"
+# access_token_ttl_secs = 3600
+# refresh_token_ttl_secs = 2592000
+# authorization_code_ttl_secs = 300
+#
+# [[oauth.clients]]
+# client_id = "chatgpt"
+# # Omit client_secret_env for a public PKCE client.
+# client_secret_env = "EVENTS_BRIDGE_OAUTH_CLIENT_SECRET"
+# redirect_uris = ["https://chatgpt.com/connector/oauth/callback"]
+# scopes = ["events.read", "events.subscribe", "events.ack"]
+# principal = "chatgpt"
+
 [subscriptions]
 default_ttl_secs = 3600
 min_ttl_secs = 60

@@ -20,7 +20,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{any, get, post},
 };
 use rmcp::transport::streamable_http_server::{
@@ -35,13 +35,17 @@ use url::Url;
 
 use crate::{
     app::AppState,
-    auth::AuthError,
+    auth::{Auth, AuthError, AuthenticatedPrincipal},
     consumers::ConsumerError,
     edge_protocol::{
         EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE, HEADER_EDGE_SIGNATURE,
         HEADER_EDGE_TIMESTAMP, valid_edge_token, verify as verify_edge_signature,
     },
     mcp::{error::INVALID_REQUEST, handler::EventsHandler},
+    oauth::{
+        AuthorizationParams, ClientAuthentication, DECISION_FIELD, OAuthError, OAuthService,
+        RevokeParams, TokenParams, required_scope_for_method, required_scope_for_tool,
+    },
     store::{NewEvent, SnapshotCommitError},
     util::constant_time_eq,
 };
@@ -52,6 +56,7 @@ pub const EVENTS_CAPABILITY: &str = "events";
 const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024 + 4096;
 const MAX_MCP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const HEADER_INTERNAL_TOKEN: &str = "x-internal-token";
+const MAX_OAUTH_FORM_BYTES: usize = 64 * 1024;
 
 struct McpHttpState {
     app: Arc<AppState>,
@@ -83,11 +88,65 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
         )
     };
 
+    let oauth_routes = app.oauth.as_deref().map(|oauth| {
+        (
+            oauth.base_path().to_string(),
+            oauth.authorization_server_metadata_path(),
+            oauth.protected_resource_metadata_path(),
+            oauth.authorize_path(),
+            oauth.token_path(),
+            oauth.revoke_path(),
+        )
+    });
+
     let state = Arc::new(McpHttpState { app, service });
 
-    Router::new()
+    let mut router = Router::new()
         .route("/mcp", any(mcp_entry))
         .route("/healthz", get(healthz))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource_metadata),
+        )
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize_get).post(oauth_authorize_post),
+        )
+        .route("/oauth/token", post(oauth_token))
+        .route("/oauth/revoke", post(oauth_revoke));
+
+    if let Some((
+        base_path,
+        auth_server_meta_path,
+        protected_resource_meta_path,
+        authorize_path,
+        token_path,
+        revoke_path,
+    )) = oauth_routes
+        && !base_path.is_empty()
+    {
+        router = router
+            .route(
+                &auth_server_meta_path,
+                get(oauth_authorization_server_metadata),
+            )
+            .route(
+                &protected_resource_meta_path,
+                get(oauth_protected_resource_metadata),
+            )
+            .route(
+                &authorize_path,
+                get(oauth_authorize_get).post(oauth_authorize_post),
+            )
+            .route(&token_path, post(oauth_token))
+            .route(&revoke_path, post(oauth_revoke));
+    }
+
+    router
         .route("/internal/events", post(internal_ingest))
         .route("/internal/edge/t3", post(edge_ingest))
         .route("/webhooks/github", post(github_webhook_entry))
@@ -296,10 +355,378 @@ fn invalid_request(message: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+fn required_scope_for_message(value: &Value) -> Option<&'static str> {
+    let object = value.as_object()?;
+    let method = object.get("method")?.as_str()?;
+    if method == "tools/call" {
+        let name = object
+            .get("params")
+            .and_then(Value::as_object)
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)?;
+        return required_scope_for_tool(name);
+    }
+    required_scope_for_method(method)
+}
+
+fn missing_scope(value: &Value, identity: &AuthenticatedPrincipal) -> Option<&'static str> {
+    match value {
+        Value::Array(messages) => messages
+            .iter()
+            .find_map(|message| missing_scope(message, identity)),
+        other => required_scope_for_message(other).filter(|scope| !identity.has_scope(scope)),
+    }
+}
+
+fn unauthorized(error: AuthError, oauth: Option<&OAuthService>) -> Response {
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": error.message()})),
+    )
+        .into_response();
+    let challenge = match oauth {
+        Some(oauth) => format!(
+            "Bearer resource_metadata=\"{}\"",
+            oauth.protected_resource_metadata_url()
+        ),
+        None => "Bearer".to_string(),
+    };
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+fn insufficient_scope(scope: &'static str) -> Response {
+    let mut response = (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "insufficient_scope",
+            "error_description": format!("the access token is missing scope `{scope}`"),
+        })),
+    )
+        .into_response();
+    let challenge = format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"");
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+fn auth_error_response(state: &AppState, error: AuthError) -> Response {
+    match error {
+        AuthError::InsufficientScope(scope) => insufficient_scope(scope),
+        other => unauthorized(other, state.oauth.as_deref()),
+    }
+}
+
+fn oauth_not_found() -> Response {
+    (StatusCode::NOT_FOUND, "OAuth is not enabled").into_response()
+}
+
+fn with_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+fn oauth_error_response(error: OAuthError) -> Response {
+    if let OAuthError::Server(ref cause) = error {
+        tracing::error!(%cause, "OAuth request failed");
+    }
+    let status = error.status();
+    let mut response = (status, Json(error.body())).into_response();
+    response = with_no_store(response);
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"oauth\""),
+        );
+    }
+    response
+}
+
+fn oauth_status_error(status: StatusCode, message: &str) -> Response {
+    with_no_store(
+        (
+            status,
+            Json(json!({
+                "error": "invalid_request",
+                "error_description": message,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+fn is_form_content_type(headers: &HeaderMap) -> bool {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+}
+
+#[allow(clippy::result_large_err)] // OAuth errors are ready-to-send HTTP responses.
+async fn parse_oauth_form<T>(headers: &HeaderMap, request: Request) -> Result<T, Response>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if !is_form_content_type(headers) {
+        return Err(oauth_status_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "expected application/x-www-form-urlencoded",
+        ));
+    }
+    let body = match axum::body::to_bytes(request.into_body(), MAX_OAUTH_FORM_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return Err(oauth_status_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "OAuth form body is too large",
+            ));
+        }
+    };
+    serde_urlencoded::from_bytes(&body)
+        .map_err(|_| oauth_status_error(StatusCode::BAD_REQUEST, "malformed OAuth form body"))
+}
+
+fn authorization_security_headers(mut response: Response) -> Response {
+    response = with_no_store(response);
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
+             base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn clear_csrf_cookie(oauth: &OAuthService, mut response: Response) -> Response {
+    if let Ok(value) = HeaderValue::from_str(&oauth.clear_csrf_cookie()) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+}
+
+fn authorization_redirect(oauth: &OAuthService, url: &Url) -> Response {
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    match HeaderValue::from_str(url.as_str()) {
+        Ok(value) => {
+            response.headers_mut().insert(header::LOCATION, value);
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+            authorization_security_headers(clear_csrf_cookie(oauth, response))
+        }
+        Err(_) => oauth_error_response(OAuthError::Server(anyhow::anyhow!(
+            "could not encode redirect URI"
+        ))),
+    }
+}
+
+async fn oauth_authorization_server_metadata(
+    State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let Some(oauth) = state.app.oauth.as_deref() else {
+        return oauth_not_found();
+    };
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return with_no_store(response.into_response());
+    }
+    with_no_store(Json(oauth.authorization_server_metadata()).into_response())
+}
+
+async fn oauth_protected_resource_metadata(
+    State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let Some(oauth) = state.app.oauth.as_deref() else {
+        return oauth_not_found();
+    };
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return with_no_store(response.into_response());
+    }
+    with_no_store(Json(oauth.protected_resource_metadata()).into_response())
+}
+
+async fn oauth_authorize_get(
+    State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(params): Query<AuthorizationParams>,
+) -> Response {
+    let Some(oauth) = state.app.oauth.as_deref() else {
+        return oauth_not_found();
+    };
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return authorization_security_headers(response.into_response());
+    }
+    let request = match oauth.validate_authorization(&params) {
+        Ok(request) => request,
+        Err(error) => {
+            return authorization_security_headers(oauth_error_response(error));
+        }
+    };
+    let csrf_token = OAuthService::new_csrf_token();
+    let html = oauth.render_consent(&request, &csrf_token);
+    let mut response = Html(html).into_response();
+    let cookie = oauth.csrf_cookie(&csrf_token);
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    authorization_security_headers(response)
+}
+
+async fn oauth_authorize_post(
+    State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    let Some(oauth) = state.app.oauth.as_deref() else {
+        return oauth_not_found();
+    };
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return authorization_security_headers(response.into_response());
+    }
+    let params: AuthorizationParams = match parse_oauth_form(&headers, request).await {
+        Ok(params) => params,
+        Err(response) => return authorization_security_headers(response),
+    };
+    let authorized = match oauth.validate_authorization(&params) {
+        Ok(request) => request,
+        Err(error) => {
+            return authorization_security_headers(oauth_error_response(error));
+        }
+    };
+    if !oauth.verify_csrf(&headers, params.csrf_token.as_deref()) {
+        return authorization_security_headers(oauth_error_response(OAuthError::InvalidRequest(
+            "missing or invalid CSRF token".into(),
+        )));
+    }
+    if !oauth.verify_admin_secret(params.admin_secret.as_deref()) {
+        return authorization_security_headers(oauth_error_response(OAuthError::InvalidRequest(
+            "administrator approval secret is invalid".into(),
+        )));
+    }
+    match params.decision.as_deref() {
+        Some("deny") => authorization_redirect(oauth, &oauth.deny_redirect(&authorized)),
+        Some("approve") => match oauth.approve_redirect(&authorized) {
+            Ok(url) => authorization_redirect(oauth, &url),
+            Err(error) => authorization_security_headers(oauth_error_response(error)),
+        },
+        _ => authorization_security_headers(oauth_error_response(OAuthError::InvalidRequest(
+            format!("`{DECISION_FIELD}` must be approve or deny"),
+        ))),
+    }
+}
+
+async fn oauth_token(
+    State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    let Some(oauth) = state.app.oauth.as_deref() else {
+        return oauth_not_found();
+    };
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return with_no_store(response.into_response());
+    }
+    let params: TokenParams = match parse_oauth_form(&headers, request).await {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let mut authentication = match ClientAuthentication::from_headers(&headers) {
+        Ok(authentication) => authentication,
+        Err(error) => return oauth_error_response(error),
+    };
+    authentication.form_client_id = params.client_id.clone();
+    authentication.form_client_secret = params.client_secret.clone();
+
+    let result = match params.grant_type.as_deref() {
+        Some("authorization_code") => oauth.exchange_authorization_code(&params, &authentication),
+        Some("refresh_token") => oauth.refresh_token(&params, &authentication),
+        Some(_) => Err(OAuthError::UnsupportedGrantType),
+        None => Err(OAuthError::InvalidRequest(
+            "`grant_type` is required".into(),
+        )),
+    };
+    match result {
+        Ok(token) => with_no_store(Json(token).into_response()),
+        Err(error) => oauth_error_response(error),
+    }
+}
+
+async fn oauth_revoke(
+    State(state): State<Arc<McpHttpState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    let Some(oauth) = state.app.oauth.as_deref() else {
+        return oauth_not_found();
+    };
+    if let Err(response) =
+        validate_http_security(&headers, &uri, &state.app.config.server.allowed_hosts)
+    {
+        return with_no_store(response.into_response());
+    }
+    let params: RevokeParams = match parse_oauth_form(&headers, request).await {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    let mut authentication = match ClientAuthentication::from_headers(&headers) {
+        Ok(authentication) => authentication,
+        Err(error) => return oauth_error_response(error),
+    };
+    authentication.form_client_id = params.client_id.clone();
+    authentication.form_client_secret = params.client_secret.clone();
+    match oauth.revoke(&params, &authentication) {
+        Ok(()) => with_no_store(Json(json!({})).into_response()),
+        Err(error) => oauth_error_response(error),
+    }
+}
+
 async fn mcp_entry(State(state): State<Arc<McpHttpState>>, request: Request) -> Response {
-    let principal = match state.app.auth.authenticate(request.headers()) {
+    let principal = match state.app.auth.authenticate_request(request.headers()) {
         Ok(principal) => principal,
-        Err(error) => return unauthorized(error),
+        Err(error) => return auth_error_response(&state.app, error),
     };
 
     if let Err(response) = validate_http_security(
@@ -311,14 +738,16 @@ async fn mcp_entry(State(state): State<Arc<McpHttpState>>, request: Request) -> 
     }
 
     let is_post = request.method() == Method::POST;
-    if is_post && let Err(response) = require_json_content_type(request.headers()) {
-        return response.into_response();
-    }
     if !is_post {
+        let mut request = request;
+        request.extensions_mut().insert(principal);
         return forward(state.service.clone(), request).await;
     }
+    if let Err(response) = require_json_content_type(request.headers()) {
+        return response.into_response();
+    }
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_MCP_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -327,6 +756,15 @@ async fn mcp_entry(State(state): State<Arc<McpHttpState>>, request: Request) -> 
     };
 
     let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
+
+    // Scope checks run before rmcp sees the request. This covers both a single
+    // JSON-RPC object and a batch array; any insufficient tool call rejects the
+    // whole request rather than partially executing it.
+    if let Some(value) = parsed.as_ref()
+        && let Some(scope) = missing_scope(value, &principal)
+    {
+        return insufficient_scope(scope);
+    }
 
     // Events extension methods are served by the hub itself. They are not
     // allowed to bypass JSON-RPC 2.0 envelope validation because invalid
@@ -340,7 +778,7 @@ async fn mcp_entry(State(state): State<Arc<McpHttpState>>, request: Request) -> 
         }
         let id = object.get("id").cloned();
         let params = object.get("params").cloned();
-        return events_jsonrpc(&state.app, method, params, id, &principal).await;
+        return events_jsonrpc(&state.app, method, params, id, &principal.principal).await;
     }
 
     let patch_capabilities = parsed
@@ -349,6 +787,7 @@ async fn mcp_entry(State(state): State<Arc<McpHttpState>>, request: Request) -> 
         .and_then(Value::as_str)
         .is_some_and(|method| method == "initialize" || method == "server/discover");
 
+    parts.extensions.insert(principal);
     let request = Request::from_parts(parts, Body::from(bytes));
     let response = forward(state.service.clone(), request).await;
     if patch_capabilities {
@@ -385,18 +824,6 @@ async fn events_jsonrpc(
         Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error.to_json()}),
     };
     Json(payload).into_response()
-}
-
-fn unauthorized(error: AuthError) -> Response {
-    let mut response = (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": error.message()})),
-    )
-        .into_response();
-    response
-        .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    response
 }
 
 /// Inject `capabilities.events` into a JSON or SSE MCP response body.
@@ -501,7 +928,7 @@ async fn internal_ingest(
     }
 
     if let Err(error) = state.app.auth.authenticate(&headers) {
-        return unauthorized(error);
+        return unauthorized(error, None);
     }
 
     if let Some(expected) = &state.app.internal_token {
@@ -510,7 +937,7 @@ async fn internal_ingest(
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         if !constant_time_eq(presented.as_bytes(), expected.expose_secret().as_bytes()) {
-            return unauthorized(AuthError::InvalidToken);
+            return unauthorized(AuthError::InvalidToken, None);
         }
     }
 
@@ -550,19 +977,24 @@ async fn internal_ingest(
     .into_response()
 }
 
-/// Shared auth checks for the consumer endpoints.
+/// Shared auth and scope checks for the consumer endpoints.
 fn authorize_consumer(
     state: &Arc<McpHttpState>,
     headers: &HeaderMap,
     uri: &Uri,
+    scope: &'static str,
 ) -> Option<Response> {
     if let Err(response) =
         validate_http_security(headers, uri, &state.app.config.server.allowed_hosts)
     {
         return Some(response.into_response());
     }
-    if let Err(error) = state.app.auth.authenticate(headers) {
-        return Some(unauthorized(error));
+    let identity = match state.app.auth.authenticate_request(headers) {
+        Ok(identity) => identity,
+        Err(error) => return Some(auth_error_response(&state.app, error)),
+    };
+    if let Err(error) = Auth::require_scope(&identity, scope) {
+        return Some(auth_error_response(&state.app, error));
     }
     None
 }
@@ -582,7 +1014,9 @@ async fn consumer_probe(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = authorize_consumer(&state, &headers, &uri) {
+    if let Some(response) =
+        authorize_consumer(&state, &headers, &uri, crate::oauth::SCOPE_EVENTS_READ)
+    {
         return response;
     }
     match state.app.consumers.probe(&name) {
@@ -604,7 +1038,9 @@ async fn consumer_poll(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = authorize_consumer(&state, &headers, &uri) {
+    if let Some(response) =
+        authorize_consumer(&state, &headers, &uri, crate::oauth::SCOPE_EVENTS_READ)
+    {
         return response;
     }
     match state.app.consumers.poll(&name, query.limit) {
@@ -627,7 +1063,9 @@ async fn consumer_ack(
     headers: HeaderMap,
     Json(body): Json<ConsumerAckRequest>,
 ) -> Response {
-    if let Some(response) = authorize_consumer(&state, &headers, &uri) {
+    if let Some(response) =
+        authorize_consumer(&state, &headers, &uri, crate::oauth::SCOPE_EVENTS_ACK)
+    {
         return response;
     }
     match state.app.consumers.ack(&name, body.up_to_sequence) {

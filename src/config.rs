@@ -1,8 +1,9 @@
 //! Daemon configuration loaded from TOML.
 //!
-//! Secrets are never stored in the configuration file. The only credential the
-//! hub reads is a bearer token, and it is named indirectly through
-//! `auth.token_env` so the value comes from the process environment.
+//! Secrets are never stored in the configuration file. The static bearer token,
+//! OAuth administrator approval secret, and OAuth client secrets are named
+//! indirectly through environment variables so their values come from the
+//! process environment.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// Inbound MCP authentication.
     pub auth: AuthConfig,
+    /// OAuth 2.1 authorization server settings.
+    pub oauth: OAuthConfig,
     /// Webhook subscription defaults.
     pub subscriptions: SubscriptionConfig,
     /// Delivery worker settings.
@@ -218,6 +221,61 @@ impl Default for AuthConfig {
             principal: "local".into(),
         }
     }
+}
+
+/// OAuth 2.1 authorization-server settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Enables the authorization server and OAuth bearer authentication.
+    pub enabled: bool,
+    /// Public issuer identifier. Required when `enabled` is true.
+    pub issuer: Option<String>,
+    /// Environment variable holding the consent approval secret.
+    ///
+    /// Required when `enabled` is true. The secret is requested on the consent
+    /// form in addition to the CSRF cookie/field pair.
+    pub admin_secret_env: Option<String>,
+    /// Access-token lifetime in seconds.
+    pub access_token_ttl_secs: u64,
+    /// Refresh-token lifetime in seconds.
+    pub refresh_token_ttl_secs: u64,
+    /// Authorization-code lifetime in seconds.
+    pub authorization_code_ttl_secs: u64,
+    /// Pre-registered OAuth clients. Required when `enabled` is true.
+    pub clients: Vec<OAuthClientConfig>,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: None,
+            admin_secret_env: None,
+            access_token_ttl_secs: 3600,
+            refresh_token_ttl_secs: 2_592_000,
+            authorization_code_ttl_secs: 300,
+            clients: Vec::new(),
+        }
+    }
+}
+
+/// One pre-registered OAuth client.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthClientConfig {
+    /// Stable client identifier.
+    pub client_id: String,
+    /// Environment variable holding the client secret. When absent the client
+    /// is public and must use PKCE without a secret.
+    pub client_secret_env: Option<String>,
+    /// Exact redirect URIs registered for this client.
+    pub redirect_uris: Vec<String>,
+    /// Scopes this client may request.
+    pub scopes: Vec<String>,
+    /// Principal attributed to tokens issued to this client. Defaults to the
+    /// client id.
+    pub principal: Option<String>,
 }
 
 /// Subscription lifetime settings.
@@ -577,6 +635,140 @@ impl Config {
             );
         }
 
+        let oauth = &self.oauth;
+        if oauth.access_token_ttl_secs == 0 {
+            bail!("oauth.access_token_ttl_secs must be greater than zero");
+        }
+        if oauth.refresh_token_ttl_secs == 0 {
+            bail!("oauth.refresh_token_ttl_secs must be greater than zero");
+        }
+        if oauth.authorization_code_ttl_secs == 0 {
+            bail!("oauth.authorization_code_ttl_secs must be greater than zero");
+        }
+        if oauth
+            .admin_secret_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("oauth.admin_secret_env must not be empty when set");
+        }
+        if let Some(issuer) = oauth.issuer.as_deref() {
+            if issuer.trim() != issuer || issuer.is_empty() {
+                bail!("oauth.issuer must not be empty or have surrounding whitespace");
+            }
+            let url = url::Url::parse(issuer)
+                .with_context(|| format!("oauth.issuer `{issuer}` is not a URL"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("oauth.issuer must use http or https");
+            }
+            if url.cannot_be_a_base()
+                || url.host_str().is_none()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                bail!(
+                    "oauth.issuer must be a hierarchical URL with a host and no query or fragment"
+                );
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                bail!("oauth.issuer must not contain userinfo");
+            }
+            if url.scheme() == "http" && !is_loopback_oauth_host(&url) {
+                bail!("oauth.issuer must use https for non-loopback hosts");
+            }
+        }
+        let mut seen_client_ids: BTreeMap<&str, ()> = BTreeMap::new();
+        for client in &oauth.clients {
+            if client.client_id.trim().is_empty() {
+                bail!("oauth.clients[].client_id must not be empty");
+            }
+            if client.client_id.chars().any(char::is_control) {
+                bail!("oauth.clients[].client_id must not contain control characters");
+            }
+            if seen_client_ids
+                .insert(client.client_id.as_str(), ())
+                .is_some()
+            {
+                bail!(
+                    "oauth client_id `{}` is registered more than once",
+                    client.client_id
+                );
+            }
+            if client
+                .client_secret_env
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("oauth.clients[].client_secret_env must not be empty when set");
+            }
+            if client
+                .principal
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                bail!("oauth.clients[].principal must not be empty when set");
+            }
+            if client.redirect_uris.is_empty() {
+                bail!(
+                    "oauth.clients[{}].redirect_uris must not be empty",
+                    client.client_id
+                );
+            }
+            for redirect_uri in &client.redirect_uris {
+                let url = url::Url::parse(redirect_uri).with_context(|| {
+                    format!(
+                        "oauth.clients[].redirect_uris entry `{redirect_uri}` is not an absolute URL"
+                    )
+                })?;
+                if !matches!(url.scheme(), "http" | "https") {
+                    bail!("oauth redirect_uri `{redirect_uri}` must use http or https");
+                }
+                if url.cannot_be_a_base() || url.host_str().is_none() || url.fragment().is_some() {
+                    bail!(
+                        "oauth redirect_uri `{redirect_uri}` must be absolute with a host and no fragment"
+                    );
+                }
+                if !url.username().is_empty() || url.password().is_some() {
+                    bail!("oauth redirect_uri `{redirect_uri}` must not contain userinfo");
+                }
+                if url.scheme() == "http" && !is_loopback_oauth_host(&url) {
+                    bail!(
+                        "oauth redirect_uri `{redirect_uri}` must use https for non-loopback hosts"
+                    );
+                }
+            }
+            let mut seen_scopes: BTreeMap<&str, ()> = BTreeMap::new();
+            for scope in &client.scopes {
+                if !crate::oauth::ALL_SCOPES.contains(&scope.as_str()) {
+                    bail!("oauth.clients[].scopes contains unsupported scope `{scope}`");
+                }
+                if seen_scopes.insert(scope.as_str(), ()).is_some() {
+                    bail!(
+                        "oauth client `{}` repeats scope `{scope}`",
+                        client.client_id
+                    );
+                }
+            }
+        }
+        if oauth.enabled {
+            if oauth.issuer.is_none() {
+                bail!("oauth.issuer must be set when oauth.enabled is true");
+            }
+            if !oauth
+                .admin_secret_env
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                bail!(
+                    "oauth.admin_secret_env must be set to a non-empty environment variable name \
+                     when oauth.enabled is true"
+                );
+            }
+            if oauth.clients.is_empty() {
+                bail!("oauth.clients must contain at least one client when oauth.enabled is true");
+            }
+        }
+
         let server = &self.server;
         if server.enable_edge_ingest
             && !server
@@ -842,6 +1034,15 @@ fn validate_github_repository(repository: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn is_loopback_oauth_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1323,5 +1524,211 @@ mod tests {
         let error = Config::parse("[collectors.github]\ntoken_env = \"\"\n")
             .expect_err("empty token env must fail");
         assert!(error.to_string().contains("token_env"), "{error}");
+    }
+    #[test]
+    fn oauth_defaults_are_disabled_and_ttls_are_positive() {
+        let config = Config::parse("").unwrap();
+        assert!(!config.oauth.enabled);
+        assert_eq!(config.oauth.access_token_ttl_secs, 3600);
+        assert_eq!(config.oauth.refresh_token_ttl_secs, 2_592_000);
+        assert_eq!(config.oauth.authorization_code_ttl_secs, 300);
+        assert!(config.oauth.clients.is_empty());
+
+        for contents in [
+            "[oauth]\naccess_token_ttl_secs = 0\n",
+            "[oauth]\nrefresh_token_ttl_secs = 0\n",
+            "[oauth]\nauthorization_code_ttl_secs = 0\n",
+        ] {
+            assert!(Config::parse(contents).is_err(), "{contents}");
+        }
+    }
+
+    #[test]
+    fn enabled_oauth_requires_issuer_admin_secret_and_client() {
+        let error = Config::parse("[oauth]\nenabled = true\n")
+            .expect_err("issuer and clients are required");
+        assert!(error.to_string().contains("issuer"), "{error}");
+
+        let with_issuer = Config::parse(
+            "[oauth]\n\
+             enabled = true\n\
+             issuer = \"https://bridge.example.com\"\n",
+        )
+        .expect_err("admin secret and clients are required");
+        assert!(
+            with_issuer.to_string().contains("admin_secret_env"),
+            "{with_issuer}"
+        );
+
+        let error = Config::parse(
+            "[oauth]\n\
+             enabled = true\n\
+             issuer = \"https://bridge.example.com\"\n\
+             admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n",
+        )
+        .expect_err("clients are required");
+        assert!(error.to_string().contains("clients"), "{error}");
+    }
+
+    #[test]
+    fn oauth_issuer_and_redirect_uri_are_strict_urls() {
+        let prefix = "[oauth]\n\
+                      enabled = true\n\
+                      admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n";
+        let client = "[[oauth.clients]]\n\
+                      client_id = \"client\"\n\
+                      redirect_uris = [\"https://client.example/callback\"]\n";
+        for issuer in [
+            "ftp://bridge.example.com",
+            "http://bridge.example.com",
+            "http://192.0.2.10:8787",
+            "https://bridge.example.com?x=1",
+            "https://bridge.example.com#fragment",
+            "https://user:pass@bridge.example.com",
+            "not a URL",
+        ] {
+            let contents = format!("{prefix}issuer = \"{issuer}\"\n{client}");
+            assert!(
+                Config::parse(&contents).is_err(),
+                "issuer `{issuer}` must be rejected"
+            );
+        }
+        for issuer in [
+            "https://bridge.example.com/base",
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+        ] {
+            let ok = Config::parse(&format!("{prefix}issuer = \"{issuer}\"\n{client}"))
+                .unwrap_or_else(|err| panic!("issuer `{issuer}` must be accepted: {err}"));
+            assert_eq!(ok.oauth.issuer.as_deref(), Some(issuer));
+        }
+
+        for redirect in [
+            "client/callback",
+            "javascript:alert(1)",
+            "http://client.example/callback",
+            "http://198.51.100.2/callback",
+            "https://client.example/callback#fragment",
+            "https://user:pass@client.example/callback",
+        ] {
+            let contents = format!(
+                "[oauth]\n\
+                 enabled = true\n\
+                 issuer = \"https://bridge.example.com\"\n\
+                 admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n\
+                 [[oauth.clients]]\n\
+                 client_id = \"client\"\n\
+                 redirect_uris = [\"{redirect}\"]\n"
+            );
+            assert!(
+                Config::parse(&contents).is_err(),
+                "redirect `{redirect}` must be rejected"
+            );
+        }
+
+        for redirect in [
+            "http://localhost:9999/callback",
+            "http://127.0.0.1:9999/callback",
+            "http://[::1]:9999/callback",
+        ] {
+            let contents = format!(
+                "[oauth]\n\
+                 enabled = true\n\
+                 issuer = \"https://bridge.example.com\"\n\
+                 admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n\
+                 [[oauth.clients]]\n\
+                 client_id = \"client\"\n\
+                 redirect_uris = [\"{redirect}\"]\n"
+            );
+            Config::parse(&contents)
+                .unwrap_or_else(|err| panic!("loopback redirect `{redirect}` must pass: {err}"));
+        }
+    }
+
+    #[test]
+    fn oauth_clients_require_unique_ids_and_known_scopes() {
+        let prefix = "[oauth]\n\
+                      enabled = true\n\
+                      issuer = \"https://bridge.example.com\"\n\
+                      admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n";
+        let duplicate = format!(
+            "{prefix}\
+             [[oauth.clients]]\n\
+             client_id = \"client\"\n\
+             redirect_uris = [\"https://client.example/callback\"]\n\
+             [[oauth.clients]]\n\
+             client_id = \"client\"\n\
+             redirect_uris = [\"https://client.example/other\"]\n"
+        );
+        let error = Config::parse(&duplicate).expect_err("duplicate client ids must fail");
+        assert!(error.to_string().contains("more than once"), "{error}");
+
+        let unknown_scope = format!(
+            "{prefix}\
+             [[oauth.clients]]\n\
+             client_id = \"client\"\n\
+             redirect_uris = [\"https://client.example/callback\"]\n\
+             scopes = [\"events.admin\"]\n"
+        );
+        let error = Config::parse(&unknown_scope).expect_err("unknown scope must fail");
+        assert!(error.to_string().contains("events.admin"), "{error}");
+
+        let empty_redirect = format!(
+            "{prefix}\
+             [[oauth.clients]]\n\
+             client_id = \"client\"\n\
+             redirect_uris = []\n"
+        );
+        let error = Config::parse(&empty_redirect).expect_err("empty redirect list must fail");
+        assert!(error.to_string().contains("redirect_uris"), "{error}");
+    }
+
+    #[test]
+    fn oauth_public_and_confidential_clients_parse() {
+        let config = Config::parse(
+            "[oauth]\n\
+             enabled = true\n\
+             issuer = \"https://bridge.example.com\"\n\
+             admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n\
+             access_token_ttl_secs = 60\n\
+             refresh_token_ttl_secs = 120\n\
+             authorization_code_ttl_secs = 30\n\
+             [[oauth.clients]]\n\
+             client_id = \"confidential\"\n\
+             client_secret_env = \"EVENTS_BRIDGE_OAUTH_CLIENT\"\n\
+             redirect_uris = [\"https://client.example/callback\"]\n\
+             scopes = [\"events.read\", \"events.ack\"]\n\
+             principal = \"alice\"\n\
+             [[oauth.clients]]\n\
+             client_id = \"public\"\n\
+             redirect_uris = [\"http://127.0.0.1:9999/callback\"]\n\
+             scopes = [\"events.read\"]\n",
+        )
+        .expect("oauth config parses");
+        assert!(config.oauth.enabled);
+        assert_eq!(config.oauth.access_token_ttl_secs, 60);
+        assert_eq!(config.oauth.clients.len(), 2);
+        assert_eq!(
+            config.oauth.clients[0].client_secret_env.as_deref(),
+            Some("EVENTS_BRIDGE_OAUTH_CLIENT")
+        );
+        assert!(config.oauth.clients[1].client_secret_env.is_none());
+
+        let blank_secret = Config::parse(
+            "[oauth]\n\
+             enabled = true\n\
+             issuer = \"https://bridge.example.com\"\n\
+             admin_secret_env = \"EVENTS_BRIDGE_OAUTH_ADMIN\"\n\
+             [[oauth.clients]]\n\
+             client_id = \"client\"\n\
+             client_secret_env = \"  \"\n\
+             redirect_uris = [\"https://client.example/callback\"]\n",
+        )
+        .expect_err("blank client secret env must fail");
+        assert!(
+            blank_secret.to_string().contains("client_secret_env"),
+            "{blank_secret}"
+        );
     }
 }

@@ -14,6 +14,7 @@ pub mod edge_protocol;
 pub mod event;
 pub mod hub;
 pub mod mcp;
+pub mod oauth;
 pub mod store;
 pub mod transport;
 pub mod util;
