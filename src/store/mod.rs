@@ -7,7 +7,8 @@ pub mod repository;
 pub mod t3;
 
 pub use consumers::{
-    ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, ConsumerProbeSnapshot, ConsumerRow,
+    ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, ConsumerPollSnapshot,
+    ConsumerPollSnapshotQuery, ConsumerProbeSnapshot, ConsumerRow,
 };
 pub use github::{
     GITHUB_COLLECTOR, GitHubApplyOutcome, GitHubCheckpoint, GitHubCiRun, GitHubDelivery,

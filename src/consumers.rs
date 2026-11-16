@@ -17,7 +17,10 @@ use serde_json::Value;
 use crate::{
     config::{Config, ConsumerProfileConfig, EventDisposition, resolve_consumer_profile},
     mcp::event_catalog,
-    store::{ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, Event, Repository},
+    store::{
+        ConsumerAckError, ConsumerAckOutcome, ConsumerEventFilter, ConsumerPollSnapshotQuery,
+        Event, Repository,
+    },
 };
 
 /// Largest page a consumer poll will return, matching the MCP pull tools.
@@ -236,13 +239,38 @@ impl ConsumerService {
         name: &str,
         limit_override: Option<usize>,
     ) -> Result<ConsumerPoll, ConsumerError> {
+        self.poll_with_snapshot(name, limit_override, |consumer, query| {
+            self.repo.poll_consumer_snapshot(consumer, query)
+        })
+    }
+
+    #[cfg(test)]
+    fn poll_with_snapshot_hook(
+        &self,
+        name: &str,
+        limit_override: Option<usize>,
+        after_immediate_read: impl FnOnce(),
+    ) -> Result<ConsumerPoll, ConsumerError> {
+        self.poll_with_snapshot(name, limit_override, |consumer, query| {
+            self.repo
+                .poll_consumer_snapshot_with_hook(consumer, query, after_immediate_read)
+        })
+    }
+
+    fn poll_with_snapshot(
+        &self,
+        name: &str,
+        limit_override: Option<usize>,
+        read_snapshot: impl FnOnce(
+            &str,
+            &ConsumerPollSnapshotQuery<'_>,
+        ) -> anyhow::Result<crate::store::ConsumerPollSnapshot>,
+    ) -> Result<ConsumerPoll, ConsumerError> {
         let (consumer, profile) = self.resolve(name)?;
-        let row = self.repo.ensure_consumer(&consumer)?;
         let immediate_kinds = enabled_kinds_for(&profile, EventDisposition::Immediate);
         let digest_kinds = enabled_kinds_for(&profile, EventDisposition::Digest);
         let all_kinds = enabled_kinds(&profile);
         let filters = event_filter(&profile);
-        let cursor_sequence = row.cursor_sequence;
 
         let limit = match limit_override {
             Some(limit) => limit.clamp(1, MAX_CONSUMER_POLL_LIMIT),
@@ -251,153 +279,43 @@ impl ConsumerService {
                 .clamp(1, MAX_CONSUMER_POLL_LIMIT),
         };
 
-        // Read one extra immediate event so a full page is distinguishable from
-        // "exactly one page, nothing more". Immediate events are truncated only
-        // after that check and always win over digest aggregation.
-        let mut immediate_events = self.repo.list_consumer_events(
-            cursor_sequence,
-            &immediate_kinds,
-            &filters,
-            limit.saturating_add(1),
-        )?;
-        let more_immediate = immediate_events.len() > limit;
-        immediate_events.truncate(limit);
-        let next_cursor_from_immediate = immediate_events
-            .last()
-            .map(|event| event.sequence)
-            .unwrap_or(cursor_sequence);
-        let digest_budget = limit.saturating_sub(immediate_events.len());
+        let query = ConsumerPollSnapshotQuery {
+            limit,
+            digest_catchup_limit: MAX_DIGEST_CATCHUP_EVENTS,
+            immediate_kinds: &immediate_kinds,
+            digest_kinds: &digest_kinds,
+            all_kinds: &all_kinds,
+            filters: &filters,
+        };
+        let snapshot = read_snapshot(&consumer, &query)?;
 
-        let mut digest_events = Vec::new();
-        let mut truncated = false;
-        let mut has_more = more_immediate;
-        // Set only when the digest scan stops short of the last returned
-        // immediate event. The cursor must then stop at the last summarized
-        // digest so an acknowledgement cannot skip the unscanned remainder.
-        let mut next_cursor_ceiling = None;
-
-        if digest_budget == 0 {
-            // The immediate page is full. Digest events at or before the last
-            // returned immediate event would be skipped by an acknowledgement,
-            // so summarize exactly those now. Later events stay unread.
-            if next_cursor_from_immediate > cursor_sequence {
-                let count = self.repo.count_consumer_events_in_range(
-                    cursor_sequence,
-                    Some(next_cursor_from_immediate),
-                    &digest_kinds,
-                    &filters,
-                )?;
-                if count > 0 {
-                    // Remaining digest budget is zero, so this is always a
-                    // summary rather than a full page of digest detail.
-                    truncated = true;
-                    let (mut events, scanned_past_cap) = self.list_digest_catchup(
-                        cursor_sequence,
-                        Some(next_cursor_from_immediate),
-                        &digest_kinds,
-                        &filters,
-                    )?;
-                    has_more |= scanned_past_cap;
-                    if scanned_past_cap {
-                        next_cursor_ceiling = events.last().map(|event| event.sequence);
-                    }
-                    digest_events.append(&mut events);
-                }
-            }
-
-            if !has_more {
-                // Immediate events beyond the page, or digest events after the
-                // last returned immediate event, remain for the next poll.
-                let remaining = self.repo.count_consumer_events(
-                    next_cursor_from_immediate,
-                    &all_kinds,
-                    &filters,
-                )?;
-                has_more = remaining > 0;
-            }
-        } else if !digest_kinds.is_empty() {
-            let unread_digest =
-                self.repo
-                    .count_consumer_events(cursor_sequence, &digest_kinds, &filters)?;
-            if unread_digest > 0 && unread_digest <= digest_budget as i64 {
-                // Every unread digest event fits in the remaining budget, so
-                // return the complete aggregated page.
-                digest_events = self.repo.list_consumer_events(
-                    cursor_sequence,
-                    &digest_kinds,
-                    &filters,
-                    usize::try_from(unread_digest).unwrap_or(digest_budget),
-                )?;
-            } else if unread_digest > digest_budget as i64 {
-                // The digest backlog exceeds the budget. Keep every immediate
-                // event and summarize the digest backlog up to the catchup cap.
-                truncated = true;
-                let (mut events, scanned_past_cap) =
-                    self.list_digest_catchup(cursor_sequence, None, &digest_kinds, &filters)?;
-                has_more = scanned_past_cap;
-                if scanned_past_cap {
-                    // Unscanned digest events may sit before a returned
-                    // immediate event, so stop the cursor at the summary.
-                    next_cursor_ceiling = events.last().map(|event| event.sequence);
-                }
-                digest_events.append(&mut events);
-            }
-        }
-
-        let digests = aggregate_digests(&digest_events, &profile)?;
-        let next_cursor_sequence = next_cursor_ceiling.unwrap_or_else(|| {
-            immediate_events
+        let digests = aggregate_digests(&snapshot.digest_events, &profile)?;
+        let next_cursor_sequence = snapshot.next_cursor_ceiling.unwrap_or_else(|| {
+            snapshot
+                .immediate_events
                 .iter()
                 .map(|event| event.sequence)
-                .chain(digest_events.iter().map(|event| event.sequence))
+                .chain(snapshot.digest_events.iter().map(|event| event.sequence))
                 .max()
-                .unwrap_or(cursor_sequence)
+                .unwrap_or(snapshot.cursor_sequence)
         });
 
-        let events = immediate_events
+        let events = snapshot
+            .immediate_events
             .into_iter()
             .map(|event| render_event(&profile, event))
             .collect();
 
-        self.repo.mark_consumer_polled(&consumer)?;
-        let latest_sequence = self.repo.latest_event_sequence()?;
-
         Ok(ConsumerPoll {
             consumer,
-            cursor_sequence,
+            cursor_sequence: snapshot.cursor_sequence,
             next_cursor_sequence,
-            latest_sequence,
-            has_more,
-            truncated,
+            latest_sequence: snapshot.latest_sequence,
+            has_more: snapshot.has_more,
+            truncated: snapshot.truncated,
             events,
             digests,
         })
-    }
-
-    /// Read at most [`MAX_DIGEST_CATCHUP_EVENTS`] digest events.
-    ///
-    /// The second element is true when the range contained more rows than the
-    /// cap, meaning the caller must report `hasMore` and leave the remainder
-    /// for the next poll.
-    fn list_digest_catchup(
-        &self,
-        after_sequence: i64,
-        through_sequence: Option<i64>,
-        kinds: &[String],
-        filters: &ConsumerEventFilter<'_>,
-    ) -> Result<(Vec<Event>, bool), ConsumerError> {
-        let mut events = self.repo.list_consumer_events_in_range(
-            after_sequence,
-            through_sequence,
-            kinds,
-            filters,
-            MAX_DIGEST_CATCHUP_EVENTS.saturating_add(1),
-        )?;
-        let scanned_past_cap = events.len() > MAX_DIGEST_CATCHUP_EVENTS;
-        if scanned_past_cap {
-            events.truncate(MAX_DIGEST_CATCHUP_EVENTS);
-        }
-        Ok((events, scanned_past_cap))
     }
 
     /// Advance the consumer cursor monotonically.
@@ -1317,5 +1235,61 @@ mod tests {
             final_probe.unread_count,
             final_probe.latest_sequence - final_probe.cursor_sequence
         );
+    }
+
+    #[test]
+    fn poll_shares_one_snapshot_so_concurrent_ingest_never_skips_immediate_events() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let writer_repo = Arc::new(Repository::open(temp.path()).unwrap());
+        let reader_repo = Arc::new(Repository::open(temp.path()).unwrap());
+        let service = ConsumerService::new(reader_repo, Config::default().consumers);
+
+        // Initialize the durable consumer row at cursor 0 so poll uses a
+        // read-only WAL snapshot while the concurrent writer commits.
+        assert_eq!(service.probe("muse").unwrap().cursor_sequence, 0);
+        ingest(
+            &writer_repo,
+            "evt_digest_1",
+            "t3.run.completed",
+            completed_payload("run-1"),
+        );
+
+        let first = service
+            .poll_with_snapshot_hook("muse", Some(2), || {
+                ingest(
+                    &writer_repo,
+                    "evt_immediate_2",
+                    "t3.run.failed",
+                    failed_payload("run-2"),
+                );
+                ingest(
+                    &writer_repo,
+                    "evt_digest_3",
+                    "t3.run.completed",
+                    completed_payload("run-3"),
+                );
+            })
+            .unwrap();
+
+        // Snapshot sees only sequence 1: cursor does not jump to 3 past
+        // immediate sequence 2.
+        assert!(first.events.is_empty());
+        assert_eq!(first.digests.len(), 1);
+        assert_eq!(first.digests[0].count, 1);
+        assert_eq!(first.digests[0].max_sequence, 1);
+        assert_eq!(first.next_cursor_sequence, 1);
+        assert_eq!(first.latest_sequence, 1);
+        assert!(!first.has_more);
+
+        service.ack("muse", first.next_cursor_sequence).unwrap();
+
+        let second = service.poll("muse", Some(2)).unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event_id, "evt_immediate_2");
+        assert_eq!(second.digests.len(), 1);
+        assert_eq!(second.digests[0].count, 1);
+        assert_eq!(second.digests[0].max_sequence, 3);
+        assert_eq!(second.next_cursor_sequence, 3);
+        assert!(!second.has_more);
     }
 }
