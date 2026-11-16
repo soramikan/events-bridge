@@ -5,8 +5,10 @@
 
 pub mod app;
 pub mod auth;
+pub mod cli;
 pub mod collectors;
 pub mod config;
+pub mod consumers;
 pub mod delivery;
 pub mod edge_protocol;
 pub mod event;

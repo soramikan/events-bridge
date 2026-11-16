@@ -8,6 +8,7 @@ use secrecy::SecretString;
 use crate::{
     auth::Auth,
     config::Config,
+    consumers::ConsumerService,
     delivery::verification::CallbackPolicy,
     event::{EventBus, IngestService},
     mcp::subscriptions::SubscriptionManager,
@@ -27,6 +28,8 @@ pub struct AppState {
     pub ingest: IngestService,
     /// `events/*` implementation.
     pub subscriptions: Arc<SubscriptionManager>,
+    /// Server-side polling consumers.
+    pub consumers: Arc<ConsumerService>,
     /// Pull tools.
     pub tools: Arc<ToolService>,
     /// Inbound authentication.
@@ -56,7 +59,8 @@ impl AppState {
             config.subscriptions.clone(),
             policy,
         ));
-        let tools = Arc::new(ToolService::new(repo.clone()));
+        let consumers = Arc::new(ConsumerService::from_config(repo.clone(), &config));
+        let tools = Arc::new(ToolService::with_consumers(repo.clone(), consumers.clone()));
         let auth = Auth::from_config(&config.auth)?;
 
         let internal_token = if config.server.enable_internal_ingest {
@@ -100,6 +104,7 @@ impl AppState {
             bus,
             ingest,
             subscriptions,
+            consumers,
             tools,
             auth,
             internal_token,

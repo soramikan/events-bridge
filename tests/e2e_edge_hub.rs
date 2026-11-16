@@ -2736,7 +2736,7 @@ async fn stdio_surface_serves_tools_and_events() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 9);
     for expected in [
         "list_events",
         "get_event",
@@ -2744,6 +2744,9 @@ async fn stdio_surface_serves_tools_and_events() {
         "get_t3_approvals",
         "get_github_status",
         "ack_events",
+        "probe_consumer",
+        "poll_consumer_events",
+        "ack_consumer_events",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }

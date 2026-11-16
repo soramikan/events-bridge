@@ -325,6 +325,7 @@ HTTP /mcp
 | `delivery_attempts` | HTTP ステータス、エラー、送信時刻 |
 | `collector_checkpoints` | GitHub ETag、T3 Code の取得位置 |
 | `acks` | オプションのユーザー確認履歴 |
+| `consumers` | ポーリング consumer の名前・カーソル・最終 poll/ack 時刻 |
 
 `deliveries` は購読単位で `UNIQUE(subscription_id, event_id)` を持たせる。
 
@@ -385,6 +386,100 @@ dots への監視指示の例:
 5. **ChatGPT 実機検証**: 購読生成、チャレンジ検証、イベント配信、dots の自動処理、再起動復旧
 
 実機検証では Webhook の HTTP `2xx` だけでなく、実際の dots タスクが起動し、指定された内容がユーザーに提示されるまで確認する。
+
+## 10. Muse ポーリングコンシューマー（Phase A: A1/A2/A3）
+
+ChatGPT の MCP Events 購読は「クライアントが URL と秘密鍵を登録し、サーバーが署名付き Webhook を push する」方式である。これに対して Muse などの常駐クライアントは、SSH 越しの CLI や cron/hook から**サーバー側カーソルを poll/ack する pull 方式**の方が扱いやすい。Phase A ではこの pull 経路を `consumers` として追加する。
+
+### 10.1 subscriptions と consumers の概念的な違い
+
+| 項目 | `subscriptions`（ChatGPT Webhook） | `consumers`（Muse polling） |
+| --- | --- | --- |
+| 主導権 | クライアントが購読を登録 | クライアントが任意のタイミングで poll |
+| 配信方向 | サーバーから callback URL へ push | クライアントがサーバーから pull |
+| 状態 | `subscriptions` + `deliveries` + `delivery_attempts` | `consumers.cursor_sequence` のみ |
+| フィルター | 購読ごとの `arguments`（イベント定義の inputSchema） | `[consumers.<name>]` の `events` / `filters` プロファイル |
+| 有効期限 | `refreshBefore` による TTL。期限前に再購読が必要 | なし。行は永続 |
+| 重複制御 | `UNIQUE(subscription_id, event_id)` による Webhook 配信の冪等性 | カーソルを ack まで進めない at-least-once |
+| 消費者ごとの独立性 | 購読 ID 単位 | consumer 名単位でカーソルを完全分離 |
+| 用途 | ChatGPT / dots の自動タスク起動 | Muse の SSH CLI・cron・hook チェック |
+
+両者は同じ `events` テーブルを読むが、`consumers` は `deliveries` を一切作らない。`ack_events`（ユーザー確認履歴）とも独立しており、consumer の ack は `consumers.cursor_sequence` だけを動かす。
+
+### 10.2 スキーマ（A1）
+
+`migrations/005_consumers.sql` で次を追加する（`PRAGMA user_version = 5`）。
+
+```sql
+CREATE TABLE consumers (
+    name            TEXT PRIMARY KEY,
+    cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK (cursor_sequence >= 0),
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    last_polled_at  TEXT,
+    last_acked_at   TEXT
+);
+```
+
+`probe` は行がなければ `cursor_sequence = 0` で自動初期化する。`poll` は `last_polled_at` と `updated_at` だけを更新し、`cursor_sequence` は変更しない。`ack` は `0 <= upToSequence <= latestSequence` を検証したうえで `max(current, upToSequence)` へ単調に進める。古い sequence の ack は no-op（`advanced: false`）とし、既読イベントを再び開かない。
+
+### 10.3 プロファイルと disposition（A3）
+
+`[consumers.<name>]` でイベント名ごとの扱いを定義する。
+
+- `immediate`: 即時通知対象。`probe` の unread に数え、`poll` で返す。
+- `digest`: 集約対象。Phase A では `poll.events` に `"disposition": "digest"` として返し、`digests` は空配列を返す（A2 で集約を実装）。
+- `off`: `probe`・`poll` の両方から除外する。
+
+未指定イベントの扱いは `default_disposition`（既定 `off`）。`filters` は `environment_ids` / `project_ids` / `repositories` の allowlist で、空配列は制限なしを意味する。イベント payload に対応するキーがない場合は不一致として除外する。
+
+`muse` という名前は組み込みプロファイルとして常に解決できる（大文字小文字を区別しない）。`[consumers.muse]` または `[consumers.Muse]` を書いた場合は、組み込みのイベント表に対してキー単位でマージされる。たとえば `"github.pr.merged" = "off"` と書くと、そのイベントだけが無効になる。
+
+| イベント | 組み込み Muse の disposition |
+| --- | --- |
+| `t3.approval.required` | `immediate` |
+| `t3.run.failed` | `immediate` |
+| `github.workflow.failed` | `immediate` |
+| `github.review.requested` | `digest` |
+| `github.pr.merged` | `digest` |
+| `t3.run.completed` | `digest` |
+
+### 10.4 3つのサーフェス（A1/A2）
+
+**CLI**
+
+```console
+events-bridge poll --consumer muse --probe
+events-bridge poll --consumer muse --limit 50
+events-bridge poll --consumer muse --ack 123
+events-bridge ack --consumer muse --up-to 123
+```
+
+`--config` / `--db` で設定と DB を明示できる。stdout は 1 個の JSON ドキュメントのみで、ログは stderr に限定する。
+
+**Hub HTTP**
+
+```text
+GET  /consumers/{name}/probe
+GET  /consumers/{name}/poll?limit=N
+POST /consumers/{name}/ack   {"upToSequence": 123}
+```
+
+3 エンドポイントとも `Authorization: Bearer` と Host/Origin の HTTP セキュリティ検証を通す。ack は `{"cursor": 123}` も受け付ける。
+
+**MCP tools**
+
+| ツール | 引数 | 権限 |
+| --- | --- | --- |
+| `probe_consumer` | `consumer` | Read |
+| `poll_consumer_events` | `consumer`, `limit` (1..=200) | Read |
+| `ack_consumer_events` | `consumer`, `up_to_sequence` | Write |
+
+既存の `ack_events` は変更しない。`ack_consumer_events` は consumer カーソル専用である。
+
+### 10.5 2段階チェック
+
+高頻度の hook/cron では、まず `probe` だけを呼ぶ。`hasUpdates` / `unreadCount` が 0 なら本文取得も ack も行わない。更新がある場合だけ `poll` し、処理完了後に返却された `nextCursorSequence` で `ack` する。poll と ack の間にプロセスが落ちても、カーソルは進んでいないためイベントは再返却される（at-least-once）。
 
 ## 最終推奨構成
 

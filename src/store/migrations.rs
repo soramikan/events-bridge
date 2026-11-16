@@ -31,6 +31,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: include_str!("../../migrations/004_edge_ingest.sql"),
     },
+    Migration {
+        version: 5,
+        sql: include_str!("../../migrations/005_consumers.sql"),
+    },
 ];
 
 /// Apply every migration newer than the connection's `user_version`.

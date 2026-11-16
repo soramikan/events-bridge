@@ -63,6 +63,37 @@ poll_interval_ms = 5000
 [logging]
 level = "info,events_bridge=debug"
 
+# Polling consumers (Phase A).
+#
+# Consumers are server-side cursors resolved by name. `poll` never advances a
+# cursor; only `ack` does, so poll/ack is at-least-once. Consumers are separate
+# from the ChatGPT webhook `[subscriptions]` path above.
+#
+# The built-in `muse` profile is always available and resolves
+# `t3.approval.required`, `t3.run.failed` and `github.workflow.failed` as
+# immediate notifications; `github.review.requested`, `github.pr.merged` and
+# `t3.run.completed` are digest-eligible. Everything else is off.
+#
+# Configure `[consumers.muse]` to override individual values or event
+# dispositions. The built-in event map is merged with the entries below, so
+# setting an event to "off" disables just that event.
+# [consumers.muse]
+# default_disposition = "off"
+# digest_window_secs = 600
+# max_events_per_poll = 50
+# max_digest_event_ids = 50
+# [consumers.muse.events]
+# "t3.approval.required" = "immediate"
+# "t3.run.failed" = "immediate"
+# "github.workflow.failed" = "immediate"
+# "github.review.requested" = "digest"
+# "github.pr.merged" = "digest"
+# "t3.run.completed" = "digest"
+# [consumers.muse.filters]
+# environment_ids = ["linux-main"]
+# project_ids = ["lnako"]
+# repositories = ["soramikan/events-bridge"]
+
 # T3 Code Collector (Phase 2).
 #
 # The collector opens T3 Code's state database read-only. It needs no token:

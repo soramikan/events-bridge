@@ -4,10 +4,11 @@
 //! hub reads is a bearer token, and it is named indirectly through
 //! `auth.token_env` so the value comes from the process environment.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Absolute protocol ceiling for one serialized webhook body (256 KiB).
 ///
@@ -41,6 +42,12 @@ pub struct Config {
     pub collectors: CollectorsConfig,
     /// Edge forwarding settings (only required by the `edge` subcommand).
     pub edge: EdgeConfig,
+    /// Named server-side polling consumer profiles.
+    ///
+    /// Profiles are read-only configuration, not webhook subscriptions. The
+    /// built-in `muse` profile is resolved even when this map is empty.
+    #[serde(default)]
+    pub consumers: BTreeMap<String, ConsumerProfileConfig>,
 }
 
 /// HTTP listener settings.
@@ -233,6 +240,146 @@ impl Default for SubscriptionConfig {
             max_ttl_secs: 86_400,
         }
     }
+}
+
+/// How a consumer wants a given event name handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventDisposition {
+    /// Return the event on the next poll and surface it in unread counts.
+    Immediate,
+    /// Return the event but let the caller batch it (Phase A2 adds digests).
+    Digest,
+    /// Exclude the event from probes and polls entirely.
+    #[default]
+    Off,
+}
+
+/// Optional payload filters applied to a consumer profile.
+///
+/// Every list is an allowlist: an empty list means "no restriction". When a
+/// list is non-empty the event payload must contain the matching key with one
+/// of the listed values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsumerFiltersConfig {
+    /// Accepted `data.environment_id` values.
+    pub environment_ids: Vec<String>,
+    /// Accepted `data.project_id` values.
+    pub project_ids: Vec<String>,
+    /// Accepted `data.repository` values (`owner/repo`).
+    pub repositories: Vec<String>,
+}
+
+/// Configuration for one named polling consumer.
+///
+/// Consumers are server-side cursors: `poll` never advances the cursor, only
+/// `ack` does. That makes poll/ack at-least-once instead of at-most-once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsumerProfileConfig {
+    /// Disposition for event names not listed in `events`.
+    pub default_disposition: EventDisposition,
+    /// Intended aggregation window for digest events (Phase A2).
+    pub digest_window_secs: u64,
+    /// Default number of events returned by one poll.
+    pub max_events_per_poll: usize,
+    /// Maximum number of event ids returned in one digest (Phase A2).
+    pub max_digest_event_ids: usize,
+    /// Per-event-name disposition overrides.
+    pub events: BTreeMap<String, EventDisposition>,
+    /// Optional payload filters.
+    pub filters: ConsumerFiltersConfig,
+}
+
+impl Default for ConsumerProfileConfig {
+    fn default() -> Self {
+        Self {
+            default_disposition: EventDisposition::Off,
+            digest_window_secs: 600,
+            max_events_per_poll: 50,
+            max_digest_event_ids: 50,
+            events: BTreeMap::new(),
+            filters: ConsumerFiltersConfig::default(),
+        }
+    }
+}
+
+impl ConsumerProfileConfig {
+    /// Built-in profile for the Muse polling consumer.
+    ///
+    /// Approval requests and failures are immediate notifications; lower
+    /// urgency activity is digest-eligible. Everything else is off.
+    pub fn muse_default() -> Self {
+        let mut events = BTreeMap::new();
+        events.insert("t3.approval.required".into(), EventDisposition::Immediate);
+        events.insert("t3.run.failed".into(), EventDisposition::Immediate);
+        events.insert("github.workflow.failed".into(), EventDisposition::Immediate);
+        events.insert("github.review.requested".into(), EventDisposition::Digest);
+        events.insert("github.pr.merged".into(), EventDisposition::Digest);
+        events.insert("t3.run.completed".into(), EventDisposition::Digest);
+        Self {
+            events,
+            ..Self::default()
+        }
+    }
+
+    /// Overlay an explicitly configured profile on top of this one.
+    ///
+    /// Scalars replace the base value, event names are merged one key at a
+    /// time (so a profile can turn a built-in event `off`), and filters are
+    /// taken from the override.
+    pub fn with_overrides(mut self, overrides: &Self) -> Self {
+        self.default_disposition = overrides.default_disposition;
+        self.digest_window_secs = overrides.digest_window_secs;
+        self.max_events_per_poll = overrides.max_events_per_poll;
+        self.max_digest_event_ids = overrides.max_digest_event_ids;
+        self.filters = overrides.filters.clone();
+        self.events.extend(
+            overrides
+                .events
+                .iter()
+                .map(|(name, disposition)| (name.clone(), *disposition)),
+        );
+        self
+    }
+}
+
+/// Resolve a consumer profile by name.
+///
+/// Matching is case-insensitive. The built-in `muse` profile is always
+/// available; an explicitly configured `[consumers.muse]` (or differently
+/// cased equivalent) is merged over it. Returns the canonical consumer name
+/// together with the resolved profile.
+pub fn resolve_consumer_profile(
+    consumers: &BTreeMap<String, ConsumerProfileConfig>,
+    requested: &str,
+) -> Option<(String, ConsumerProfileConfig)> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+
+    let configured = consumers
+        .get_key_value(requested)
+        .or_else(|| {
+            consumers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(requested))
+        })
+        .map(|(name, profile)| (name.clone(), profile.clone()));
+
+    if requested.eq_ignore_ascii_case("muse") {
+        let profile = match configured {
+            Some((_, overrides)) => {
+                ConsumerProfileConfig::muse_default().with_overrides(&overrides)
+            }
+            None => ConsumerProfileConfig::muse_default(),
+        };
+        return Some(("muse".into(), profile));
+    }
+
+    configured
 }
 
 /// Delivery worker settings.
@@ -615,6 +762,26 @@ impl Config {
                 github.max_webhook_body_bytes
             );
         }
+
+        for (name, profile) in &self.consumers {
+            if name.trim().is_empty() {
+                bail!("consumer names must not be empty");
+            }
+            if profile.digest_window_secs == 0 {
+                bail!("consumers.{name}.digest_window_secs must be greater than zero");
+            }
+            if profile.max_events_per_poll == 0 {
+                bail!("consumers.{name}.max_events_per_poll must be greater than zero");
+            }
+            if profile.max_digest_event_ids == 0 {
+                bail!("consumers.{name}.max_digest_event_ids must be greater than zero");
+            }
+            for event in profile.events.keys() {
+                if event.trim().is_empty() {
+                    bail!("consumers.{name}.events keys must not be empty");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -725,6 +892,106 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let error = Config::parse("[server]\nbind = \"127.0.0.1:1\"\nsurprise = true\n")
             .expect_err("unknown key must fail");
+        assert!(error.to_string().contains("surprise"), "{error}");
+    }
+
+    #[test]
+    fn config_without_consumers_parses_and_uses_defaults() {
+        let config = Config::parse("[delivery]\ntimeout_secs = 3\n").unwrap();
+        assert!(config.consumers.is_empty());
+        let (name, profile) = resolve_consumer_profile(&config.consumers, "muse").unwrap();
+        assert_eq!(name, "muse");
+        assert_eq!(profile.default_disposition, EventDisposition::Off);
+        assert_eq!(profile.digest_window_secs, 600);
+        assert_eq!(profile.max_events_per_poll, 50);
+        assert_eq!(profile.max_digest_event_ids, 50);
+        assert_eq!(
+            profile.events.get("t3.run.failed"),
+            Some(&EventDisposition::Immediate)
+        );
+        assert_eq!(
+            profile.events.get("github.pr.merged"),
+            Some(&EventDisposition::Digest)
+        );
+    }
+
+    #[test]
+    fn muse_profile_overrides_merge_with_builtin_defaults() {
+        let config = Config::parse(
+            "[consumers.Muse]\n\
+             digest_window_secs = 120\n\
+             max_events_per_poll = 10\n\
+             max_digest_event_ids = 5\n\
+             [consumers.Muse.events]\n\
+             \"github.pr.merged\" = \"off\"\n\
+             \"github.workflow.failed\" = \"digest\"\n",
+        )
+        .expect("muse profile parses");
+
+        let (name, profile) = resolve_consumer_profile(&config.consumers, "muse").unwrap();
+        assert_eq!(name, "muse");
+        assert_eq!(profile.digest_window_secs, 120);
+        assert_eq!(profile.max_events_per_poll, 10);
+        assert_eq!(profile.max_digest_event_ids, 5);
+        assert_eq!(
+            profile.events.get("github.pr.merged"),
+            Some(&EventDisposition::Off)
+        );
+        assert_eq!(
+            profile.events.get("github.workflow.failed"),
+            Some(&EventDisposition::Digest)
+        );
+        // Untouched built-in entries survive the merge.
+        assert_eq!(
+            profile.events.get("t3.approval.required"),
+            Some(&EventDisposition::Immediate)
+        );
+
+        let (name, profile) = resolve_consumer_profile(&config.consumers, "MUSE").unwrap();
+        assert_eq!(name, "muse");
+        assert_eq!(profile.max_events_per_poll, 10);
+    }
+
+    #[test]
+    fn custom_consumer_profiles_resolve_case_insensitively() {
+        let config = Config::parse(
+            "[consumers.Reviewer]\n\
+             default_disposition = \"digest\"\n\
+             [consumers.Reviewer.filters]\n\
+             repositories = [\"soramikan/events-bridge\"]\n",
+        )
+        .unwrap();
+        let (name, profile) = resolve_consumer_profile(&config.consumers, "reviewer").unwrap();
+        assert_eq!(name, "Reviewer");
+        assert_eq!(profile.default_disposition, EventDisposition::Digest);
+        assert_eq!(
+            profile.filters.repositories,
+            vec!["soramikan/events-bridge"]
+        );
+        assert!(resolve_consumer_profile(&config.consumers, "missing").is_none());
+        assert!(resolve_consumer_profile(&Config::default().consumers, "").is_none());
+    }
+
+    #[test]
+    fn consumer_profile_validation_rejects_zero_and_empty_values() {
+        for contents in [
+            "[consumers.muse]\ndigest_window_secs = 0\n",
+            "[consumers.muse]\nmax_events_per_poll = 0\n",
+            "[consumers.muse]\nmax_digest_event_ids = 0\n",
+            "[consumers.muse.events]\n\"\" = \"immediate\"\n",
+        ] {
+            let error = Config::parse(contents).expect_err("invalid consumer profile must fail");
+            assert!(
+                error.to_string().contains("consumers.muse"),
+                "{contents}: {error}"
+            );
+        }
+
+        let error = Config::parse("[consumers.\"  \"]\n").expect_err("blank name must fail");
+        assert!(error.to_string().contains("consumer names"), "{error}");
+
+        let error = Config::parse("[consumers.muse.filters]\nsurprise = []\n")
+            .expect_err("unknown filter key must fail");
         assert!(error.to_string().contains("surprise"), "{error}");
     }
 
