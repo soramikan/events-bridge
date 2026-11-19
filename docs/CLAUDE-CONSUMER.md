@@ -188,54 +188,34 @@ $ ssh muse@hub 'events-bridge poll --consumer muse --ack 42'
 パスワードやトークンをコマンドラインに埋めない。HTTP を使う場合の Bearer トークンは
 環境変数から読み、シェル履歴やログに残さない。
 
-## 3. HTTP（任意）
+## 3. Muse VM への HTTP ポーラーの組み込み
 
-Hub を直接叩く場合の 3 エンドポイント。`[auth].token_env` を設定している場合は
-`Authorization: Bearer <token>` が必須。
-
-```console
-$ curl -fsS -H "Authorization: Bearer $TOKEN" \
-    https://bridge.example.com/consumers/muse/probe
-$ curl -fsS -H "Authorization: Bearer $TOKEN" \
-    'https://bridge.example.com/consumers/muse/poll?limit=50'
-$ curl -fsS -X POST -H "Authorization: Bearer $TOKEN" \
-    -H 'Content-Type: application/json' \
-    -d '{"upToSequence":42}' \
-    https://bridge.example.com/consumers/muse/ack
-```
-
-## 4. 2段階 hook / cron パターン
-
-高頻度チェックでは、毎回イベント本文を取得しない。まず `probe` だけを実行し、
-`hasUpdates` または `unreadCount > 0` のときだけ `poll` と `ack` を行う。
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-CONSUMER=muse
-PROBE_JSON="$(events-bridge poll --consumer "$CONSUMER" --probe)"
-
-if ! jq -e '.hasUpdates == true and .unreadCount > 0' >/dev/null <<<"$PROBE_JSON"; then
-  # 未読なし: 何もせず終了する（本文取得も ack もしない）
-  exit 0
-fi
-
-POLL_JSON="$(events-bridge poll --consumer "$CONSUMER" --limit 50)"
-NEXT_CURSOR="$(jq -r '.nextCursorSequence' <<<"$POLL_JSON")"
-
-# ここでイベントを処理する。処理が成功した場合だけ ack する。
-# jq の例: jq -c '.events[]' <<<"$POLL_JSON" | while read -r event; do ...
-process_events "$POLL_JSON"
-
-events-bridge poll --consumer "$CONSUMER" --ack "$NEXT_CURSOR"
-```
-
-cron の例（5 分ごと。多重起動を避けるため `flock` を使う）:
+Python 3 の `scripts/muse-poll.py` を Muse VM に配置する。
+既定の接続先は `http://100.85.211.2:8788`（Tailscale 内の HTTP）。
+検証用 Hub を使う場合は `EVENTS_BRIDGE_MUSE_URL` でオリジンを上書きする。
+`EVENTS_BRIDGE_TOKEN` は Muse の秘密情報管理からプロセス環境に渡す。
+cron を使う場合は、Muse ユーザーだけが読めるモード 0600 の環境ファイルから読み込む。
 
 ```cron
-*/5 * * * * flock -n /run/events-bridge-muse.lock /usr/local/bin/muse-check.sh
+* * * * * /bin/sh -c 'set -a; . "$HOME/.config/muse/events-bridge.env" || exit 1; set +a; exec /usr/local/bin/muse-poll.py --state-dir "$HOME/.local/state/muse-events" -- /usr/local/bin/muse-event-handler'
 ```
+
+hook からも同じコマンドを毎分 1 回呼べる。同じ consumer には cron と hook の
+どちらか一方を選び、VM 内で同じ状態ディレクトリを使う。状態 DB には未処理の
+ページ本文と処理済み ID が入るため、Muse ユーザー専用のディレクトリに置く。
+
+ハンドラーは標準入力の JSON 1 件を受け取る。
+`kind` は `immediate` または `digest`、`item` は Hub が返したイベントまたは
+digest、`id` は冪等処理に使うキー。成功時だけ 0 を返す。
+通知先で処理が成功してからローカル DB に記録するまでに落ちる場合があるため、
+ハンドラー側でも同じ `id` の再処理を防ぐ。
+
+ポーラーは毎分 probe し、未読時だけ新しいページを poll する。途中で失敗した
+ページはローカルに保持し、処理済み ID を飛ばして再開する。digest は掲載された
+イベント ID の組で識別し、ID が省略された場合はウィンドウと最大 sequence も使う。
+省略された個々の ID は Hub から取得できないため、要約単位で重複を排除する。
+ページ内のイベントと digest がすべて成功した後で `nextCursorSequence` を ack する。
+続きのページは次の tick で取得する。
 
 ### 注意点
 
