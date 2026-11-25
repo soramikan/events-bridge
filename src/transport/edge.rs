@@ -1,4 +1,4 @@
-//! Edge collector: forward T3 Code state to a central hub.
+//! Legacy T3 Edge implementation retained for protocol compatibility tests.
 //!
 //! The edge keeps its own SQLite database with the same T3 projection tables
 //! and `source_cursors` as the hub. It derives a [`T3WriteBatch`] locally,
@@ -14,24 +14,22 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::CONTENT_TYPE;
-use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
+    app::read_secret_env,
     collectors::{
         T3CollectorSettings, T3Source,
         t3_state::{T3Reducer, T3SourceEvent},
     },
     config::Config,
-    edge_protocol::{
-        EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE, HEADER_EDGE_SIGNATURE,
-        HEADER_EDGE_TIMESTAMP, ingest_url, sign,
-    },
+    edge_protocol::{EDGE_INGEST_PATH, EdgeT3IngestRequest},
     store::{EdgePendingSnapshot, Repository, T3Snapshot},
     util::{now_rfc3339, random_hex},
 };
+
+use super::signed_edge::SignedEdgeClient;
 
 /// One edge synchronization pass summary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,10 +44,7 @@ pub struct EdgeSyncSummary {
 
 /// Edge collector.
 pub struct Edge {
-    edge_id: String,
     environment_id: String,
-    endpoint: Url,
-    secret: SecretString,
     retry_initial: Duration,
     retry_max: Duration,
     poll_interval: Duration,
@@ -61,7 +56,7 @@ pub struct Edge {
     state_db_path: PathBuf,
     repo: Arc<Repository>,
     source: Mutex<SourceState>,
-    client: reqwest::Client,
+    client: SignedEdgeClient,
 }
 
 struct SourceState {
@@ -83,15 +78,6 @@ impl Edge {
             .context("edge.shared_secret_env is required")?;
         let secret = read_secret_env(secret_env, "edge forwarding")?;
 
-        let hub_url = config
-            .edge
-            .hub_url
-            .as_deref()
-            .context("edge.hub_url is required")?;
-        let hub_url = Url::parse(hub_url)
-            .with_context(|| format!("edge.hub_url `{hub_url}` is not a URL"))?;
-        let endpoint = ingest_url(&hub_url);
-
         let settings = T3CollectorSettings::from_config_with_hostname_fallback(config)?;
         let environment_id = settings.environment_id.clone();
         let edge_id = resolve_edge_id(config, &environment_id);
@@ -101,19 +87,10 @@ impl Edge {
         let identity = file_identity(&settings.state_db_path);
         let source = T3Source::open(&settings.state_db_path)?;
 
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(config.edge.request_timeout_secs.max(1)))
-            .connect_timeout(Duration::from_secs(config.edge.request_timeout_secs.max(1)))
-            .user_agent(concat!("events-bridge-edge/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("building edge HTTP client")?;
+        let client = SignedEdgeClient::new(&config.edge, EDGE_INGEST_PATH, edge_id, secret)?;
 
         Ok(Self {
-            edge_id,
             environment_id,
-            endpoint,
-            secret,
             retry_initial: Duration::from_millis(config.edge.retry_initial_ms.max(1)),
             retry_max: Duration::from_millis(
                 config
@@ -140,7 +117,7 @@ impl Edge {
 
     /// Stable edge identifier sent in `X-Edge-Id`.
     pub fn edge_id(&self) -> &str {
-        &self.edge_id
+        self.client.edge_id()
     }
 
     /// T3 environment id carried by the forwarded state.
@@ -150,7 +127,7 @@ impl Edge {
 
     /// Hub ingest endpoint.
     pub fn endpoint(&self) -> &Url {
-        &self.endpoint
+        self.client.endpoint()
     }
 
     /// Local edge database.
@@ -255,14 +232,14 @@ impl Edge {
                     delay = self.retry_initial;
                     if summary.snapshot {
                         tracing::info!(
-                            edge_id = %self.edge_id,
+                            edge_id = %self.edge_id(),
                             environment_id = %self.environment_id,
                             "edge snapshot accepted by hub"
                         );
                     }
                     if summary.processed > 0 {
                         tracing::info!(
-                            edge_id = %self.edge_id,
+                            edge_id = %self.edge_id(),
                             environment_id = %self.environment_id,
                             processed = summary.processed,
                             emitted = summary.emitted,
@@ -273,8 +250,8 @@ impl Edge {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        edge_id = %self.edge_id,
-                        endpoint = %self.endpoint,
+                        edge_id = %self.edge_id(),
+                        endpoint = %self.endpoint(),
                         delay_ms = delay.as_millis(),
                         %error,
                         "edge forward failed; retrying"
@@ -514,43 +491,7 @@ impl Edge {
     }
 
     async fn post(&self, request: &EdgeT3IngestRequest) -> Result<()> {
-        let body = serde_json::to_vec(request)?;
-        let timestamp = chrono::Utc::now().timestamp();
-        let nonce = random_hex(16);
-        let signature = sign(
-            self.secret.expose_secret().as_bytes(),
-            &self.edge_id,
-            timestamp,
-            &nonce,
-            &body,
-        );
-
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .header(reqwest::header::CONNECTION, "close")
-            .header(HEADER_EDGE_ID, &self.edge_id)
-            .header(HEADER_EDGE_TIMESTAMP, timestamp.to_string())
-            .header(HEADER_EDGE_NONCE, &nonce)
-            .header(HEADER_EDGE_SIGNATURE, signature)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {}", self.endpoint))?;
-
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let detail = response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(512)
-            .collect::<String>();
-        bail!("hub rejected edge request with HTTP {status}: {detail}");
+        self.client.post(serde_json::to_vec(request)?).await
     }
 
     fn with_source<T>(&self, f: impl FnOnce(&T3Source) -> Result<T>) -> Result<T> {
@@ -619,16 +560,6 @@ fn resolve_edge_id(config: &Config, environment_id: &str) -> String {
     String::new()
 }
 
-fn read_secret_env(variable: &str, purpose: &str) -> Result<SecretString> {
-    let value = std::env::var(variable).with_context(|| {
-        format!("{purpose} is configured but environment variable `{variable}` is unset")
-    })?;
-    if value.trim().is_empty() {
-        bail!("environment variable `{variable}` is empty");
-    }
-    Ok(SecretString::from(value))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     #[cfg(unix)]
@@ -669,59 +600,6 @@ fn file_signature(path: &Path) -> Option<(u64, u128)> {
         .as_nanos();
     Some((metadata.len(), modified))
 }
-
-/// Load configuration and run the edge collector until shutdown.
-pub async fn run(config_path: PathBuf) -> Result<()> {
-    let config = Config::load(config_path)?;
-    crate::init_tracing(&config.logging.level);
-    let edge = Edge::new(&config)?;
-    tracing::info!(
-        edge_id = %edge.edge_id(),
-        environment_id = %edge.environment_id(),
-        endpoint = %edge.endpoint(),
-        "events-bridge edge started"
-    );
-    let cancellation = CancellationToken::new();
-    let child = cancellation.clone();
-    let handle = tokio::spawn(async move {
-        if let Err(error) = edge.run(child).await {
-            tracing::error!(%error, "edge collector stopped");
-        }
-    });
-
-    shutdown_signal().await;
-    cancellation.cancel();
-    let _ = handle.await;
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not install SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
-    tracing::info!("edge shutdown signal received");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

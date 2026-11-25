@@ -3,8 +3,8 @@
 //! The stdio surface exposes exactly the same `EventsHandler` as the HTTP
 //! transport: the six pull tools plus `events/list`, `events/poll`,
 //! `events/subscribe` and `events/unsubscribe`. When a configuration file
-//! enables the local T3 collector or the GitHub poller, those background tasks
-//! start here too and are cancelled and joined on exit.
+//! enables the GitHub poller, that background task starts here too and is
+//! cancelled and joined on exit.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -61,17 +61,7 @@ where
         policy,
     );
 
-    let t3_collector = hub::spawn_t3_collector(&state)?;
-    let github_poller = match hub::spawn_github_poller(&state) {
-        Ok(poller) => poller,
-        Err(error) => {
-            if let Some((collector_cancellation, collector_handle)) = t3_collector {
-                collector_cancellation.cancel();
-                let _ = collector_handle.await;
-            }
-            return Err(error);
-        }
-    };
+    let github_poller = hub::spawn_github_poller(&state)?;
 
     let cancellation = CancellationToken::new();
     let worker_token = cancellation.clone();
@@ -87,10 +77,6 @@ where
     .await;
 
     cancellation.cancel();
-    if let Some((collector_cancellation, collector_handle)) = t3_collector {
-        collector_cancellation.cancel();
-        let _ = collector_handle.await;
-    }
     if let Some((poller_cancellation, poller_handle)) = github_poller {
         poller_cancellation.cancel();
         let _ = poller_handle.await;

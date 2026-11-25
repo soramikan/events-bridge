@@ -48,14 +48,14 @@ pub fn definitions() -> Vec<Tool> {
         vec![
             tool(
                 "list_events",
-                "List persisted T3 Code and GitHub events, optionally filtered by time, source, event name, or severity.",
+                "List persisted Orca, GitHub, and historical T3 Code events, optionally filtered by time, source, event name, or severity.",
                 json!({
                     "type": "object",
                     "properties": {
                         "since": {"type": "string", "description": "Inclusive RFC 3339 lower bound on occurredAt."},
                         "until": {"type": "string", "description": "Inclusive RFC 3339 upper bound on occurredAt."},
-                        "source": {"type": "string", "enum": ["t3", "github"]},
-                        "kind": {"type": "string", "description": "Exact event name, e.g. t3.run.failed."},
+                        "source": {"type": "string", "enum": ["orca", "github", "t3"]},
+                        "kind": {"type": "string", "description": "Exact event name, e.g. orca.session.failed."},
                         "severity": {"type": "string", "enum": ["high", "normal"]},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                         "after": {"type": "integer", "minimum": 0, "description": "Return events with sequence strictly greater than this value."},

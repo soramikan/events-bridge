@@ -1,6 +1,6 @@
-# T3 Code / GitHub → ChatGPT（dots / Work）向け MCP Events サーバー設計
+# Orca / GitHub → ChatGPT（dots / Work）向け MCP Events サーバー設計
 
-公式仕様を確認した設計（2026年11月16日時点）。リポジトリ名・バイナリ名は `events-bridge` に統一する（設計中の `t3gh-mcpd` 表記は本バイナリを指す）。
+MCP Events の公式仕様を確認した設計（2026年11月16日時点）。Orca の取得経路は 2026 年 11 月 25 日時点。リポジトリ名・バイナリ名は `events-bridge` に統一する（設計中の `t3gh-mcpd` 表記は本バイナリを指す）。
 
 ## 1. 結論：MCP Events の実装方式
 
@@ -38,12 +38,14 @@ ChatGPT の MCP Events は、Work のクラウド実行、対応するデスク�
 
 | イベント名 | 発生条件 | 優先度 |
 | --- | --- | --- |
-| `t3.run.completed` | T3 の実行が正常完了 | 通常 |
-| `t3.run.failed` | エージェント実行が失敗 | 高 |
-| `t3.approval.required` | 承認・入力待ち | 高 |
+| `orca.session.completed` | Orca エージェントのターンが完了 | 通常 |
+| `orca.session.failed` | Orca が失敗または予期しない中断を報告 | 高 |
+| `orca.approval.required` | Orca が承認・入力待ちを観測 | 高 |
 | `github.workflow.failed` | CI ワークフローが失敗 | 高 |
 | `github.review.requested` | PR のレビュー要求 | 通常 |
 | `github.pr.merged` | PR がマージされた | 通常 |
+
+既存の `t3.*` は過去のイベントを読むために引き続き公開する。
 
 イベントを細かく分割することで、dots に「承認待ちは即時通知、完了は集約通知」といった異なる処理を設定できる。
 
@@ -51,8 +53,8 @@ ChatGPT の MCP Events は、Work のクラウド実行、対応するデスク�
 
 ```json
 {
-  "name": "t3.run.completed",
-  "description": "A T3 Code coding-agent run has completed.",
+  "name": "orca.session.completed",
+  "description": "An Orca agent finished a turn.",
   "delivery": ["webhook", "poll"],
   "inputSchema": {
     "type": "object",
@@ -68,12 +70,12 @@ ChatGPT の MCP Events は、Work のクラウド実行、対応するデスク�
     "properties": {
       "environment_id": {"type": "string"},
       "project_id": {"type": "string"},
-      "thread_id": {"type": "string"},
-      "run_id": {"type": "string"},
+      "session_id": {"type": "string"},
       "summary": {"type": "string"},
-      "url": {"type": "string"}
+      "severity": {"type": "string", "enum": ["high", "normal"]},
+      "requires_action": {"type": "boolean"}
     },
-    "required": ["environment_id", "project_id", "thread_id", "run_id", "summary"],
+    "required": ["environment_id", "session_id", "summary"],
     "additionalProperties": false
   }
 }
@@ -91,7 +93,7 @@ ChatGPT の MCP Events は、Work のクラウド実行、対応するデスク�
   "id": 2,
   "method": "events/subscribe",
   "params": {
-    "name": "t3.run.completed",
+    "name": "orca.session.completed",
     "arguments": {
       "environment_id": "linux-main"
     },
@@ -130,29 +132,28 @@ ChatGPT の MCP Events は、Work のクラウド実行、対応するデスク�
 
 ```json
 {
-  "eventId": "evt_linux-main_run-102_completed",
-  "name": "t3.run.completed",
+  "eventId": "evt_orca_<sha256>",
+  "name": "orca.session.completed",
   "timestamp": "2026-11-16T01:00:00+09:00",
   "data": {
     "environment_id": "linux-main",
-    "project_id": "lnako",
-    "thread_id": "thread-42",
-    "run_id": "run-102",
-    "summary": "Coding agent run completed",
-    "url": "https://t3.example.com/threads/42"
+    "session_id": "orca_session_id:00000000-0000-4000-8000-000000000001",
+    "summary": "An Orca agent finished a turn.",
+    "severity": "normal",
+    "requires_action": false
   },
   "cursor": null
 }
 ```
 
-イベント ID、日時、URL は形式を示す例示。実際の URI は T3 Code が提供する正規のリンクを使用する。
+イベント ID と日時は形式を示す例。Orca のイベント ID は §4 の規則で生成する。
 
 HTTP ヘッダー:
 
 ```
 POST /mcp-events/callback_123 HTTP/1.1
 Content-Type: application/json
-webhook-id: evt_linux-main_run-102_completed
+webhook-id: evt_orca_<sha256>
 webhook-timestamp: 1794762000
 webhook-signature: v1,<computed-signature>
 X-MCP-Subscription-Id: sub_123
@@ -199,7 +200,7 @@ ChatGPT の `2xx` は **Webhook の受信確認**であり、dots が処理を�
   "id": 3,
   "method": "events/poll",
   "params": {
-    "name": "t3.run.completed",
+    "name": "orca.session.completed",
     "arguments": {"environment_id": "linux-main"},
     "cursor": "seq_42",
     "maxAgeMs": 600000,
@@ -229,9 +230,9 @@ ChatGPT の `2xx` は **Webhook の受信確認**であり、dots が処理を�
     "events": [
       {
         "eventId": "evt_...",
-        "name": "t3.run.completed",
+        "name": "orca.session.completed",
         "timestamp": "2026-11-16T01:00:00.000Z",
-        "data": {"environment_id": "linux-main"}
+        "data": {"environment_id": "linux-main", "session_id": "orca_session_id:00000000-0000-4000-8000-000000000001", "summary": "An Orca agent finished a turn."}
       }
     ],
     "cursor": "seq_42",
@@ -261,24 +262,15 @@ ChatGPT の `2xx` は **Webhook の受信確認**であり、dots が処理を�
 | `maxEvents: 0`（負値・非整数を含む） | `-32602` |
 | `_meta` が JSON オブジェクトでない | `-32602` |
 
-## 3. T3 Code / GitHub 側のイベント取得方式
+## 3. Orca / GitHub 側のイベント取得方式
 
-T3 Code では、ファイルシステム監視よりも **Orchestrator V2 の永続イベントと状態遷移**を利用する方が正確である。
+### 3.1 Orca の監視方式
 
-### 3.1 T3 Code の監視方式
-
-T3 Code の公式実装では、Orchestrator V2 がイベントログを正本として使用している。イベント・Projection・副作用の Outbox をトランザクションで記録し、コミット後にイベントを購読者へ流す。永続イベントには単調増加の `sequence` が付与され、スナップショット以降のイベントを追跡できる設計である。
-
-| 方式 | 評価 | 用途 |
-| --- | --- | --- |
-| T3 Code の認証済み RPC / WebSocket | 最優先 | 実行状態をリアルタイム追跡 |
-| T3 Code 側の小さな Event Adapter | 推奨代替 | 内部イベントを安定した形式で取得 |
-| SQLite の読み取り専用参照 | フォールバック | 起動時の復元・補正 |
-| `notify` によるファイル監視 | 最終手段 | ファイル変更を再読込の契機にする |
-
-認証済み RPC で必要なイベントが外部取得できるかは、導入する T3 Code のバージョンごとに確認する。内部のイベントストリームが直接公開されていない場合は、T3 Code サーバー側に読み取り専用 Event Adapter を追加する方法が堅実である。
-
-**エージェントのターン終了と、チェックポイント等も含む Run の最終確定は区別する。** `provider turn ended` をそのまま `t3.run.completed` に変換すると、バックグラウンドタスクが残っている実行を誤って完了として通知する可能性がある。
+各 Edge は Orca 1.4.273 の `worktree ps --agent-wait --environment local --json` を読み、
+`hostId = "local"` の行から終了結果と承認・入力待ちを取得する。終了結果を持たない端末の
+`done` は必要に応じて `agent read` でも確認する。状態は定期採取のため、採取間隔より短い
+遷移は観測できないことがある。取得経路の比較と判定条件は
+[Orca Edge コレクター](ORCA-COLLECTOR.md) に記載する。
 
 ### 3.2 GitHub の監視方式
 
@@ -288,12 +280,12 @@ GitHub は Webhook を第一候補とし、REST / GraphQL の定期照合で取�
 - GitHub は失敗した Webhook を自動再送しないため、API ポーリングによる定期照合も必要（ETag とウォーターマークを管理）。
 - 対象イベントは `workflow_run`、`pull_request`、`pull_request_review`、`pull_request_review_comment`、`check_run` など。同じ CI 失敗を `workflow_run` と `check_run` の両方から通知しないよう、実行 ID と Attempt を使って正規化する。
 
-## 4. 複数 T3 Code サーバーを統合する構成
+## 4. 複数 Orca ホストを統合する構成
 
-Linux 機と Mac mini の両方に T3 Code を配置する環境では、**Edge Collector と中央 Hub を分ける構成**を採る。
+Mado の orca-serve と Mini のデスクトップ版はそれぞれ Edge を持ち、pm-01 の Hub に送る。
 
 - Hub（AlmaLinux 10）: Event Normalizer、SQLite Event Store、Subscription Manager、Webhook Dispatcher、GitHub Collector、MCP HTTP Server を持つ中央集約。
-- Edge（各ホスト）: 対象 T3 Code の状態を収集して Hub に転送する（認証済み HTTPS / Private Network）。
+- Edge（各ホスト）: ローカルの Orca の状態を収集し、署名付きで Hub へ転送する。
 - ChatGPT へは Secure MCP Tunnel または HTTPS で接続する。
 
 同一 Rust バイナリに `hub`、`edge`、オプションの `stdio` サブコマンドを実装する。
@@ -302,14 +294,18 @@ Linux 機と Mac mini の両方に T3 Code を配置する環境では、**Edge 
 # 中央管理ホスト
 events-bridge hub --config /etc/events-bridge/config.toml
 
-# T3 Code が動作するホスト
+# Orca が動作するホスト
 events-bridge edge --config /etc/events-bridge/config.toml
 
 # 汎用 MCP クライアントやトンネル向け
 events-bridge stdio
 ```
 
-単一ホストだけで使う構成にも対応できるよう、`hub` がローカル Collector を直接起動するモードを設ける。
+Edge は採取したイベントを SQLite の送信待ちキューに保存する。Hub は
+`POST /internal/edge/orca` で既存の Edge 署名・時刻・ノンスを検証し、受理したイベントを
+通常のイベントログと Webhook 配信キューに取り込む。Edge は HTTP 2xx を受け取った本文だけを
+送信済みにする。イベント ID は `evt_orca_` + SHA-256（ホスト ID・セッション ID・種別・状態開始時刻）。
+Orca と旧 T3 に共通の実行 ID はないため、移行中は同じ作業を両基盤で起動しない。
 
 ## 5. Rust の内部設計
 
@@ -329,8 +325,7 @@ events-bridge/
 │   │   ├── migrations.rs
 │   │   └── repository.rs
 │   ├── collectors/
-│   │   ├── t3_rpc.rs
-│   │   ├── t3_snapshot.rs
+│   │   ├── orca.rs
 │   │   ├── github_webhook.rs
 │   │   └── github_poll.rs
 │   ├── mcp/
@@ -345,7 +340,7 @@ events-bridge/
 │   │   └── retry.rs
 │   └── transport/
 │       ├── http.rs
-│       ├── edge.rs
+│       ├── orca_edge.rs
 │       └── stdio.rs
 └── migrations/
     └── 001_initial.sql
@@ -401,7 +396,9 @@ HTTP /mcp
 | `subscriptions` | 購読 ID、所有者、フィルター、Webhook URL、鍵、期限 |
 | `deliveries` | 購読 ID × イベント ID、送信状態、試行回数、次回送信日時 |
 | `delivery_attempts` | HTTP ステータス、エラー、送信時刻 |
-| `collector_checkpoints` | GitHub ETag、T3 Code の取得位置 |
+| `collector_checkpoints` | GitHub ETag、旧 T3 Code の取得位置 |
+| `orca_edge_baselines` | Edge の初回採取時刻 |
+| `orca_edge_outbox` | Orca の観測済みイベント ID、送信待ち本文 |
 | `acks` | オプションのユーザー確認履歴 |
 | `consumers` | ポーリング consumer の名前・カーソル・最終 poll/ack 時刻 |
 | `oauth_authorization_codes` | 認可コードの SHA-256 hash、client、scopes、PKCE challenge、TTL、使用時刻 |
@@ -412,7 +409,7 @@ HTTP /mcp
 
 `tokio::sync::broadcast` は永続キューではなく、ワーカーを起こすための通知経路として使用する。イベントの取り込み時には、イベント本体と配信対象レコードを SQLite の単一トランザクションで保存してから `broadcast` に通知する。再起動後は `deliveries` の未完了レコードから送信を再開する。
 
-Webhook の `cursor` と、T3 Code 自体の `sequence` は別々に管理する。`events/poll` のカーソルは Hub の `events.sequence` を `seq_<N>` 形式で表し、`sequence > N` のイベントを昇順に返す。
+Edge の採取・再送位置と Hub の消費カーソルはそれぞれ独立して管理する。`events/poll` のカーソルは Hub の `events.sequence` を `seq_<N>` 形式で表し、`sequence > N` のイベントを昇順に返す。
 
 ## 6. ChatGPT 向け Pull ツール
 
@@ -422,8 +419,8 @@ Webhook のイベント本文には、dots が判断するのに必要な短い�
 | --- | --- | --- |
 | `list_events` | 期間・ソース・重要度別のイベント取得 | Read |
 | `get_event` | イベント ID の詳細取得 | Read |
-| `get_t3_run` | T3 Code Run の最新状態取得 | Read |
-| `get_t3_approvals` | 現在の承認待ち取得 | Read |
+| `get_t3_run` | 保存済みの T3 Code Run を取得 | Read |
+| `get_t3_approvals` | 保存済みの T3 Code 承認を取得 | Read |
 | `get_github_status` | PR・CI の最新状態取得 | Read |
 | `ack_events` | ユーザー確認状態の記録 | Write、任意 |
 
@@ -442,7 +439,7 @@ Webhook の `data` には、既存の必須フィールドを変えずに次の�
 | `requires_action` | boolean | ユーザーまたはエージェントの対応が必要かどうか。 |
 | `error_excerpt` | string | 失敗理由の 1 行抜粋。改行を畳み、`payload.error_excerpt_max_chars` 文字以内に収める。 |
 
-`requires_action` の意味は「このイベントを受け取ったエージェントが、通知だけでなく確認・承認・修正などの操作を検討すべきか」である。`t3.run.completed` と `github.pr.merged` は `false`、`t3.run.failed`・`t3.approval.required`・`github.workflow.failed`・`github.review.requested` は `true` とする。
+`requires_action` の意味は「このイベントを受け取ったエージェントが、通知だけでなく確認・承認・修正などの操作を検討すべきか」である。`orca.session.completed` と `github.pr.merged` は `false`、`orca.session.failed`・`orca.approval.required`・`github.workflow.failed`・`github.review.requested` は `true` とする。
 
 `severity` は `high` / `normal` の列挙値のみを受け付ける。スキーマに `enum` がある場合、`validate_payload` は文字列型の一致だけでなく列挙値も検証する。
 
@@ -587,7 +584,7 @@ Phase C2 は Dynamic Client Registration（DCR）を公開しない。クライ�
 
 | やりたいこと | ChatGPT での実現方法 |
 | --- | --- |
-| T3 Code 完了で dots を起動 | MCP Events 購読 |
+| Orca のターン完了で dots を起動 | MCP Events 購読 |
 | CI 失敗時に dots が原因を調査 | MCP Events + MCP Tool |
 | イベントを dots の会話へ報告 | イベントトリガータスクの指示 |
 | 複数イベントをまとめて報告 | タスクのバッチ設定とサーバー側集約 |
@@ -598,12 +595,12 @@ Phase C2 は Dynamic Client Registration（DCR）を公開しない。クライ�
 
 dots への監視指示の例:
 
-> 接続した `events-bridge` の MCP Events を購読してください。T3 Code の承認待ち・実行失敗と GitHub CI 失敗は発生時に調査して報告してください。正常完了は短時間のイベントをまとめ、プロジェクト別に報告してください。問題の修正や承認操作は勝手に行わず、まず原因と対応案を提示してください。同一イベントの再配送では重複処理を避けてください。
+> 接続した `events-bridge` の MCP Events を購読してください。Orca の承認・入力待ちや失敗と GitHub CI 失敗は発生時に調査して報告してください。正常完了は短時間のイベントをまとめ、プロジェクト別に報告してください。問題の修正や承認操作は勝手に行わず、まず原因と対応案を提示してください。同一イベントの再配送では重複処理を避けてください。
 
 ## 9. 実装・検証の優先順位
 
 1. **MCP Events プロトコルの最小実装**: events/list・poll・subscribe・unsubscribe、Webhook 検証、署名、SQLite 永続化
-2. **T3 Code Collector**: Run 完了・承認待ち・失敗の3種類を取得し、再接続後の状態を復元
+2. **Orca Collector**: ターン完了、承認・入力待ち、失敗を採取し、観測したイベントを永続化
 3. **GitHub Collector**: Webhook 受信、API 補正、重複排除、PR・CI の対応付け
 4. **複数ホスト統合**: Linux と macOS の Edge Collector、中央 Hub への認証済み転送
 5. **ChatGPT 実機検証**: 購読生成、チャレンジ検証、イベント配信、dots の自動処理、再起動復旧
@@ -660,12 +657,14 @@ CREATE TABLE consumers (
 
 | イベント | 組み込み Muse の disposition |
 | --- | --- |
-| `t3.approval.required` | `immediate` |
-| `t3.run.failed` | `immediate` |
+| `orca.approval.required` | `immediate` |
+| `orca.session.failed` | `immediate` |
 | `github.workflow.failed` | `immediate` |
 | `github.review.requested` | `digest` |
 | `github.pr.merged` | `digest` |
-| `t3.run.completed` | `digest` |
+| `orca.session.completed` | `digest` |
+
+既存の T3 イベントにも従来の disposition を適用する。
 
 ### 10.4 3つのサーフェス（A1/A2）
 
@@ -718,7 +717,7 @@ POST /consumers/{name}/ack   {"upToSequence": 123}
   "windowStart": "2026-11-16T01:00:00Z",
   "windowEnd": "2026-11-16T01:10:00Z",
   "count": 3,
-  "countsByKind": { "t3.run.completed": 2, "github.review.requested": 1 },
+  "countsByKind": { "orca.session.completed": 2, "github.review.requested": 1 },
   "eventIds": ["evt_...", "evt_...", "evt_..."],
   "eventIdsTruncated": false,
   "maxSequence": 42
@@ -745,15 +744,11 @@ POST /consumers/{name}/ack   {"upToSequence": 123}
 
 Rust 単一バイナリ、Edge / Hub 二層構成、MCP Events Webhook 配信を正式な主経路とする設計。
 
-特に重要な点は、ファイル監視中心の T3 Collector を永続イベント中心に変更すること、MCP SSE 通知を Webhook 配信に置き換えること、購読と配信の永続化を独立させること、認証を ChatGPT の正式な方式に合わせることである。
-
-また、T3 Code 自身にも完了・失敗・承認待ちのモバイル通知機能がある。単純な即時通知は T3 Code に任せ、dots では複数プロジェクトの状況集約、CI 原因調査、対応案の提示を担当させると役割が明確になる。
-
 ## 主要な参照仕様
 
 - OpenAI — MCP Events 公式実装ガイド: https://developers.openai.com/plugins/build/mcp-events
 - MCP Events ドラフト仕様: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md
 - OpenAI — Secure MCP Tunnel: https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
 - OpenAI — MCP プラグイン認証仕様: https://developers.openai.com/plugins/build/auth
-- T3 Code — 内部アーキテクチャ: https://github.com/pingdotgg/t3code/blob/main/docs/internals/overview.md
+- [Orca CLI リファレンス](https://orca.dev/docs/cli/reference)
 - 公式 Rust MCP SDK: https://github.com/modelcontextprotocol/rust-sdk

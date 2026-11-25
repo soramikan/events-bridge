@@ -1,4 +1,4 @@
-//! Authenticated Edge -> Hub T3 forwarding protocol.
+//! Authenticated Edge -> Hub forwarding protocol.
 //!
 //! The wire format is deliberately small and independent of the MCP surface:
 //!
@@ -11,12 +11,12 @@
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    store::{T3Snapshot, T3WriteBatch},
-    util::constant_time_eq,
+    store::{NewEvent, T3Snapshot, T3WriteBatch},
+    util::{constant_time_eq, format_rfc3339},
 };
 
 /// Header carrying the edge identifier.
@@ -30,6 +30,118 @@ pub const HEADER_EDGE_SIGNATURE: &str = "x-edge-signature";
 
 /// Path appended to `edge.hub_url`.
 pub const EDGE_INGEST_PATH: &str = "/internal/edge/t3";
+/// Path for signed Orca events.
+pub const ORCA_EDGE_INGEST_PATH: &str = "/internal/edge/orca";
+
+/// An Orca event reported by a host's Edge. The Hub derives the stored event
+/// and its ID from this record, keeping free-form agent data out of the wire format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrcaEdgeEvent {
+    /// Stable installation label assigned in Edge configuration.
+    pub environment_id: String,
+    /// Orca conversation ID including its address prefix.
+    pub session_id: String,
+    /// Optional host-local Orca project ID.
+    pub project_id: Option<String>,
+    /// Event type.
+    pub kind: OrcaEventKind,
+    /// Orca's epoch-millisecond timestamp for the transition.
+    pub occurred_at_ms: i64,
+}
+
+/// The Orca observations an Edge is allowed to ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrcaEventKind {
+    /// The agent finished a turn.
+    Completed,
+    /// The agent failed a turn.
+    Failed,
+    /// The agent is waiting for a person's approval or input.
+    ApprovalRequired,
+}
+
+impl OrcaEventKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Completed => "orca.session.completed",
+            Self::Failed => "orca.session.failed",
+            Self::ApprovalRequired => "orca.approval.required",
+        }
+    }
+
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::Completed => "An Orca agent finished a turn.",
+            Self::Failed => "An Orca agent turn failed or was unexpectedly interrupted.",
+            Self::ApprovalRequired => "An Orca agent is waiting for approval or input.",
+        }
+    }
+}
+
+impl OrcaEdgeEvent {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !valid_edge_token(&self.environment_id) {
+            return Err("invalid Orca environment_id".into());
+        }
+        if !self
+            .session_id
+            .strip_prefix("orca_session_id:")
+            .is_some_and(valid_edge_token)
+        {
+            return Err("invalid Orca session_id".into());
+        }
+        if self
+            .project_id
+            .as_deref()
+            .is_some_and(|id| !valid_edge_token(id))
+        {
+            return Err("invalid Orca project_id".into());
+        }
+        if self.occurred_at_ms <= 0
+            || chrono::DateTime::from_timestamp_millis(self.occurred_at_ms).is_none()
+        {
+            return Err("invalid Orca occurred_at_ms".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn event_id(&self) -> String {
+        let identity = serde_json::to_vec(&(
+            &self.environment_id,
+            &self.session_id,
+            self.kind.name(),
+            self.occurred_at_ms,
+        ))
+        .expect("event identity is serializable");
+        format!("evt_orca_{}", hex::encode(Sha256::digest(identity)))
+    }
+
+    pub(crate) fn into_event(self) -> anyhow::Result<NewEvent> {
+        let occurred_at = chrono::DateTime::from_timestamp_millis(self.occurred_at_ms)
+            .ok_or_else(|| anyhow::anyhow!("invalid Orca occurred_at_ms"))?;
+        let id = self.event_id();
+        let requires_action = self.kind != OrcaEventKind::Completed;
+        let mut payload = serde_json::json!({
+            "environment_id": self.environment_id,
+            "session_id": self.session_id,
+            "summary": self.kind.summary(),
+            "severity": if requires_action { "high" } else { "normal" },
+            "requires_action": requires_action
+        });
+        if let Some(project_id) = self.project_id {
+            payload["project_id"] = project_id.into();
+        }
+        Ok(NewEvent {
+            id: Some(id),
+            source: Some("orca".into()),
+            kind: self.kind.name().into(),
+            payload,
+            occurred_at: Some(format_rfc3339(occurred_at)),
+        })
+    }
+}
 
 /// One authenticated edge ingest request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,9 +199,13 @@ pub enum EdgeT3IngestRequest {
 
 /// Build the ingest endpoint URL from a validated hub base URL.
 pub fn ingest_url(base: &Url) -> Url {
+    edge_endpoint(base, EDGE_INGEST_PATH)
+}
+
+pub(crate) fn edge_endpoint(base: &Url, path: &str) -> Url {
     let mut url = base.clone();
     let base_path = url.path().trim_end_matches('/');
-    url.set_path(&format!("{base_path}{EDGE_INGEST_PATH}"));
+    url.set_path(&format!("{base_path}{path}"));
     url
 }
 

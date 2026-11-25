@@ -19,12 +19,16 @@
 
 | イベント | disposition |
 | --- | --- |
-| `t3.approval.required` | `immediate` |
-| `t3.run.failed` | `immediate` |
+| `orca.approval.required` | `immediate` |
+| `orca.session.failed` | `immediate` |
 | `github.workflow.failed` | `immediate` |
 | `github.review.requested` | `digest` |
 | `github.pr.merged` | `digest` |
-| `t3.run.completed` | `digest` |
+| `orca.session.completed` | `digest` |
+
+過去の T3 イベントも同じカーソルから読める。`t3.approval.required` と `t3.run.failed` は
+`immediate`、`t3.run.completed` は `digest`。切り替え手順は
+[Orca Edge コレクター](ORCA-COLLECTOR.md#本番切り替え手順) を参照。
 
 ### イベントを上書きする
 
@@ -36,12 +40,12 @@ max_events_per_poll = 50      # poll の既定件数（> 0）
 max_digest_event_ids = 50     # A2 の digest 1 件あたりの最大 ID 数（> 0）
 
 [consumers.muse.events]
-"t3.approval.required" = "immediate"
-"t3.run.failed" = "immediate"
+"orca.approval.required" = "immediate"
+"orca.session.failed" = "immediate"
 "github.workflow.failed" = "immediate"
 "github.review.requested" = "digest"
 "github.pr.merged" = "digest"
-"t3.run.completed" = "digest"
+"orca.session.completed" = "digest"
 ```
 
 組み込みプロファイルへの上書きは **キー単位でマージ** される。上の例のように
@@ -54,14 +58,19 @@ payload に対応するキーが必要。
 
 ```toml
 [consumers.muse.filters]
-environment_ids = ["linux-main", "mac-mini"]
-project_ids = ["lnako"]
+environment_ids = ["mado", "mini"]
+project_ids = ["orca-project-id"]
 repositories = ["soramikan/events-bridge"]
 ```
 
 - `environment_ids` → `data.environment_id`
 - `project_ids` → `data.project_id`
 - `repositories` → `data.repository`
+
+Orca イベントの `source` は `orca`。 `data` の必須項目は `environment_id`、`session_id`、
+`summary` で、Edge から届くイベントには `severity`、`requires_action` も入る。
+`project_id` は Orca が返した場合に付く。`environment_ids` に Orca Edge の ID を含めること。
+`repositories` の allowlist を設定したプロファイルでは、Orca イベントは対象外になる。
 
 ### 独自コンシューマー
 
@@ -113,11 +122,17 @@ $ events-bridge poll --consumer muse --limit 50
     {
       "eventId": "evt_...",
       "sequence": 41,
-      "name": "t3.approval.required",
-      "source": "t3",
+      "name": "orca.approval.required",
+      "source": "orca",
       "disposition": "immediate",
       "occurredAt": "2026-11-16T01:00:00.000Z",
-      "data": { "...": "..." }
+      "data": {
+        "environment_id": "mado",
+        "session_id": "orca_session_id:00000000-0000-4000-8000-000000000001",
+        "summary": "An Orca agent is waiting for approval or input.",
+        "severity": "high",
+        "requires_action": true
+      }
     }
   ],
   "digests": [
@@ -125,7 +140,7 @@ $ events-bridge poll --consumer muse --limit 50
       "windowStart": "2026-11-16T01:00:00Z",
       "windowEnd": "2026-11-16T01:10:00Z",
       "count": 3,
-      "countsByKind": { "t3.run.completed": 2, "github.review.requested": 1 },
+      "countsByKind": { "orca.session.completed": 2, "github.review.requested": 1 },
       "eventIds": ["evt_...", "evt_...", "evt_..."],
       "eventIdsTruncated": false,
       "maxSequence": 42

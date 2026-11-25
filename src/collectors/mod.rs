@@ -1,11 +1,12 @@
 //! Upstream event collectors.
 //!
-//! Phase 2 implements the T3 Code collector and Phase 3 adds GitHub webhook
-//! ingestion plus REST reconciliation.
+//! Orca observations, GitHub webhook ingestion and REST reconciliation,
+//! and the legacy T3 implementation used for compatibility tests.
 
 pub mod github_poll;
 pub mod github_state;
 pub mod github_webhook;
+pub(crate) mod orca;
 pub mod t3_sqlite;
 pub mod t3_state;
 

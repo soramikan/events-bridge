@@ -1,4 +1,6 @@
-# T3 Code Collector（Phase 2）
+# T3 Code Collector（Phase 2、旧実装）
+
+この文書は旧実装の記録です。現行の Edge と切り替え手順は [Orca Edge コレクター](ORCA-COLLECTOR.md) を参照してください。
 
 T3 Code の実行完了・失敗・承認待ちを、events-bridge のイベントログへ取り込む
 Collector の設計と実装メモです。対象はホスト上の **T3 Code 0.1.9** です。

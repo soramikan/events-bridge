@@ -4,6 +4,7 @@ pub mod consumers;
 pub mod github;
 pub mod migrations;
 pub mod oauth;
+pub(crate) mod orca;
 pub mod repository;
 pub mod t3;
 

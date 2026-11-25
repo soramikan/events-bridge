@@ -39,6 +39,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: include_str!("../../migrations/006_oauth.sql"),
     },
+    Migration {
+        version: 7,
+        sql: include_str!("../../migrations/007_orca_edge.sql"),
+    },
 ];
 
 /// Apply every migration newer than the connection's `user_version`.

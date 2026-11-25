@@ -25,10 +25,11 @@ use axum::{
 };
 use events_bridge::{
     config::Config,
+    consumers::ConsumerService,
     delivery::verification::CallbackPolicy,
     edge_protocol::{
         EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE, HEADER_EDGE_SIGNATURE,
-        HEADER_EDGE_TIMESTAMP, sign,
+        HEADER_EDGE_TIMESTAMP, ORCA_EDGE_INGEST_PATH, OrcaEdgeEvent, OrcaEventKind, sign,
     },
     hub::Hub,
     store::{
@@ -1189,6 +1190,7 @@ impl RunningEdge {
 fn hub_config(database: PathBuf) -> Config {
     let mut config = Config::for_tests(database);
     config.server.enable_edge_ingest = true;
+    config.server.accept_legacy_t3_edge = true;
     config.server.edge_shared_secret_env = Some(EDGE_SECRET_ENV.into());
     config.server.edge_max_skew_secs = 300;
     config.server.max_edge_body_bytes = 4 * 1024 * 1024;
@@ -1317,7 +1319,7 @@ async fn post_edge_request(
     edge_id: &str,
     nonce: &str,
     timestamp: i64,
-    request: &EdgeT3IngestRequest,
+    request: &impl serde::Serialize,
 ) -> reqwest::Response {
     let body = serde_json::to_vec(request).unwrap();
     let signature = sign(EDGE_SECRET.as_bytes(), edge_id, timestamp, nonce, &body);
@@ -1397,6 +1399,207 @@ fn sample_approval(environment_id: &str, approval_id: &str, run_id: &str) -> T3A
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn signed_orca_ingest_deduplicates_and_preserves_muse_poll_and_ack() {
+    init_env();
+    let temp = TempDir::new().unwrap();
+    let mut config = hub_config(temp.path().join("hub.db"));
+    config.server.accept_legacy_t3_edge = false;
+    let hub = RunningHub::start(config, false).await;
+    let endpoint = format!("{}{ORCA_EDGE_INGEST_PATH}", hub.base_url);
+    let client = reqwest::Client::new();
+    let now = chrono::Utc::now();
+    let event = OrcaEdgeEvent {
+        environment_id: "mini".into(),
+        session_id: "orca_session_id:test-orca-session".into(),
+        project_id: Some("project-orca".into()),
+        kind: OrcaEventKind::Completed,
+        occurred_at_ms: now.timestamp_millis(),
+    };
+    let post = |nonce, body| {
+        post_edge_request(
+            &client,
+            &endpoint,
+            "edge-orca",
+            nonce,
+            now.timestamp(),
+            body,
+        )
+    };
+    let unsigned = client.post(&endpoint).json(&event).send().await.unwrap();
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+    let first = post("orca-nonce-one", &event).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(first["duplicate"], false);
+    assert_eq!(
+        post("orca-nonce-one", &event).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let retry: Value = post("orca-nonce-two", &event).await.json().await.unwrap();
+    assert_eq!(retry["eventId"], first["eventId"]);
+    assert_eq!(retry["duplicate"], true);
+
+    let mado_completion = OrcaEdgeEvent {
+        environment_id: "mado".into(),
+        ..event.clone()
+    };
+    let other_host: Value = post("orca-nonce-three", &mado_completion)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(other_host["duplicate"], false);
+    assert_ne!(other_host["eventId"], first["eventId"]);
+
+    let failure = OrcaEdgeEvent {
+        kind: OrcaEventKind::Failed,
+        ..mado_completion.clone()
+    };
+    assert_eq!(
+        post("orca-nonce-four", &failure).await.status(),
+        StatusCode::OK
+    );
+    let approval = OrcaEdgeEvent {
+        kind: OrcaEventKind::ApprovalRequired,
+        ..mado_completion.clone()
+    };
+    assert_eq!(
+        post("orca-nonce-five", &approval).await.status(),
+        StatusCode::OK
+    );
+    let legacy = client
+        .post(format!("{}/internal/edge/t3", hub.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+
+    let consumer = ConsumerService::new(hub.hub.repository().clone(), Default::default());
+    let page = consumer.poll("muse", None).unwrap();
+    assert_eq!(page.cursor_sequence, 0);
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(page.events[0].name, "orca.session.failed");
+    assert_eq!(page.events[1].name, "orca.approval.required");
+    assert_eq!(page.digests[0].counts_by_kind["orca.session.completed"], 2);
+    assert_eq!(consumer.probe("muse").unwrap().unread_count, 4);
+    consumer.ack("muse", page.next_cursor_sequence).unwrap();
+    assert_eq!(consumer.probe("muse").unwrap().unread_count, 0);
+    hub.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn orca_edge_keeps_collecting_while_hub_replies_fail_and_retries_on_restart() {
+    use std::{fs, os::unix::fs::PermissionsExt, process::Stdio};
+
+    init_env();
+    let temp = TempDir::new().unwrap();
+    let hub = RunningHub::start(hub_config(temp.path().join("hub.db")), false).await;
+    let proxy = HttpProxy::start(hub.address).await;
+    proxy.set_fail(true); // Hub accepts the request, but Edge never sees a 2xx.
+    let executable = temp.path().join("orca");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+test "$*" = 'worktree ps --limit 2000 --agent-wait --environment local --json' || exit 1
+exec cat worktrees.json
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let write_page = |state, outcome: Option<&str>| {
+        let now = chrono::Utc::now().timestamp_millis();
+        let page = json!({"ok":true,"result":{
+            "hostScope":{"hostIds":["local"]},"truncated":false,"worktrees":[{
+                "hostId":"local","repoId":"project-fixture","agents":[{
+                    "orcaSessionId":"test-session","state":state,"stateStartedAt":now,
+                    "interrupted":false,
+                    "mainAgent":{"state":state,"stateStartedAt":now,"outcome":outcome}
+                }]
+            }]
+        }});
+        let staging = temp.path().join("worktrees.tmp");
+        fs::write(&staging, page.to_string()).unwrap();
+        fs::rename(staging, temp.path().join("worktrees.json")).unwrap();
+    };
+    write_page("working", None);
+    let db = temp.path().join("edge.db");
+    let config = temp.path().join("edge.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[database]
+path = {db:?}
+[collectors.orca]
+environment_id = "mado"
+cli_path = {executable:?}
+poll_interval_ms = 25
+[edge]
+hub_url = {hub_url:?}
+shared_secret_env = "{EDGE_SECRET_ENV}"
+retry_initial_ms = 20
+retry_max_ms = 100
+"#,
+            hub_url = proxy.url()
+        ),
+    )
+    .unwrap();
+    let launch = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_events-bridge"))
+            .args(["edge", "--config"])
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let mut edge = launch();
+    let consumer = ConsumerService::new(hub.hub.repository().clone(), Default::default());
+    let local_count = |sql| {
+        Connection::open(&db)
+            .ok()
+            .and_then(|conn| conn.query_row(sql, [], |row| row.get::<_, usize>(0)).ok())
+    };
+    wait_until("Orca Edge baseline", || {
+        local_count("SELECT count(*) FROM orca_edge_baselines") == Some(1)
+    })
+    .await;
+    write_page("done", Some("failure"));
+    wait_until(
+        "in-flight event persisted at Hub without a successful response",
+        || {
+            consumer.probe("muse").unwrap().unread_count == 1
+                && local_count("SELECT count(*) FROM orca_edge_outbox WHERE body IS NOT NULL")
+                    == Some(1)
+        },
+    )
+    .await;
+    write_page("done", Some("success"));
+    wait_until("another event captured during the delivery outage", || {
+        local_count("SELECT count(*) FROM orca_edge_outbox WHERE body IS NOT NULL") == Some(2)
+    })
+    .await;
+    edge.kill().await.unwrap();
+
+    write_page("working", None);
+    proxy.set_fail(false);
+    let mut edge = launch();
+    wait_until(
+        "persisted Orca events acknowledged after Edge restart",
+        || local_count("SELECT count(*) FROM orca_edge_outbox WHERE body IS NULL") == Some(2),
+    )
+    .await;
+    assert_eq!(consumer.probe("muse").unwrap().unread_count, 2);
+    edge.kill().await.unwrap();
+    hub.stop().await;
+}
 
 #[tokio::test]
 async fn edge_hub_github_and_multi_host_flow() {
@@ -2832,17 +3035,23 @@ async fn stdio_surface_serves_tools_and_events() {
         "2026-11-16T03:00:00.000Z",
     )]);
 
-    let mut fixture = Fixture::new();
-    fixture.seed_project_thread();
-    fixture.seed_existing_completed_run();
-
     let mut config = Config::for_tests(temp.path().join("stdio.db"));
-    config.collectors.t3.enabled = true;
-    config.collectors.t3.state_db_path = fixture.path().to_path_buf();
-    config.collectors.t3.environment_id = Some("env-stdio".into());
-    config.collectors.t3.poll_interval_ms = 50;
-    config.collectors.t3.watch_wal = false;
-    config.collectors.t3.batch_size = 100;
+    let repo = Repository::open(&config.database.path).unwrap();
+    repo.apply_t3_snapshot(
+        "env-stdio",
+        &T3Snapshot {
+            projects: vec![sample_project("env-stdio", "p1")],
+            threads: vec![sample_thread("env-stdio", "t1", "p1")],
+            runs: vec![sample_run("env-stdio", "run-stdio-1", "completed")],
+            approvals: vec![sample_approval(
+                "env-stdio",
+                "approval-stdio-1",
+                "run-stdio-1",
+            )],
+        },
+        2,
+    )
+    .unwrap();
     config.collectors.github.poll_enabled = true;
     config.collectors.github.repositories = vec![REPOSITORY.into()];
     config.collectors.github.api_base_url = api.url().to_string();
@@ -2919,7 +3128,7 @@ async fn stdio_surface_serves_tools_and_events() {
     )
     .await;
     let events: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-    assert_eq!(events["result"]["events"].as_array().unwrap().len(), 6);
+    assert_eq!(events["result"]["events"].as_array().unwrap().len(), 9);
 
     send_line(
         &mut client_writer,
@@ -2928,7 +3137,7 @@ async fn stdio_surface_serves_tools_and_events() {
             "id": 4,
             "method": "events/subscribe",
             "params": {
-                "name": "t3.run.completed",
+                "name": "orca.session.completed",
                 "arguments": {"environment_id": "env-stdio"},
                 "delivery": {
                     "mode": "webhook",
@@ -2946,12 +3155,24 @@ async fn stdio_surface_serves_tools_and_events() {
         .expect("subscription id")
         .to_string();
 
-    fixture.emit_completed_run("run-stdio-1", 2);
-    fixture.emit_pending_approval("approval-stdio-1", "run-stdio-1");
-    wait_until("stdio collector delivery", || {
+    let persist_orca_event = |id: &str| {
+        repo.ingest_event(NewEvent {
+            id: Some(id.into()),
+            kind: "orca.session.completed".into(),
+            source: None,
+            payload: json!({
+                "environment_id": "env-stdio", "session_id": "orca_session_id:test",
+                "summary": "synthetic completion"
+            }),
+            occurred_at: None,
+        })
+        .unwrap();
+    };
+    persist_orca_event("evt_stdio_one");
+    wait_until("stdio delivery", || {
         receiver.events().iter().any(|event| {
-            event.event_name.as_deref() == Some("t3.run.completed")
-                && event.data["run_id"] == "run-stdio-1"
+            event.event_name.as_deref() == Some("orca.session.completed")
+                && event.data["session_id"] == "orca_session_id:test"
         })
     })
     .await;
@@ -2971,9 +3192,9 @@ async fn stdio_surface_serves_tools_and_events() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|event| event["kind"] == "t3.run.completed")
+        .find(|event| event["kind"] == "orca.session.completed")
         .and_then(|event| event["id"].as_str())
-        .expect("t3.run.completed event")
+        .expect("Orca completion event")
         .to_string();
 
     send_line(
@@ -3101,36 +3322,8 @@ async fn stdio_surface_serves_tools_and_events() {
     assert!(unsubscribed["result"].is_object(), "{unsubscribed}");
 
     let deliveries_before = receiver.deliveries();
-    fixture.emit_completed_run("run-stdio-2", 3);
-
-    // The collector still runs after unsubscribe; only delivery stops.
-    let mut second_run_seen = false;
-    for _ in 0..100 {
-        send_line(
-            &mut client_writer,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 12,
-                "method": "tools/call",
-                "params": {
-                    "name": "get_t3_run",
-                    "arguments": {"run_id": "run-stdio-2", "environment_id": "env-stdio"}
-                }
-            }),
-        )
-        .await;
-        let second: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        if second["result"]["structuredContent"]["run"]["runId"] == "run-stdio-2" {
-            second_run_seen = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        second_run_seen,
-        "collector must keep running after unsubscribe"
-    );
+    persist_orca_event("evt_stdio_two");
+    assert!(repo.get_event("evt_stdio_two").unwrap().is_some());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         receiver.deliveries(),
@@ -3388,7 +3581,7 @@ async fn abandoned_snapshot_stages_are_pruned_after_ttl_on_hub() {
 }
 
 #[tokio::test]
-async fn stdio_partial_startup_failure_cleans_up_t3_collector() {
+async fn stdio_startup_ignores_retired_local_t3_collector() {
     init_env();
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("stdio-fail.db");
@@ -3403,9 +3596,7 @@ async fn stdio_partial_startup_failure_cleans_up_t3_collector() {
     config.collectors.t3.poll_interval_ms = 50;
     config.collectors.github.poll_enabled = true;
     config.collectors.github.repositories = vec![REPOSITORY.into()];
-    // Non-empty token with a newline passes `AppState::new` and fails inside
-    // `hub::spawn_github_poller` after `hub::spawn_t3_collector` has already
-    // started, exercising the cancel + join cleanup path.
+    // The GitHub poller still reports invalid configuration with an old T3 config present.
     config.collectors.github.token_env = Some(INVALID_GITHUB_TOKEN_ENV.into());
 
     let (server_reader, _client_writer) = tokio::io::duplex(4096);
@@ -3424,18 +3615,17 @@ async fn stdio_partial_startup_failure_cleans_up_t3_collector() {
     assert!(
         repo.get_t3_run("run-old", Some("env-stdio-fail"))
             .unwrap()
-            .is_some(),
-        "t3_collector must have started and captured its initial snapshot before poller failure"
+            .is_none(),
+        "the retired local T3 collector must not snapshot even with its old flag enabled"
     );
 
-    // Ensure the cancelled collector is no longer running and writing new events.
     fixture.emit_completed_run("run-after-failed-startup", 2);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         repo.get_t3_run("run-after-failed-startup", Some("env-stdio-fail"))
             .unwrap()
             .is_none(),
-        "cancelled t3_collector must have stopped before serve_with_io returned"
+        "stdio must not collect new T3 events"
     );
 }
 
