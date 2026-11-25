@@ -21,17 +21,19 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 enable_internal_ingest = false
 # internal_token_env = "EVENTS_BRIDGE_INTERNAL_TOKEN"
 
-# Authenticated Edge -> Hub T3 forwarding. Disabled by default. When enabled,
-# `POST /internal/edge/t3` accepts signed requests from `events-bridge edge`.
+# Authenticated Edge -> Hub forwarding. Disabled by default. When enabled,
+# `POST /internal/edge/orca` accepts signed requests from `events-bridge edge`.
 # The shared HMAC secret is read from the named environment variable; never
 # write the secret itself to this file.
 enable_edge_ingest = false
+# Set true during rollout to keep accepting signed requests from old T3 Edges.
+accept_legacy_t3_edge = false
 # edge_shared_secret_env = "EVENTS_BRIDGE_EDGE_SECRET"
 # Accepted clock skew for X-Edge-Timestamp (seconds, must be > 0).
 edge_max_skew_secs = 300
 # Maximum edge request body (1 byte .. 16 MiB).
 max_edge_body_bytes = 4194304
-# Retention period for incomplete chunked snapshot stages (seconds, must be > 0).
+# Retention period for incomplete legacy T3 snapshot stages (seconds, must be > 0).
 edge_stage_ttl_secs = 3600
 
 [database]
@@ -104,10 +106,9 @@ level = "info,events_bridge=debug"
 # cursor; only `ack` does, so poll/ack is at-least-once. Consumers are separate
 # from the ChatGPT webhook `[subscriptions]` path above.
 #
-# The built-in `muse` profile is always available and resolves
-# `t3.approval.required`, `t3.run.failed` and `github.workflow.failed` as
-# immediate notifications; `github.review.requested`, `github.pr.merged` and
-# `t3.run.completed` are digest-eligible. Everything else is off.
+# The built-in `muse` profile treats Orca approvals, Orca failures and GitHub
+# CI failures as immediate, and Orca completions, GitHub review requests and
+# PR merges as digest events. Historical T3 events keep their dispositions.
 #
 # Configure `[consumers.muse]` to override individual values or event
 # dispositions. The built-in event map is merged with the entries below, so
@@ -118,33 +119,26 @@ level = "info,events_bridge=debug"
 # max_events_per_poll = 50
 # max_digest_event_ids = 50
 # [consumers.muse.events]
-# "t3.approval.required" = "immediate"
-# "t3.run.failed" = "immediate"
+# "orca.approval.required" = "immediate"
+# "orca.session.failed" = "immediate"
 # "github.workflow.failed" = "immediate"
 # "github.review.requested" = "digest"
 # "github.pr.merged" = "digest"
-# "t3.run.completed" = "digest"
+# "orca.session.completed" = "digest"
 # [consumers.muse.filters]
-# environment_ids = ["linux-main"]
-# project_ids = ["lnako"]
+# environment_ids = ["mado", "mini"]
+# project_ids = ["orca-project-id"]
 # repositories = ["soramikan/events-bridge"]
 
-# T3 Code Collector (Phase 2).
-#
-# The collector opens T3 Code's state database read-only. It needs no token:
-# T3 Code performs its own authentication. Enable this only on the host that
-# runs T3 Code. `state_db_path` defaults to ~/.t3/userdata/statev2.sqlite and
-# `environment_id` is read from the sibling `environment-id` file.
-[collectors.t3]
-enabled = false
-# state_db_path = "/home/example/.t3/userdata/statev2.sqlite"
-# environment_id = "59f9e9a5-51a0-41b4-9790-6bc8cbc2245e"
-# environment_id_path = "/home/example/.t3/userdata/environment-id"
-# Optional web base URL; deep links are only emitted when this is set.
-# t3_web_base_url = "https://t3.example.com"
-poll_interval_ms = 1000
-watch_wal = true
-batch_size = 500
+# Orca collector. Only the Edge uses this section.
+[collectors.orca]
+# Required by `edge`: a stable, unique ID for this host.
+# environment_id = "mado"
+# Default executable: orca-ide on Linux, orca elsewhere. Set the absolute path
+# if the CLI is not on the service's PATH.
+# cli_path = "/opt/orca-server/bin/orca-ide"
+poll_interval_ms = 5000
+cli_timeout_secs = 10
 
 # GitHub Collector (Phase 3).
 #
@@ -178,16 +172,13 @@ poll_interval_secs = 60
 # Accepted webhook body ceiling (at most 10 MiB).
 max_webhook_body_bytes = 1048576
 
-# Edge Collector (Phase 4).
+# Edge forwarding.
 #
-# Only the `edge` subcommand requires this section. A hub deployment may omit
-# it entirely. The edge reads T3 Code's state database read-only, derives the
-# same T3 write batches as the hub-local collector, and forwards them to the
-# hub with an HMAC-SHA256 signature. The local cursor advances only after the
-# hub answers 2xx, so a hub outage is retried without losing events.
+# The Edge polls local Orca and retries queued events until the Hub returns 2xx.
+# A Hub deployment may omit this section.
 [edge]
 # Hub base URL. Must be http or https, hierarchical, and have no query or
-# fragment. The edge appends /internal/edge/t3.
+# fragment. The Edge appends /internal/edge/orca.
 # hub_url = "https://bridge.example.com"
 
 # Environment variable holding the shared edge HMAC secret. Required by the
@@ -196,14 +187,9 @@ max_webhook_body_bytes = 1048576
 # shared_secret_env = "EVENTS_BRIDGE_EDGE_SECRET"
 
 # Stable edge identifier (1..=128 characters, no whitespace/control). When
-# omitted, the resolved collectors.t3.environment_id is used.
+# omitted, collectors.orca.environment_id is used.
 # edge_id = "mac-mini"
 
 request_timeout_secs = 15
 retry_initial_ms = 500
 retry_max_ms = 30000
-
-# Maximum serialized size of one snapshot chunk request. Snapshots larger than
-# this are uploaded as SnapshotChunk requests and finalized with an atomic
-# SnapshotCommit. Must be at least 1024.
-max_snapshot_chunk_bytes = 1048576

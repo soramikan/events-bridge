@@ -9,6 +9,8 @@ use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 
+use crate::edge_protocol::OrcaEventKind;
+
 /// Event priority advertised in `events/list` metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -56,7 +58,7 @@ impl EventDefinition {
     }
 }
 
-fn t3_filter_schema() -> Value {
+fn environment_filter_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -68,14 +70,36 @@ fn t3_filter_schema() -> Value {
     })
 }
 
-/// All Phase 1 event definitions, in the order advertised by `events/list`.
+fn orca_definition(kind: OrcaEventKind, severity: Severity) -> EventDefinition {
+    EventDefinition {
+        name: kind.name(),
+        description: kind.summary(),
+        severity,
+        input_schema: environment_filter_schema(),
+        payload_schema: json!({
+            "type": "object",
+            "properties": {
+                "environment_id": {"type": "string"},
+                "session_id": {"type": "string"},
+                "project_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "severity": {"type": "string", "enum": ["high", "normal"]},
+                "requires_action": {"type": "boolean"}
+            },
+            "required": ["environment_id", "session_id", "summary"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Event definitions, in the order advertised by `events/list`.
 pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
     vec![
         EventDefinition {
             name: "t3.run.completed",
             description: "A T3 Code coding-agent run has completed.",
             severity: Severity::Normal,
-            input_schema: t3_filter_schema(),
+            input_schema: environment_filter_schema(),
             payload_schema: json!({
                 "type": "object",
                 "properties": {
@@ -101,7 +125,7 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
             name: "t3.run.failed",
             description: "A T3 Code coding-agent run has failed.",
             severity: Severity::High,
-            input_schema: t3_filter_schema(),
+            input_schema: environment_filter_schema(),
             payload_schema: json!({
                 "type": "object",
                 "properties": {
@@ -130,7 +154,7 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
             name: "t3.approval.required",
             description: "A T3 Code run is waiting for user approval or input.",
             severity: Severity::High,
-            input_schema: t3_filter_schema(),
+            input_schema: environment_filter_schema(),
             payload_schema: json!({
                 "type": "object",
                 "properties": {
@@ -248,6 +272,9 @@ pub static EVENTS: LazyLock<Vec<EventDefinition>> = LazyLock::new(|| {
                 "additionalProperties": false
             }),
         },
+        orca_definition(OrcaEventKind::Completed, Severity::Normal),
+        orca_definition(OrcaEventKind::Failed, Severity::High),
+        orca_definition(OrcaEventKind::ApprovalRequired, Severity::High),
     ]
 });
 
@@ -354,7 +381,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn catalog_contains_the_six_phase_one_events() {
+    fn catalog_contains_current_and_legacy_events() {
         let names: Vec<_> = EVENTS.iter().map(|event| event.name).collect();
         assert_eq!(
             names,
@@ -365,6 +392,9 @@ mod tests {
                 "github.workflow.failed",
                 "github.review.requested",
                 "github.pr.merged",
+                "orca.session.completed",
+                "orca.session.failed",
+                "orca.approval.required",
             ]
         );
         for event in EVENTS.iter() {

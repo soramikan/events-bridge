@@ -3,7 +3,7 @@ name = "events-bridge"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Signed MCP Events webhook bridge for T3 Code and GitHub events"
+description = "Signed MCP Events webhook bridge for Orca and GitHub events"
 license = "MIT"
 publish = false
 

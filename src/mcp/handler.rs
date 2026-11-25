@@ -40,7 +40,7 @@ impl ServerHandler for EventsHandler {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "T3 Code and GitHub events. Use tools/list for pull tools and \
+                "Orca and GitHub events. Use tools/list for pull tools and \
                  the events/* extension for signed webhook subscriptions and \
                  cursor-based polling.",
             )

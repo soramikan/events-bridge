@@ -1,20 +1,21 @@
 # events-bridge
 
-T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI 失敗、レビュー要求、PR マージ）を収集・正規化し、MCP Events（SEP-3415 ドラフト / OpenAI 実装方式）の署名付き Webhook 配信で ChatGPT（dots / Work）へ届ける Rust デーモンです。
+Orca と GitHub のイベント（セッションの完了・失敗・承認待ち、CI 失敗、レビュー要求、PR マージ）を収集・正規化し、MCP Events（SEP-3415 ドラフト / OpenAI 実装方式）の署名付き Webhook 配信で ChatGPT（dots / Work）へ届ける Rust デーモンです。
 
 - 単一バイナリ、サブコマンド `hub` / `edge` / `stdio`
 - 購読・イベント・配信状態は SQLite に永続化し、再起動後も未配信分から再開します
 - 配信は Standard Webhooks（HMAC-SHA256）署名つき、指数バックオフ再送つき
 
-設計の正本は [docs/DESIGN.md](docs/DESIGN.md)、T3 Code Collector の調査・実装メモは
-[docs/T3-COLLECTOR.md](docs/T3-COLLECTOR.md)、ChatGPT / dots 接続の運用側手順は
-[docs/CHATGPT-SETUP.md](docs/CHATGPT-SETUP.md) です。
+設計は [docs/DESIGN.md](docs/DESIGN.md)、Orca Edge の運用は
+[docs/ORCA-COLLECTOR.md](docs/ORCA-COLLECTOR.md)、Muse のポーリング契約は
+[docs/CLAUDE-CONSUMER.md](docs/CLAUDE-CONSUMER.md) を参照してください。
+ChatGPT / dots への接続手順は [docs/CHATGPT-SETUP.md](docs/CHATGPT-SETUP.md) にあります。
 
 ## Phase 1 の実装範囲
 
 - `hub`: Streamable HTTP `/mcp`、SQLite ストア、Webhook ディスパッチャー
 - MCP `initialize` / `server/discover` で `capabilities.events` を公開
-- `events/list`（6 イベント）、`events/subscribe`、`events/unsubscribe`
+- `events/list`、`events/subscribe`、`events/unsubscribe`
 - コールバック検証: `whsec_` 形式検証、HTTPS 必須、DNS 解決結果のパブリック IP 限定、
   IP ピン留め + リダイレクト禁止、署名付きチャレンジのエコー確認
 - 1 リクエスト 1 イベントの署名付き配信（本文 256 KiB 上限）、
@@ -22,18 +23,13 @@ T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI �
 - Pull ツール `list_events` / `get_event` / `ack_events`
 - `stdio`: 汎用 MCP クライアント向けの基本初期化（Phase 4 で Collector 連携と
   統合テストを追加）
-- `edge`: Phase 4 で実装（上記「Phase 4 の実装範囲」参照）
+- `edge`: 各ホストから Orca イベントを転送
 
-## Phase 2 の実装範囲（T3 Code Collector）
+## 旧 T3 Code イベント
 
-- T3 Code 0.1.9 の `statev2.sqlite` を **読み取り専用**で参照し、
-  `orchestration_events` の `sequence` をカーソルとして追従
-- 初回起動時は Projection からスナップショットを水和し、過去の完了 Run を配信しない
-- `run.updated` の最終確定だけから `t3.run.completed` / `t3.run.failed` を導出
-  （`provider-turn.updated` / `run-attempt.updated` では発火しない）
-- `runtime-request.updated` から `t3.approval.required` を導出
-- Pull ツール `get_t3_run` / `get_t3_approvals`
-- 詳細は [docs/T3-COLLECTOR.md](docs/T3-COLLECTOR.md)
+Hub に保存済みの T3 イベントと投影は、`list_events` / `get_event`、
+`get_t3_run` / `get_t3_approvals` で参照できます。
+移行前の実装は [docs/T3-COLLECTOR.md](docs/T3-COLLECTOR.md) に記録しています。
 
 ## Phase 3 の実装範囲（GitHub Collector）
 
@@ -65,35 +61,15 @@ T3 Code と GitHub のイベント（実行完了・失敗・承認待ち、CI �
 - Pull ツール `get_github_status`（PR・CI の最新状態とサマリー）
 - 環境変数で秘密情報を指定: `webhook_secret_env`、任意の `token_env`
 
-## Phase 4 の実装範囲（Edge / Hub 統合）
+## Orca Edge / Hub
 
-- `edge` サブコマンド: T3 Code の `statev2.sqlite` を読み取り専用で追従し、
-  `T3Reducer` が生成した `T3WriteBatch` を Hub へ HMAC-SHA256 署名付きで転送
-  - 初回はスナップショット、以降は `orchestration_events.sequence` 単位の差分
-  - 未確認スナップショットは `edge_pending_snapshots` に基準 sequence ごと保存し、
-    再試行・再起動時は同じスナップショットを再送（新しい `N+k` を撮り直さない）
-  - 大きなスナップショットは `edge.max_snapshot_chunk_bytes` 単位の
-    `SnapshotChunk` に分割し、`SnapshotCommit` で Hub 側が原子的に適用
-  - ローカルの `source_cursors` / 投影テーブルは **Hub が 2xx を返した後だけ** 更新
-  - Hub 停止・ネットワーク障害時は `retry_initial_ms`〜`retry_max_ms` の
-    指数バックオフで再送し、復旧後に欠損なく追いつく
-  - 古い／重複した Batch は Hub 側で no-op とし、投影とカーソルを巻き戻さない
-- Hub の `POST /internal/edge/t3`
-  - `X-Edge-Id` / `X-Edge-Timestamp` / `X-Edge-Nonce` / `X-Edge-Signature`
-  - 署名対象は `"{edge_id}.{timestamp}.{nonce}." + raw body`
-  - 時刻ずれ・署名不一致・同一 `(edge_id, nonce)` の再利用は `401` で拒否し、
-    状態を変更しない
-  - `edge_nonces` テーブルでリプレイを防止し、期限切れは自動削除
-  - スナップショット / 複数バッチを Hub 側の単一トランザクションで適用
-  - Batch 内の投影・イベントの `environment_id` 不一致は `422` で拒否
-  - チャンク欠損のある `SnapshotCommit` は `422` で拒否し、投影とカーソルを汚さない
-- `hub` 単一ホストモード: `collectors.t3.enabled` と `collectors.github.*` を
-  有効にした 1 プロセス構成もそのまま動作
-- `stdio`: HTTP と同じ 6 ツール + `events/list` / `events/subscribe` /
-  `events/unsubscribe` を公開。`--config` で Collector / GitHub Poller も起動し、
-  終了時にキャンセル・join
-- 複数ホスト: 異なる `environment_id` の Edge と Hub ローカル T3 が同一 Hub に
-  共存し、`environment_id` フィルター付き購読が分離される
+- Orca と同じホストの Edge が読み取り用 CLI からエージェントの状態を採取します。
+- Edge はイベントを SQLite に保存し、HMAC-SHA256 署名付きの
+  `POST /internal/edge/orca` で転送します。Hub の HTTP 2xx まで再送対象として保持します。
+- 同じ状態を再観測したときや再送時には、ホスト・セッション・種別・状態開始時刻から
+  求めたイベント ID で重複排除します。
+- GitHub の収集と Muse の cursor / ack は従来の経路を使います。
+- 旧 T3 Edge の転送は移行期間に限り、Hub の `accept_legacy_t3_edge` で許可できます。
 
 ## 起動
 
@@ -120,35 +96,25 @@ edge_shared_secret_env = "EVENTS_BRIDGE_EDGE_SECRET"
 export EVENTS_BRIDGE_EDGE_SECRET="$(openssl rand -hex 32)"
 ```
 
-### Edge（T3 Code が動作するホスト）
+### Edge（Orca が動作するホスト）
 
 ```toml
 [database]
 path = "/var/lib/events-bridge/edge.db"
 
-[collectors.t3]
-enabled = true
-state_db_path = "/home/example/.t3/userdata/statev2.sqlite"
-environment_id = "mac-mini"
+[collectors.orca]
+environment_id = "mado"
+cli_path = "/opt/orca-server/bin/orca-ide"
 
 [edge]
 hub_url = "https://bridge.example.com"
 shared_secret_env = "EVENTS_BRIDGE_EDGE_SECRET"
-edge_id = "mac-mini"
 ```
 
-```sh
-export EVENTS_BRIDGE_EDGE_SECRET="..."   # Hub と同じ値
-events-bridge edge --config /etc/events-bridge/config.toml
-```
-
-`edge.hub_url` と `edge.shared_secret_env` は `edge` サブコマンドでのみ必須です。
-Hub は `[edge]` セクションが無くても起動します。シークレットは TOML に書かず、
-環境変数（または systemd の `EnvironmentFile` など）から渡してください。
-`collectors.t3.environment_id` と `environment-id` ファイルのどちらも無い場合、
-Edge は OS のホスト名を使用します。ホスト名も解決できない場合は共通の
-`"edge"` にフォールバックせず、`collectors.t3.environment_id` の明示設定を
-求めて起動に失敗します。
+Orca と同じユーザーおよびランタイム環境で `events-bridge edge --config /etc/events-bridge/config.toml`
+を実行します。ホストごとに固有の `environment_id` を設定します。
+共有シークレットは Hub と同じ値を環境変数から渡してください。
+Mini と Mado の設定および移行順は [docs/ORCA-COLLECTOR.md](docs/ORCA-COLLECTOR.md) を参照してください。
 
 ### stdio（汎用 MCP クライアント / トンネル）
 
@@ -158,10 +124,8 @@ events-bridge stdio
 events-bridge stdio --config /etc/events-bridge/config.toml
 ```
 
-`--config` を指定し、`collectors.t3.enabled` または
-`collectors.github.poll_enabled` が有効な場合は、Hub と同じ Collector / Poller が
-バックグラウンドで起動します。stdout は MCP メッセージ専用で、ログは stderr に
-出力されます。
+`collectors.github.poll_enabled` が有効な設定を渡すと、Hub と同じ GitHub ポーラーが
+バックグラウンドで起動します。stdout は MCP メッセージ専用で、ログは stderr に出力されます。
 
 `auth.token_env` を設定しない場合、ハブは認証なしで起動します。ループバックまたは
 Secure MCP Tunnel の内側など、信頼できる経路でのみ使用してください。
@@ -177,14 +141,11 @@ curl -sS http://127.0.0.1:8787/internal/events \
   -H "Authorization: Bearer ${EVENTS_BRIDGE_TOKEN}" \
   -H "X-Internal-Token: ${EVENTS_BRIDGE_INTERNAL_TOKEN}" \
   -d '{
-    "kind": "t3.run.completed",
+    "kind": "orca.session.completed",
     "payload": {
-      "environment_id": "linux-main",
-      "project_id": "lnako",
-      "thread_id": "thread-42",
-      "run_id": "run-102",
-      "summary": "Coding agent run completed",
-      "url": "https://t3.example.com/threads/42"
+      "environment_id": "mado",
+      "session_id": "orca_session_id:00000000-0000-4000-8000-000000000001",
+      "summary": "An Orca agent finished a turn."
     }
   }'
 ```
@@ -202,11 +163,11 @@ cargo test
 本番の SSRF ポリシーは別途、HTTP URL・プライベート IP・リダイレクト・不正な
 `whsec_`・チャレンジ不一致のケースで検証しています。
 
-`tests/e2e_edge_hub.rs` は Phase 4 のローカル E2E です。実際の SQLite フィクスチャ、
-Hub、Edge、GitHub Webhook / Poll、Mock ChatGPT Webhook Receiver、stdio を
-ループバックで組み合わせ、次を検証します。
+`tests/e2e_edge_hub.rs` では、署名付き Orca 取り込みと Muse の cursor / ack を
+ローカルの Hub で検証します。Orca CLI の応答・ホスト境界・再起動時の再送はコレクターの単体テスト、
+旧 T3 Edge の互換性と配信経路は同じローカル E2E で検証します。
 
-- Edge の初回スナップショットと差分転送、Hub 側の単一トランザクション取り込み
+- 旧 T3 Edge の初回スナップショットと差分転送、Hub 側の単一トランザクション取り込み
 - 署名付き Edge リクエストの不正署名・時刻ずれ・ノンスリプレイ拒否（401）
 - Hub 停止中の Edge イベントが Hub 再起動後に欠損なく追いつくこと
 - 配信途中の Hub 再起動で pending delivery が再送されること
@@ -229,8 +190,7 @@ Hub、Edge、GitHub Webhook / Poll、Mock ChatGPT Webhook Receiver、stdio を
 
 ## 状態
 
-Phase 1・Phase 2（T3 Code Collector）・Phase 3（GitHub Collector）・
-Phase 4（Edge / Hub 統合、`stdio` 完成、ローカル E2E）実装済みです。
+Orca / GitHub の収集、Hub の Webhook 配信、MCP と Muse のポーリングに対応しています。
 ChatGPT 実機・dots・クラウド側の接続と確認は **未実施の運用側作業** であり、
 [docs/CHATGPT-SETUP.md](docs/CHATGPT-SETUP.md) に手順と確認項目をまとめています。
 ローカルの自動テストは Edge / Hub / GitHub / 署名配信 / 再起動復旧 / 410 / リプレイ

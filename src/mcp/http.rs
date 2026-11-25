@@ -27,7 +27,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use secrecy::ExposeSecret;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -38,8 +38,9 @@ use crate::{
     auth::{Auth, AuthError, AuthenticatedPrincipal},
     consumers::ConsumerError,
     edge_protocol::{
-        EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE, HEADER_EDGE_SIGNATURE,
-        HEADER_EDGE_TIMESTAMP, valid_edge_token, verify as verify_edge_signature,
+        EDGE_INGEST_PATH, EdgeT3IngestRequest, HEADER_EDGE_ID, HEADER_EDGE_NONCE,
+        HEADER_EDGE_SIGNATURE, HEADER_EDGE_TIMESTAMP, ORCA_EDGE_INGEST_PATH, OrcaEdgeEvent,
+        valid_edge_token, verify as verify_edge_signature,
     },
     mcp::{error::INVALID_REQUEST, handler::EventsHandler},
     oauth::{
@@ -148,7 +149,8 @@ pub fn router_with_cancellation(app: Arc<AppState>, cancellation: CancellationTo
 
     router
         .route("/internal/events", post(internal_ingest))
-        .route("/internal/edge/t3", post(edge_ingest))
+        .route(ORCA_EDGE_INGEST_PATH, post(edge_orca_ingest))
+        .route(EDGE_INGEST_PATH, post(edge_t3_ingest))
         .route("/webhooks/github", post(github_webhook_entry))
         .route("/consumers/{name}/probe", get(consumer_probe))
         .route("/consumers/{name}/poll", get(consumer_poll))
@@ -1074,9 +1076,13 @@ async fn consumer_ack(
     }
 }
 
-async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -> Response {
+async fn authenticate_edge_request<T: DeserializeOwned>(
+    state: &McpHttpState,
+    request: Request,
+    validate: impl FnOnce(&T) -> Result<(), String>,
+) -> Result<(String, T), Box<Response>> {
     if !state.app.config.server.enable_edge_ingest {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(StatusCode::NOT_FOUND.into_response().into());
     }
 
     if let Err(response) = validate_http_security(
@@ -1084,18 +1090,19 @@ async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -
         request.uri(),
         &state.app.config.server.allowed_hosts,
     ) {
-        return response.into_response();
+        return Err(response.into_response().into());
     }
     if let Err(response) = require_json_content_type(request.headers()) {
-        return response.into_response();
+        return Err(response.into_response().into());
     }
 
     let Some(secret) = state.app.edge_shared_secret.as_ref() else {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "edge ingest secret is not configured"})),
         )
-            .into_response();
+            .into_response()
+            .into());
     };
 
     let headers = request.headers().clone();
@@ -1103,40 +1110,43 @@ async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -
     let body = match axum::body::to_bytes(request.into_body(), limit).await {
         Ok(body) => body,
         Err(_) => {
-            return (
+            return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json!({"error": "edge request body too large"})),
             )
-                .into_response();
+                .into_response()
+                .into());
         }
     };
 
     let Some(edge_id) = header_value(&headers, HEADER_EDGE_ID) else {
-        return edge_unauthorized("missing X-Edge-Id");
+        return Err(edge_unauthorized("missing X-Edge-Id"));
     };
     if !valid_edge_token(edge_id) {
-        return edge_unauthorized("invalid X-Edge-Id");
+        return Err(edge_unauthorized("invalid X-Edge-Id"));
     }
     let Some(nonce) = header_value(&headers, HEADER_EDGE_NONCE) else {
-        return edge_unauthorized("missing X-Edge-Nonce");
+        return Err(edge_unauthorized("missing X-Edge-Nonce"));
     };
     if !valid_edge_token(nonce) {
-        return edge_unauthorized("invalid X-Edge-Nonce");
+        return Err(edge_unauthorized("invalid X-Edge-Nonce"));
     }
     let Some(timestamp) =
         header_value(&headers, HEADER_EDGE_TIMESTAMP).and_then(|value| value.parse::<i64>().ok())
     else {
-        return edge_unauthorized("invalid X-Edge-Timestamp");
+        return Err(edge_unauthorized("invalid X-Edge-Timestamp"));
     };
     let Some(signature) = header_value(&headers, HEADER_EDGE_SIGNATURE) else {
-        return edge_unauthorized("missing X-Edge-Signature");
+        return Err(edge_unauthorized("missing X-Edge-Signature"));
     };
 
     let now = chrono::Utc::now().timestamp();
     // `abs_diff` is unsigned and cannot overflow or panic for any pair of
     // i64 values, including i64::MIN and i64::MAX.
     if now.abs_diff(timestamp) > state.app.config.server.edge_max_skew_secs {
-        return edge_unauthorized("X-Edge-Timestamp outside the accepted window");
+        return Err(edge_unauthorized(
+            "X-Edge-Timestamp outside the accepted window",
+        ));
     }
     if !verify_edge_signature(
         secret.expose_secret().as_bytes(),
@@ -1146,25 +1156,27 @@ async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -
         &body,
         signature,
     ) {
-        return edge_unauthorized("invalid X-Edge-Signature");
+        return Err(edge_unauthorized("invalid X-Edge-Signature"));
     }
 
-    let request: EdgeT3IngestRequest = match serde_json::from_slice(&body) {
+    let request: T = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("invalid edge payload: {error}")})),
             )
-                .into_response();
+                .into_response()
+                .into());
         }
     };
-    if let Err(error) = validate_edge_request(&request) {
-        return (
+    if let Err(error) = validate(&request) {
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error": error})),
         )
-            .into_response();
+            .into_response()
+            .into());
     }
 
     // The nonce is consumed only after the signature, timestamp and payload
@@ -1180,20 +1192,63 @@ async fn edge_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -
     ) {
         Ok(crate::store::EdgeNonceStatus::Accepted) => {}
         Ok(crate::store::EdgeNonceStatus::Replayed) => {
-            return edge_unauthorized("replayed X-Edge-Nonce");
+            return Err(edge_unauthorized("replayed X-Edge-Nonce"));
         }
         Ok(crate::store::EdgeNonceStatus::TimestampOutOfWindow) => {
-            return edge_unauthorized("X-Edge-Timestamp outside the accepted window");
+            return Err(edge_unauthorized(
+                "X-Edge-Timestamp outside the accepted window",
+            ));
         }
         Err(error) => {
             tracing::error!(%error, "could not record edge nonce");
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "could not record edge nonce"})),
             )
-                .into_response();
+                .into_response()
+                .into());
         }
     }
+    Ok((edge_id.to_owned(), request))
+}
+
+async fn edge_orca_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -> Response {
+    let (edge_id, event) =
+        match authenticate_edge_request(&state, request, OrcaEdgeEvent::validate).await {
+            Ok(validated) => validated,
+            Err(response) => return *response,
+        };
+    match event
+        .into_event()
+        .and_then(|event| state.app.ingest.ingest(event))
+    {
+        Ok(outcome) => Json(json!({
+            "status": "ok",
+            "eventId": outcome.event.id,
+            "duplicate": outcome.duplicate,
+            "deliveriesCreated": outcome.deliveries_created,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, %edge_id, "Orca edge event apply failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not apply Orca edge event"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn edge_t3_ingest(State(state): State<Arc<McpHttpState>>, request: Request) -> Response {
+    if !state.app.config.server.accept_legacy_t3_edge {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (edge_id, request) =
+        match authenticate_edge_request(&state, request, validate_edge_request).await {
+            Ok(validated) => validated,
+            Err(response) => return *response,
+        };
 
     match request {
         EdgeT3IngestRequest::Snapshot {
@@ -1521,8 +1576,10 @@ fn validate_snapshot_entities(
     Ok(())
 }
 
-fn edge_unauthorized(message: &'static str) -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({"error": message}))).into_response()
+fn edge_unauthorized(message: &'static str) -> Box<Response> {
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": message})))
+        .into_response()
+        .into()
 }
 
 #[cfg(test)]

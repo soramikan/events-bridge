@@ -38,7 +38,7 @@ pub struct Event {
     pub id: String,
     /// Local ingestion order.
     pub sequence: i64,
-    /// Producing system (`t3` or `github`).
+    /// Producing system (`orca`, `github`, or legacy `t3`).
     pub source: String,
     /// Event name, e.g. `t3.run.completed`.
     pub kind: String,
@@ -1064,7 +1064,7 @@ mod tests {
     #[test]
     fn migrations_create_every_table() {
         let repo = repository();
-        assert_eq!(repo.schema_version().unwrap(), 6);
+        assert_eq!(repo.schema_version().unwrap(), 7);
         let conn = repo.lock();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")

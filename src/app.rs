@@ -120,7 +120,7 @@ impl AppState {
     }
 }
 
-fn read_secret_env(variable: &str, purpose: &str) -> Result<SecretString> {
+pub(crate) fn read_secret_env(variable: &str, purpose: &str) -> Result<SecretString> {
     let value = std::env::var(variable).with_context(|| {
         format!("{purpose} is configured but environment variable `{variable}` is unset")
     })?;

@@ -89,11 +89,10 @@ impl Hub {
         self.dispatcher.drain().await
     }
 
-    /// Start the T3 Code collector when `collectors.t3.enabled` is true.
+    /// Explicitly start the legacy T3 Code collector for compatibility testing.
     ///
-    /// The collector performs its first-start snapshot before this returns, so
-    /// a misconfigured state database fails hub startup instead of being
-    /// retried silently.
+    /// The collector performs its first-start snapshot before this returns.
+    #[doc(hidden)]
     pub fn spawn_t3_collector(&self) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
         spawn_t3_collector(&self.state)
     }
@@ -124,17 +123,7 @@ impl Hub {
             "events-bridge hub listening"
         );
 
-        let collector = self.spawn_t3_collector()?;
-        let github_poller = match self.spawn_github_poller() {
-            Ok(poller) => poller,
-            Err(error) => {
-                if let Some((collector_cancellation, collector_handle)) = collector {
-                    collector_cancellation.cancel();
-                    let _ = collector_handle.await;
-                }
-                return Err(error);
-            }
-        };
+        let github_poller = self.spawn_github_poller()?;
         let (cancellation, dispatcher) = self.spawn_dispatcher();
         let mcp_cancellation = self.mcp_cancellation.clone();
         let router = self.router();
@@ -145,10 +134,6 @@ impl Hub {
             })
             .await;
         cancellation.cancel();
-        if let Some((collector_cancellation, collector_handle)) = collector {
-            collector_cancellation.cancel();
-            let _ = collector_handle.await;
-        }
         if let Some((poller_cancellation, poller_handle)) = github_poller {
             poller_cancellation.cancel();
             let _ = poller_handle.await;
@@ -159,11 +144,7 @@ impl Hub {
     }
 }
 
-/// Start the T3 Code collector when `collectors.t3.enabled` is true.
-///
-/// Shared by the `hub` and `stdio` subcommands so both expose the same local
-/// collector behavior.
-pub fn spawn_t3_collector(
+fn spawn_t3_collector(
     state: &Arc<AppState>,
 ) -> Result<Option<(CancellationToken, JoinHandle<()>)>> {
     if !state.config.collectors.t3.enabled {
@@ -214,7 +195,7 @@ pub fn spawn_github_poller(
     Ok(Some((cancellation, handle)))
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };

@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "events-bridge",
     version,
-    about = "MCP Events webhook bridge for T3 Code and GitHub",
+    about = "MCP Events webhook bridge for Orca and GitHub",
     long_about = None
 )]
 struct Cli {
@@ -29,7 +29,7 @@ enum Command {
         )]
         config: PathBuf,
     },
-    /// Edge collector: forward T3 Code state to a central hub.
+    /// Edge collector: forward local Orca events to a central hub.
     Edge {
         /// Path to the TOML configuration file.
         #[arg(
@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Hub { config } => events_bridge::transport::http::run(config).await,
-        Command::Edge { config } => events_bridge::transport::edge::run(config).await,
+        Command::Edge { config } => events_bridge::transport::orca_edge::run(config).await,
         Command::Stdio { config } => events_bridge::transport::stdio::run(config).await,
         Command::Poll {
             consumer,

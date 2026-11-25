@@ -628,7 +628,7 @@ async fn initialize_advertises_events_and_lists_the_catalog() {
 
     let listed = rpc_result(client.request("events/list", json!({})).await);
     let events = listed["events"].as_array().unwrap();
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 9);
     let names: Vec<_> = events
         .iter()
         .map(|event| event["name"].as_str().unwrap())
@@ -642,6 +642,9 @@ async fn initialize_advertises_events_and_lists_the_catalog() {
             "github.workflow.failed",
             "github.review.requested",
             "github.pr.merged",
+            "orca.session.completed",
+            "orca.session.failed",
+            "orca.approval.required",
         ]
     );
     for event in events {

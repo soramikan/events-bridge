@@ -91,8 +91,10 @@ pub struct ServerConfig {
     pub enable_internal_ingest: bool,
     /// Environment variable holding the internal ingest bearer token.
     pub internal_token_env: Option<String>,
-    /// Enables `POST /internal/edge/t3` for authenticated edge collectors.
+    /// Enables `POST /internal/edge/orca` for authenticated edge collectors.
     pub enable_edge_ingest: bool,
+    /// Temporarily allow signed requests from old T3 Edge binaries.
+    pub accept_legacy_t3_edge: bool,
     /// Environment variable holding the shared edge HMAC secret.
     ///
     /// Required when `enable_edge_ingest` is true. The secret itself is never
@@ -116,6 +118,7 @@ impl Default for ServerConfig {
             enable_internal_ingest: false,
             internal_token_env: None,
             enable_edge_ingest: false,
+            accept_legacy_t3_edge: false,
             edge_shared_secret_env: None,
             edge_max_skew_secs: 300,
             max_edge_body_bytes: DEFAULT_MAX_EDGE_BODY_BYTES,
@@ -136,8 +139,7 @@ pub struct EdgeConfig {
     pub hub_url: Option<String>,
     /// Environment variable holding the shared edge HMAC secret.
     pub shared_secret_env: Option<String>,
-    /// Stable edge identifier. Defaults to the resolved T3 environment id or
-    /// the host name.
+    /// Stable edge identifier. Defaults to the collector's environment id.
     pub edge_id: Option<String>,
     /// Per-request HTTP timeout.
     pub request_timeout_secs: u64,
@@ -391,6 +393,9 @@ impl ConsumerProfileConfig {
     /// urgency activity is digest-eligible. Everything else is off.
     pub fn muse_default() -> Self {
         let mut events = BTreeMap::new();
+        events.insert("orca.approval.required".into(), EventDisposition::Immediate);
+        events.insert("orca.session.failed".into(), EventDisposition::Immediate);
+        events.insert("orca.session.completed".into(), EventDisposition::Digest);
         events.insert("t3.approval.required".into(), EventDisposition::Immediate);
         events.insert("t3.run.failed".into(), EventDisposition::Immediate);
         events.insert("github.workflow.failed".into(), EventDisposition::Immediate);
@@ -500,10 +505,41 @@ impl Default for DeliveryConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorsConfig {
-    /// T3 Code collector settings.
+    /// Local Orca collector settings (used by the Edge).
+    pub orca: OrcaCollectorConfig,
+    /// Legacy T3 Code collector settings.
     pub t3: T3CollectorConfig,
     /// GitHub collector settings.
     pub github: GitHubCollectorConfig,
+}
+
+/// Read local Orca status using its CLI, in the Orca user's environment.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OrcaCollectorConfig {
+    /// Unique, stable ID for this host. Required by the `edge` subcommand.
+    pub environment_id: Option<String>,
+    /// Path to the Orca CLI. Defaults to `orca-ide` on Linux and `orca` elsewhere.
+    pub cli_path: PathBuf,
+    /// Wait after a status snapshot before taking the next one.
+    pub poll_interval_ms: u64,
+    /// Timeout per Orca CLI invocation.
+    pub cli_timeout_secs: u64,
+}
+
+impl Default for OrcaCollectorConfig {
+    fn default() -> Self {
+        Self {
+            environment_id: None,
+            cli_path: PathBuf::from(if cfg!(target_os = "linux") {
+                "orca-ide"
+            } else {
+                "orca"
+            }),
+            poll_interval_ms: 5_000,
+            cli_timeout_secs: 10,
+        }
+    }
 }
 
 /// T3 Code collector settings.
@@ -514,7 +550,7 @@ pub struct CollectorsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct T3CollectorConfig {
-    /// Start the collector with the hub.
+    /// Legacy flag retained for old TOML files. The daemon no longer starts this collector.
     pub enabled: bool,
     /// Path to T3 Code's `statev2.sqlite`. Empty resolves to
     /// `~/.t3/userdata/statev2.sqlite`.
@@ -889,6 +925,21 @@ impl Config {
                 "edge.max_snapshot_chunk_bytes must be at least 1024 bytes, got {}",
                 edge.max_snapshot_chunk_bytes
             );
+        }
+
+        let orca = &self.collectors.orca;
+        if orca.cli_path.as_os_str().is_empty() {
+            bail!("collectors.orca.cli_path must not be empty");
+        }
+        if orca.poll_interval_ms == 0 || orca.cli_timeout_secs == 0 {
+            bail!("Orca polling interval and CLI timeout must be greater than zero");
+        }
+        if orca
+            .environment_id
+            .as_deref()
+            .is_some_and(|id| !crate::edge_protocol::valid_edge_token(id))
+        {
+            bail!("collectors.orca.environment_id must be a valid edge identifier");
         }
 
         let t3 = &self.collectors.t3;

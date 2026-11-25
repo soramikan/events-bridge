@@ -46,9 +46,8 @@ MCP サーバーへ接続する経路として **OpenAI Secure MCP Tunnel** を�
 4. ChatGPT から MCP サーバーへ接続し、`initialize` と `tools/list` が返ることを
    確認します。
 
-5. `events/list` で 6 イベント（`t3.run.completed`、`t3.run.failed`、
-   `t3.approval.required`、`github.workflow.failed`、
-   `github.review.requested`、`github.pr.merged`）が見えることを確認します。
+5. `events/list` で `orca.session.completed`、`orca.session.failed`、
+   `orca.approval.required` と GitHub のイベントが見えることを確認します。
 
 ### 1.3 代替: Cloudflare Tunnel + OAuth 2.1
 
@@ -72,11 +71,11 @@ HTTPS で公開する場合は Cloudflare Tunnel なども使えますが、次�
 ```text
 接続した events-bridge の MCP Events を購読してください。
 
-- T3 Code の承認待ち（t3.approval.required）と実行失敗（t3.run.failed）は
-  発生時に原因を調査し、すぐに報告してください。
+- Orca の承認・入力待ち（orca.approval.required）とターン失敗（orca.session.failed）は
+  発生時にホストとセッション ID をすぐに報告してください。
 - GitHub Actions の失敗（github.workflow.failed）は、失敗した workflow、
   ブランチ、実行 URL を確認し、原因と対応案を提示してください。
-- T3 Code の正常完了（t3.run.completed）は短時間のイベントをまとめ、
+- Orca のターン完了（orca.session.completed）は短時間のイベントをまとめ、
   プロジェクト別に報告してください。
 - 問題の修正や承認操作は勝手に行わず、まず原因と対応案を提示してください。
 - 同一イベントの再配送では重複処理を避けてください。
@@ -87,7 +86,7 @@ HTTPS で公開する場合は Cloudflare Tunnel なども使えますが、次�
 
 ```json
 {
-  "name": "t3.approval.required",
+  "name": "orca.approval.required",
   "arguments": { "environment_id": "mac-mini" },
   "delivery": {
     "mode": "webhook",
@@ -108,7 +107,7 @@ HTTPS で公開する場合は Cloudflare Tunnel なども使えますが、次�
 ### 3.1 購読生成
 
 1. ChatGPT から `events/list` を呼び、イベント定義を取得する。
-2. `events/subscribe` を呼び、`t3.approval.required` などを購読する。
+2. `events/subscribe` を呼び、`orca.approval.required` などを購読する。
 3. レスポンスの `id`、`refreshBefore`、`cursor` を記録する。
 4. 同じ購読要求を再送し、新しい購読が重複生成されず既存が更新されることを
    確認する。
@@ -123,7 +122,7 @@ HTTPS で公開する場合は Cloudflare Tunnel なども使えますが、次�
 
 ### 3.3 イベント配信
 
-1. T3 Code で承認待ちまたは Run 完了を発生させる。
+1. Orca で承認・入力待ちまたはターン完了を発生させる。
 2. Hub の `list_events` / `get_event` でイベントが永続化されていることを確認する。
 3. ChatGPT 側の Webhook が `2xx` を返すことを確認する。
 4. `webhook-id`、`webhook-timestamp`、`webhook-signature`、
@@ -134,7 +133,7 @@ HTTPS で公開する場合は Cloudflare Tunnel なども使えますが、次�
 
 1. dots に §2 の監視指示を登録する。
 2. 承認待ちイベントを発生させ、dots のタスクが起動することを確認する。
-3. dots が `get_t3_run` / `get_t3_approvals` / `get_github_status` を呼び、
+3. dots が `get_event` / `get_github_status` を呼び、
    追加情報を取得できることを確認する。
 4. 通知・アクティビティ表示が期待どおりであることを確認する。
 5. **Webhook の `2xx` だけを「dots タスク起動成功」とみなさない。**
@@ -143,7 +142,7 @@ HTTPS で公開する場合は Cloudflare Tunnel なども使えますが、次�
 ### 3.5 再起動復旧
 
 1. Hub を停止する。
-2. Edge 側で T3 イベントを発生させる。
+2. Edge 側で Orca イベントを発生させる。
 3. Hub を再起動する。
 4. Edge が指数バックオフで再送し、停止中のイベントが欠損なく Hub に取り込まれる
    ことを確認する。
